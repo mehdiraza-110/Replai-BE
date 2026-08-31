@@ -1,0 +1,37 @@
+const express = require('express');
+const router = express.Router();
+const userController = require('../../controllers/user.controller');
+const { upload } = require('../../config/multer.config');
+const AuthGuard = require('../../middlewares/jwt.middleware');
+
+// Login
+router.post('/login', userController.login.bind(userController));
+
+// Create a new user
+router.post('/', userController.createUser.bind(userController));
+
+// Get all users
+router.get('/', userController.getAllUsers.bind(userController));
+
+// Get user by ID
+router.get('/:id', userController.getUserById.bind(userController));
+
+// Update user
+router.put('/:id', userController.updateUser.bind(userController));
+router.patch('/:id', userController.updateUser.bind(userController));
+
+// Delete user (soft delete)
+router.delete('/:id', userController.deleteUser.bind(userController));
+
+// Hard delete user (permanent delete)
+router.delete('/:id/hard', userController.hardDeleteUser.bind(userController));
+
+// Update user profile (authenticated user's own profile)
+router.put('/profile', AuthGuard([]), userController.updateProfile.bind(userController));
+router.patch('/profile', AuthGuard([]), userController.updateProfile.bind(userController));
+
+// Update user avatar (authenticated user's own avatar)
+router.put('/avatar', AuthGuard([]), upload.single('avatar'), userController.updateAvatar.bind(userController));
+router.patch('/avatar', AuthGuard([]), upload.single('avatar'), userController.updateAvatar.bind(userController));
+
+module.exports = router;
