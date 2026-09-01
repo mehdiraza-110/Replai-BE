@@ -2,6 +2,8 @@ const db = require("../config/db.config");
 const plusVibeService = require("./plusVibe.service");
 const eventLogService = require("./eventLog.service");
 const leadProfileService = require("./leadProfile.service");
+const knowledgeService = require("./knowledge.service");
+const ghlService = require("./ghl.service");
 
 class MessageService {
   async listConversations(query = {}) {
@@ -289,19 +291,21 @@ class MessageService {
   }
 
   async rejectDraft(draftId) {
+    // Atomic, race-safe: the WHERE status = 'Pending' guard means concurrent
+    // approve/reject calls on the same draft serialize on Postgres's row lock —
+    // whichever statement commits first wins, and the loser matches 0 rows here
+    // instead of silently overwriting an already-handled draft.
     const result = await db.query(
       `UPDATE ai_response_drafts
        SET status = 'Rejected',
            updated_at = NOW()
-       WHERE id = $1 AND is_deleted = FALSE
+       WHERE id = $1 AND is_deleted = FALSE AND status = 'Pending'
        RETURNING *`,
       [draftId]
     );
 
     if (result.rows.length === 0) {
-      const error = new Error("AI draft not found");
-      error.statusCode = 404;
-      throw error;
+      throw await buildAlreadyHandledError(draftId);
     }
 
     const draft = mapDraft(result.rows[0]);
@@ -361,40 +365,67 @@ class MessageService {
 
   async approveDraft(draftId, override = {}) {
     const startedAt = Date.now();
-    const result = await db.query(
-      `SELECT *
-       FROM ai_response_drafts
-       WHERE id = $1 AND is_deleted = FALSE`,
-      [draftId]
-    );
 
-    if (result.rows.length === 0) {
-      const error = new Error("AI draft not found");
-      error.statusCode = 404;
+    // Race-safe against a concurrent approve/reject on the same draft: SELECT ...
+    // FOR UPDATE takes a row lock inside a transaction, so a second reviewer's
+    // request blocks here until this one commits or rolls back, then re-reads the
+    // (now non-Pending) row and correctly fails with "already handled" instead of
+    // sending a duplicate reply or silently overwriting the outcome.
+    const client = await db.getClient();
+    let draft;
+    let sent;
+    let mapped;
+
+    try {
+      await client.query("BEGIN");
+
+      const result = await client.query(
+        `SELECT *
+         FROM ai_response_drafts
+         WHERE id = $1 AND is_deleted = FALSE
+         FOR UPDATE`,
+        [draftId]
+      );
+
+      if (result.rows.length === 0) {
+        const error = new Error("AI draft not found");
+        error.statusCode = 404;
+        throw error;
+      }
+
+      draft = result.rows[0];
+
+      if (draft.status !== "Pending") {
+        throw await buildAlreadyHandledError(draftId, draft.status);
+      }
+
+      sent = await sendReply({
+        replyToId: draft.reply_to_message_id,
+        subject: cleanString(override.subject) || draft.subject,
+        from: cleanString(override.from) || draft.from_email,
+        to: cleanString(override.to) || draft.to_email || draft.lead_email,
+        body: cleanString(override.body) || draft.body,
+      });
+
+      const updated = await client.query(
+        `UPDATE ai_response_drafts
+         SET status = 'Sent',
+             body = $1,
+             sent_message_id = $2,
+             updated_at = NOW()
+         WHERE id = $3
+         RETURNING *`,
+        [cleanString(override.body) || draft.body, sent.id || null, draftId]
+      );
+
+      await client.query("COMMIT");
+      mapped = mapDraft(updated.rows[0]);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
       throw error;
+    } finally {
+      client.release();
     }
-
-    const draft = result.rows[0];
-    const sent = await sendReply({
-      replyToId: draft.reply_to_message_id,
-      subject: cleanString(override.subject) || draft.subject,
-      from: cleanString(override.from) || draft.from_email,
-      to: cleanString(override.to) || draft.to_email || draft.lead_email,
-      body: cleanString(override.body) || draft.body,
-    });
-
-    const updated = await db.query(
-      `UPDATE ai_response_drafts
-       SET status = 'Sent',
-           body = $1,
-           sent_message_id = $2,
-           updated_at = NOW()
-       WHERE id = $3
-       RETURNING *`,
-      [cleanString(override.body) || draft.body, sent.id || null, draftId]
-    );
-
-    const mapped = mapDraft(updated.rows[0]);
 
     await eventLogService.record({
       eventType: "ai.draft.approved_sent",
@@ -408,6 +439,16 @@ class MessageService {
       draftId: mapped.id,
       durationMs: Date.now() - startedAt,
       metadata: { replyToId: draft.reply_to_message_id, generatedBy: mapped.generatedBy },
+    });
+
+    // Best-effort: push this lead's approved AI reply into GHL Conversations.
+    // ghlService swallows its own failures and never throws, so this never
+    // blocks or fails the approval flow.
+    ghlService.syncLeadConversation({
+      leadEmail: mapped.leadEmail,
+      subject: mapped.subject,
+      body: mapped.body,
+      direction: "outbound",
     });
 
     return mapped;
@@ -451,7 +492,7 @@ async function ensureDraft(integrationId, campaign, latestInbound, remoteMessage
   }
 
   const agent = campaign;
-  const promptContext = buildPromptContext(agent, latestInbound, remoteMessages);
+  const promptContext = await buildPromptContext(agent, latestInbound, remoteMessages);
   const generation = await generateResponse(agent, promptContext);
   const fromEmail = extractEmailAddress(latestInbound.eaccount || latestInbound.to_address_email_list);
   const toEmail = extractEmailAddress(latestInbound.lead || latestInbound.from_address_email);
@@ -820,10 +861,13 @@ function isNegativeWebhookLabel(label) {
   ].some((negativeLabel) => label.includes(negativeLabel));
 }
 
-function buildPromptContext(agent, latestInbound, remoteMessages) {
+async function buildPromptContext(agent, latestInbound, remoteMessages) {
+  const knowledge = await knowledgeService.getAgentKnowledgeContext(agent.assigned_ai_agent_id);
+
   return {
     campaign: agent.name,
     leadEmail: latestInbound.lead || latestInbound.from_address_email,
+    knowledge,
     latestReply: stripQuotedReply(latestInbound.body?.text || latestInbound.content_preview || stripHtml(latestInbound.body?.html || latestInbound.body)),
     conversation: remoteMessages.map((message) => ({
       from: getMessageDirection(message),
@@ -843,6 +887,7 @@ function buildSystemPrompt(agent) {
     agent.agent_response_rules ? `Response rules: ${agent.agent_response_rules}.` : "",
     agent.agent_sales_rules ? `Sales rules: ${agent.agent_sales_rules}.` : "",
     agent.agent_safety_rules ? `Safety rules: ${agent.agent_safety_rules}.` : "",
+    "Use the supplied knowledge context when it is relevant. Never invent facts that are not in the agent instructions, conversation, or knowledge base.",
     "Write only the email reply body. Do not include a subject line.",
   ].filter(Boolean).join("\n");
 }
@@ -982,6 +1027,32 @@ function cleanString(value) {
 
   const text = String(value).trim();
   return text.length > 0 ? text : null;
+}
+
+// Builds the error thrown when an approve/reject request loses the race against
+// another reviewer who already handled the same draft. Pass `knownStatus` when
+// the caller already has the row in hand (avoids an extra query).
+async function buildAlreadyHandledError(draftId, knownStatus) {
+  let status = knownStatus;
+
+  if (!status) {
+    const existing = await db.query(
+      `SELECT status FROM ai_response_drafts WHERE id = $1 AND is_deleted = FALSE`,
+      [draftId]
+    );
+
+    if (existing.rows.length === 0) {
+      const error = new Error("AI draft not found");
+      error.statusCode = 404;
+      return error;
+    }
+
+    status = existing.rows[0].status;
+  }
+
+  const error = new Error(`This draft was already ${status.toLowerCase()} by someone else. Refresh to see the latest queue.`);
+  error.statusCode = 409;
+  return error;
 }
 
 module.exports = new MessageService();

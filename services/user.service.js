@@ -338,6 +338,38 @@ class UserService {
     }
   }
   
+  // Change password (for authenticated user's own account)
+  async changePassword(userId, currentPassword, newPassword) {
+    const result = await db.query(
+      `SELECT id, password_hash
+       FROM users
+       WHERE id = $1 AND (is_deleted = FALSE OR is_deleted IS NULL)`,
+      [userId]
+    );
+
+    if (result.rows.length === 0) {
+      throw new Error('User not found');
+    }
+
+    const isCurrentPasswordValid = await bcrypt.compare(currentPassword, result.rows[0].password_hash);
+
+    if (!isCurrentPasswordValid) {
+      throw new Error('Current password is incorrect');
+    }
+
+    const saltRounds = 10;
+    const passwordHash = await bcrypt.hash(newPassword, saltRounds);
+
+    await db.query(
+      `UPDATE users
+       SET password_hash = $1, updated_at = NOW()
+       WHERE id = $2`,
+      [passwordHash, userId]
+    );
+
+    return { message: 'Password updated successfully' };
+  }
+
   // Update user avatar
   async updateAvatar(userId, avatarUrl) {
     const result = await db.query(

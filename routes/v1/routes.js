@@ -9,6 +9,10 @@ const eventLogRoutes = require('./event-log.routes');
 const leadRoutes = require('./lead.routes');
 const analyticsRoutes = require('./analytics.routes');
 const reviewRoutes = require('./review.routes');
+const knowledgeRoutes = require('./knowledge.routes');
+const notificationRoutes = require('./notification.routes');
+const ghlRoutes = require('./ghl.routes');
+const forwardedLeadRoutes = require('./forwarded-lead.routes');
 
 // User routes
 router.use('/users', userRoutes);
@@ -20,6 +24,10 @@ router.use('/event-logs', eventLogRoutes);
 router.use('/leads', leadRoutes);
 router.use('/analytics', analyticsRoutes);
 router.use('/reviews', reviewRoutes);
+router.use('/knowledge', knowledgeRoutes);
+router.use('/notifications', notificationRoutes);
+router.use('/ghl', ghlRoutes);
+router.use('/forwarded-leads', forwardedLeadRoutes);
 
 
 module.exports = router;

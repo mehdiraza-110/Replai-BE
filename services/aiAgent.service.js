@@ -1,5 +1,6 @@
 const db = require("../config/db.config");
 const eventLogService = require("./eventLog.service");
+const knowledgeService = require("./knowledge.service");
 
 const insertFields = [
   "name",
@@ -37,21 +38,41 @@ const updateFields = insertFields.filter((field) => field !== "created_by");
 
 class AiAgentService {
   async listAgents() {
+    await knowledgeService.ensureSchema();
+
     const result = await db.query(
-      `SELECT *
-       FROM ai_agents
-       WHERE is_deleted = FALSE
-       ORDER BY updated_at DESC`
+      `SELECT a.*,
+              COALESCE(
+                (
+                  SELECT array_agg(aks.knowledge_source_id ORDER BY aks.knowledge_source_id)
+                  FROM ai_agent_knowledge_sources aks
+                  WHERE aks.ai_agent_id = a.id
+                ),
+                '{}'::int[]
+              ) AS knowledge_source_ids
+       FROM ai_agents a
+       WHERE a.is_deleted = FALSE
+       ORDER BY a.updated_at DESC`
     );
 
     return result.rows.map(mapAgentRow);
   }
 
   async getAgentById(agentId) {
+    await knowledgeService.ensureSchema();
+
     const result = await db.query(
-      `SELECT *
-       FROM ai_agents
-       WHERE id = $1 AND is_deleted = FALSE`,
+      `SELECT a.*,
+              COALESCE(
+                (
+                  SELECT array_agg(aks.knowledge_source_id ORDER BY aks.knowledge_source_id)
+                  FROM ai_agent_knowledge_sources aks
+                  WHERE aks.ai_agent_id = a.id
+                ),
+                '{}'::int[]
+              ) AS knowledge_source_ids
+       FROM ai_agents a
+       WHERE a.id = $1 AND a.is_deleted = FALSE`,
       [agentId]
     );
 
@@ -74,28 +95,35 @@ class AiAgentService {
     );
 
     const agent = mapAgentRow(result.rows[0]);
+    await knowledgeService.setAgentSources(agent.id, agentData.knowledgeSourceIds ?? agentData.knowledge_source_ids);
+    const savedAgent = await this.getAgentById(agent.id);
+
     await eventLogService.record({
       eventType: "ai_agent.created",
       source: "ai",
       status: "Success",
-      aiAgentId: agent.id,
-      aiAgentName: agent.name,
+      aiAgentId: savedAgent.id,
+      aiAgentName: savedAgent.name,
       durationMs: Date.now() - startedAt,
-      createdBy: agent.createdBy,
+      createdBy: savedAgent.createdBy,
       metadata: {
-        role: agent.role,
-        model: agent.model,
-        automationMode: agent.automationMode,
-        autoReply: agent.autoReply,
+        role: savedAgent.role,
+        model: savedAgent.model,
+        automationMode: savedAgent.automationMode,
+        autoReply: savedAgent.autoReply,
+        knowledgeSources: savedAgent.knowledgeSourceIds.length,
       },
     });
 
-    return agent;
+    return savedAgent;
   }
 
   async updateAgent(agentId, agentData) {
     const startedAt = Date.now();
     const normalized = normalizeAgentPayload(agentData, { partial: true });
+    const hasKnowledgeSourceIds =
+      Object.prototype.hasOwnProperty.call(agentData, "knowledgeSourceIds") ||
+      Object.prototype.hasOwnProperty.call(agentData, "knowledge_source_ids");
     const assignments = [];
     const values = [];
 
@@ -106,20 +134,31 @@ class AiAgentService {
       }
     });
 
-    if (assignments.length === 0) {
+    if (assignments.length === 0 && !hasKnowledgeSourceIds) {
       const error = new Error("No fields to update");
       error.statusCode = 400;
       throw error;
     }
 
-    values.push(agentId);
-    const result = await db.query(
-      `UPDATE ai_agents
-       SET ${assignments.join(", ")}, updated_at = NOW()
-       WHERE id = $${values.length} AND is_deleted = FALSE
-       RETURNING *`,
-      values
-    );
+    let result;
+    if (assignments.length > 0) {
+      values.push(agentId);
+      result = await db.query(
+        `UPDATE ai_agents
+         SET ${assignments.join(", ")}, updated_at = NOW()
+         WHERE id = $${values.length} AND is_deleted = FALSE
+         RETURNING *`,
+        values
+      );
+    } else {
+      result = await db.query(
+        `UPDATE ai_agents
+         SET updated_at = NOW()
+         WHERE id = $1 AND is_deleted = FALSE
+         RETURNING *`,
+        [agentId]
+      );
+    }
 
     if (result.rows.length === 0) {
       const error = new Error("AI agent not found");
@@ -127,7 +166,11 @@ class AiAgentService {
       throw error;
     }
 
-    const agent = mapAgentRow(result.rows[0]);
+    if (hasKnowledgeSourceIds) {
+      await knowledgeService.setAgentSources(agentId, agentData.knowledgeSourceIds ?? agentData.knowledge_source_ids);
+    }
+
+    const agent = await this.getAgentById(agentId);
     await eventLogService.record({
       eventType: "ai_agent.updated",
       source: "ai",
@@ -139,6 +182,7 @@ class AiAgentService {
         changedFields: assignments.map((assignment) => assignment.split(" = ")[0]),
         status: agent.status,
         model: agent.model,
+        knowledgeSources: agent.knowledgeSourceIds.length,
       },
     });
 
@@ -278,6 +322,7 @@ function mapAgentRow(row) {
     salesRules: row.sales_rules,
     safetyRules: row.safety_rules,
     knowledgeSources: row.knowledge_sources,
+    knowledgeSourceIds: Array.isArray(row.knowledge_source_ids) ? row.knowledge_source_ids.map(Number) : [],
     trainingExamples: row.training_examples,
     aiProvider: row.ai_provider,
     model: row.ai_model,

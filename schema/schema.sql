@@ -82,6 +82,40 @@ CREATE TABLE IF NOT EXISTS ai_agents (
 CREATE INDEX IF NOT EXISTS idx_ai_agents_status ON ai_agents(status) WHERE is_deleted = FALSE;
 CREATE INDEX IF NOT EXISTS idx_ai_agents_provider_model ON ai_agents(ai_provider, ai_model) WHERE is_deleted = FALSE;
 
+CREATE TABLE IF NOT EXISTS knowledge_sources (
+  id SERIAL PRIMARY KEY,
+  title VARCHAR(240) NOT NULL,
+  category VARCHAR(160),
+  source_type VARCHAR(40) NOT NULL DEFAULT 'Text' CHECK (source_type IN ('Text', 'Document', 'URL', 'FAQ')),
+  owner VARCHAR(180),
+  status VARCHAR(40) NOT NULL DEFAULT 'Review' CHECK (status IN ('Published', 'Review', 'Draft')),
+  content_text TEXT,
+  usage_guidance TEXT,
+  source_url VARCHAR(700),
+  file_name VARCHAR(350),
+  file_mime_type VARCHAR(180),
+  file_size BIGINT,
+  file_storage_path VARCHAR(700),
+  chunks_count INT NOT NULL DEFAULT 0,
+  last_indexed_at TIMESTAMP,
+  created_by INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_sources_status ON knowledge_sources(status, updated_at DESC) WHERE is_deleted = FALSE;
+CREATE INDEX IF NOT EXISTS idx_knowledge_sources_category ON knowledge_sources(category) WHERE is_deleted = FALSE;
+
+CREATE TABLE IF NOT EXISTS ai_agent_knowledge_sources (
+  ai_agent_id INT REFERENCES ai_agents(id) ON DELETE CASCADE,
+  knowledge_source_id INT REFERENCES knowledge_sources(id) ON DELETE CASCADE,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (ai_agent_id, knowledge_source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_sources_source ON ai_agent_knowledge_sources(knowledge_source_id);
+
 CREATE TABLE IF NOT EXISTS plusvibe_integrations (
   id SERIAL PRIMARY KEY,
   workspace_id VARCHAR(120) NOT NULL,
@@ -193,6 +227,27 @@ CREATE TABLE IF NOT EXISTS ai_response_drafts (
 
 CREATE INDEX IF NOT EXISTS idx_ai_response_drafts_thread ON ai_response_drafts(thread_id, status) WHERE is_deleted = FALSE;
 CREATE INDEX IF NOT EXISTS idx_ai_response_drafts_agent ON ai_response_drafts(ai_agent_id) WHERE is_deleted = FALSE;
+
+CREATE TABLE IF NOT EXISTS ghl_integrations (
+  id SERIAL PRIMARY KEY,
+  location_id VARCHAR(120) NOT NULL,
+  location_name VARCHAR(220),
+  api_key_encrypted TEXT NOT NULL,
+  api_key_iv VARCHAR(64) NOT NULL,
+  api_key_tag VARCHAR(64) NOT NULL,
+  connection_status VARCHAR(40) NOT NULL DEFAULT 'Disconnected',
+  api_status VARCHAR(40) NOT NULL DEFAULT 'Unknown',
+  synced_leads INT NOT NULL DEFAULT 0,
+  last_api_request TIMESTAMP,
+  last_sync_at TIMESTAMP,
+  last_error TEXT,
+  created_by INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ghl_integrations_location ON ghl_integrations(location_id) WHERE is_deleted = FALSE;
 
 CREATE TABLE IF NOT EXISTS event_logs (
   id SERIAL PRIMARY KEY,

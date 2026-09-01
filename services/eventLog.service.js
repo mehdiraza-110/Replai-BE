@@ -1,4 +1,5 @@
 const db = require("../config/db.config");
+const realtimeService = require("./realtime.service");
 
 class EventLogService {
   async record(event = {}) {
@@ -46,7 +47,15 @@ class EventLogService {
         ]
       );
 
-      return mapEventRow(result.rows[0]);
+      const mapped = mapEventRow(result.rows[0]);
+
+      // Every meaningful mutation across the app already flows through here, so
+      // this single hook is enough to keep every connected browser tab live —
+      // no matter which page it's on — without wiring a broadcast into each
+      // individual service method.
+      realtimeService.broadcast("event", mapped);
+
+      return mapped;
     } catch (error) {
       console.error("Event log write failed:", error.message);
       return null;
