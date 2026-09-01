@@ -1,6 +1,5 @@
 const db = require("../config/db.config");
 const mammoth = require("mammoth");
-const pdfParse = require("pdf-parse");
 const { saveFileToDisk } = require("../config/multer.config");
 const eventLogService = require("./eventLog.service");
 
@@ -344,10 +343,16 @@ async function extractTextFromFile(file) {
   }
 
   if (mimetype === "application/pdf" || extension === "pdf") {
+    // Required lazily: pdf-parse pulls in pdfjs-dist + a native canvas addon,
+    // which can fail to load on some Node/OS builds. Loading it only when a
+    // PDF is actually uploaded means that failure just disables PDF text
+    // extraction for this file instead of crashing the whole server on boot.
     try {
+      const pdfParse = require("pdf-parse");
       const result = await pdfParse(file.buffer);
       return cleanString(result.text);
-    } catch {
+    } catch (error) {
+      console.error("PDF text extraction failed:", error.message);
       return null;
     }
   }
