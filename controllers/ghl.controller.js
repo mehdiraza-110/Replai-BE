@@ -2,7 +2,7 @@ const ghlService = require("../services/ghl.service");
 
 async function getConnection(req, res) {
   try {
-    const data = await ghlService.getConnection();
+    const data = await ghlService.a ();
 
     res.status(200).json({
       success: true,

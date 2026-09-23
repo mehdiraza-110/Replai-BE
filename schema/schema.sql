@@ -274,3 +274,236 @@ CREATE TABLE IF NOT EXISTS event_logs (
 CREATE INDEX IF NOT EXISTS idx_event_logs_created ON event_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_event_logs_type ON event_logs(event_type, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_event_logs_thread ON event_logs(thread_id, created_at DESC);
+
+ALTER TABLE ai_agents ADD COLUMN IF NOT EXISTS fallback_meeting_url TEXT;
+ALTER TABLE ai_agents ADD COLUMN IF NOT EXISTS meeting_duration_minutes INT DEFAULT 30;
+ALTER TABLE ai_agents ADD COLUMN IF NOT EXISTS working_hours_start TIME DEFAULT '09:00';
+ALTER TABLE ai_agents ADD COLUMN IF NOT EXISTS working_hours_end TIME DEFAULT '17:00';
+ALTER TABLE ai_agents ADD COLUMN IF NOT EXISTS timezone VARCHAR(64) DEFAULT 'UTC';
+
+CREATE TABLE IF NOT EXISTS calendar_connections (
+  id SERIAL PRIMARY KEY,
+  ai_agent_id INT NOT NULL REFERENCES ai_agents(id) ON DELETE CASCADE,
+  provider VARCHAR(32) NOT NULL DEFAULT 'google',
+  google_email VARCHAR(255),
+  access_token_encrypted TEXT,
+  access_token_iv VARCHAR(64),
+  access_token_tag VARCHAR(64),
+  refresh_token_encrypted TEXT,
+  refresh_token_iv VARCHAR(64),
+  refresh_token_tag VARCHAR(64),
+  token_expiry TIMESTAMPTZ,
+  calendar_id VARCHAR(255) DEFAULT 'primary',
+  status VARCHAR(32) NOT NULL DEFAULT 'connected',
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  CONSTRAINT calendar_connections_agent_provider_key UNIQUE (ai_agent_id, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_calendar_connections_agent ON calendar_connections(ai_agent_id, status);
+
+CREATE TABLE IF NOT EXISTS meeting_bookings (
+  id SERIAL PRIMARY KEY,
+  ai_agent_id INT NOT NULL REFERENCES ai_agents(id) ON DELETE CASCADE,
+  thread_id VARCHAR(255),
+  lead_email VARCHAR(255),
+  google_event_id VARCHAR(255),
+  meet_link TEXT,
+  scheduled_start TIMESTAMPTZ,
+  scheduled_end TIMESTAMPTZ,
+  status VARCHAR(32) NOT NULL DEFAULT 'booked',
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_meeting_bookings_thread ON meeting_bookings(thread_id);
+CREATE INDEX IF NOT EXISTS idx_meeting_bookings_agent ON meeting_bookings(ai_agent_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS domains (
+  id SERIAL PRIMARY KEY,
+  domain VARCHAR(255) UNIQUE NOT NULL,
+  registrar VARCHAR(120) NOT NULL DEFAULT 'Route53',
+  dns_provider VARCHAR(120) NOT NULL DEFAULT 'Route53',
+  hosted_zone_id VARCHAR(120),
+  aws_region VARCHAR(60) NOT NULL DEFAULT 'us-east-1',
+  ses_identity_arn VARCHAR(500),
+  mail_from_subdomain VARCHAR(255),
+  spf_status VARCHAR(40) NOT NULL DEFAULT 'Not started' CHECK (spf_status IN ('Not started', 'Pending', 'Success', 'Failed')),
+  dkim_status VARCHAR(40) NOT NULL DEFAULT 'Not started' CHECK (dkim_status IN ('Not started', 'Pending', 'Success', 'Failed')),
+  dmarc_status VARCHAR(40) NOT NULL DEFAULT 'Not started' CHECK (dmarc_status IN ('Not started', 'Pending', 'Success', 'Failed')),
+  mx_status VARCHAR(40) NOT NULL DEFAULT 'Not started' CHECK (mx_status IN ('Not started', 'Pending', 'Success', 'Failed')),
+  mail_from_status VARCHAR(40) NOT NULL DEFAULT 'Not started' CHECK (mail_from_status IN ('Not started', 'Pending', 'Success', 'Failed')),
+  provider VARCHAR(80) NOT NULL DEFAULT 'Amazon SES',
+  status VARCHAR(40) NOT NULL DEFAULT 'Provisioning' CHECK (status IN ('Provisioning', 'Pending Verification', 'Verified', 'Failed')),
+  reputation VARCHAR(40) NOT NULL DEFAULT 'Unknown',
+  last_checked_at TIMESTAMP,
+  last_error TEXT,
+  raw_dkim_tokens JSONB NOT NULL DEFAULT '[]'::jsonb,
+  created_by INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_domains_status ON domains(status) WHERE is_deleted = FALSE;
+
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS configuration_set_name VARCHAR(160);
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS emails_sent_14d INT;
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS emails_delivered_14d INT;
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS emails_bounced_14d INT;
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS emails_complained_14d INT;
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS bounce_rate NUMERIC(6,3);
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS complaint_rate NUMERIC(6,3);
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS delivery_rate NUMERIC(6,3);
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS reputation_checked_at TIMESTAMP;
+
+CREATE TABLE IF NOT EXISTS ses_account_requests (
+  id SERIAL PRIMARY KEY,
+  aws_region VARCHAR(60) NOT NULL,
+  mail_type VARCHAR(40) NOT NULL,
+  website_url VARCHAR(1000) NOT NULL,
+  use_case_description TEXT,
+  additional_contact_emails JSONB NOT NULL DEFAULT '[]'::jsonb,
+  status VARCHAR(40) NOT NULL DEFAULT 'Submitted',
+  error_message TEXT,
+  requested_by INT REFERENCES users(id) ON DELETE SET NULL,
+  requested_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ses_account_requests_requested_at ON ses_account_requests(requested_at DESC);
+
+CREATE TABLE IF NOT EXISTS mailboxes (
+  id SERIAL PRIMARY KEY,
+  domain_id INT NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+  email VARCHAR(350) UNIQUE NOT NULL,
+  local_part VARCHAR(120) NOT NULL,
+  display_name VARCHAR(220),
+  status VARCHAR(40) NOT NULL DEFAULT 'Active' CHECK (status IN ('Active', 'Paused', 'Error')),
+  daily_limit INT NOT NULL DEFAULT 20,
+  sent_today INT NOT NULL DEFAULT 0,
+  warmup_stage VARCHAR(40) NOT NULL DEFAULT 'New' CHECK (warmup_stage IN ('New', 'Ramping', 'Steady State', 'Paused')),
+  reputation_status VARCHAR(40) NOT NULL DEFAULT 'Healthy' CHECK (reputation_status IN ('Healthy', 'Watch', 'At Risk')),
+  last_sent_at TIMESTAMP,
+  last_checked_at TIMESTAMP,
+  created_by INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_mailboxes_domain ON mailboxes(domain_id) WHERE is_deleted = FALSE;
+CREATE INDEX IF NOT EXISTS idx_mailboxes_status ON mailboxes(status) WHERE is_deleted = FALSE;
+
+CREATE TABLE IF NOT EXISTS warmup_strategies (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(220) NOT NULL,
+  description TEXT,
+  start_daily_limit INT NOT NULL DEFAULT 5,
+  steady_state_daily_limit INT NOT NULL DEFAULT 40,
+  increment_per_stage INT NOT NULL DEFAULT 5,
+  stage_duration_days INT NOT NULL DEFAULT 7,
+  safety_tiers JSONB NOT NULL DEFAULT '[]'::jsonb,
+  is_ai_generated BOOLEAN NOT NULL DEFAULT FALSE,
+  ai_rationale TEXT,
+  created_by INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_warmup_strategies_active ON warmup_strategies(id) WHERE is_deleted = FALSE;
+
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS warmup_strategy_id INT REFERENCES warmup_strategies(id) ON DELETE SET NULL;
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS warmup_started_at TIMESTAMP;
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS warmup_last_tick_at TIMESTAMP;
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS warmup_last_action TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_mailboxes_warmup_strategy ON mailboxes(warmup_strategy_id) WHERE is_deleted = FALSE;
+
+CREATE TABLE IF NOT EXISTS campaigns (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(220) NOT NULL,
+  objective TEXT,
+  subject VARCHAR(500) NOT NULL,
+  body TEXT NOT NULL,
+  mailbox_mode VARCHAR(20) NOT NULL DEFAULT 'all' CHECK (mailbox_mode IN ('all', 'specific')),
+  mailbox_ids INT[] NOT NULL DEFAULT '{}',
+  daily_limit_override INT,
+  sending_days JSONB NOT NULL DEFAULT '[]'::jsonb,
+  window_start VARCHAR(5) NOT NULL DEFAULT '09:00',
+  window_end VARCHAR(5) NOT NULL DEFAULT '17:00',
+  timezone VARCHAR(80) NOT NULL DEFAULT 'UTC',
+  ai_agent_id INT REFERENCES ai_agents(id) ON DELETE SET NULL,
+  human_review_required BOOLEAN NOT NULL DEFAULT TRUE,
+  status VARCHAR(40) NOT NULL DEFAULT 'Active' CHECK (status IN ('Active', 'Paused', 'Draft', 'Completed')),
+  sent_today INT NOT NULL DEFAULT 0,
+  sent_total INT NOT NULL DEFAULT 0,
+  reply_count INT NOT NULL DEFAULT 0,
+  bounce_count INT NOT NULL DEFAULT 0,
+  started_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  created_by INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status) WHERE is_deleted = FALSE;
+CREATE INDEX IF NOT EXISTS idx_campaigns_created_at ON campaigns(created_at DESC) WHERE is_deleted = FALSE;
+
+CREATE TABLE IF NOT EXISTS campaign_leads (
+  id SERIAL PRIMARY KEY,
+  campaign_id INT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+  email VARCHAR(350) NOT NULL,
+  status VARCHAR(40) NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending', 'Sent', 'Replied', 'Bounced')),
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_campaign_leads_campaign ON campaign_leads(campaign_id);
+
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS full_name VARCHAR(220);
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS first_name VARCHAR(120);
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS last_name VARCHAR(120);
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS company VARCHAR(220);
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS role VARCHAR(180);
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS phone VARCHAR(60);
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS raw_data JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE TABLE IF NOT EXISTS campaign_followups (
+  id SERIAL PRIMARY KEY,
+  campaign_id INT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+  step_order INT NOT NULL DEFAULT 1,
+  delay_days INT NOT NULL DEFAULT 3,
+  body TEXT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_campaign_followups_campaign ON campaign_followups(campaign_id);
+
+-- Suppression list: emails that must never be sent to again (unsubscribe, complaint, hard bounce, manual).
+-- See PlusVibe-Plan.md section 12A for the full spec this implements.
+CREATE TABLE IF NOT EXISTS suppressions (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(350) NOT NULL UNIQUE,
+  reason VARCHAR(40) NOT NULL CHECK (reason IN ('unsubscribed', 'complained', 'hard_bounce', 'manual')),
+  source VARCHAR(40) NOT NULL CHECK (source IN ('link_click', 'list_unsubscribe_header', 'reply_keyword', 'ses_complaint', 'ses_bounce', 'manual')),
+  campaign_id INT REFERENCES campaigns(id) ON DELETE SET NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_suppressions_email ON suppressions(email);
+
+-- Raw inbound replies to Cold Mailer sends, received via SES -> S3 -> SNS (see
+-- services/sesInboundEmail.service.js). Logged for audit even when no action is taken.
+CREATE TABLE IF NOT EXISTS inbound_messages (
+  id SERIAL PRIMARY KEY,
+  message_id VARCHAR(500),
+  from_address VARCHAR(350) NOT NULL,
+  to_address VARCHAR(350),
+  subject TEXT,
+  body_text TEXT,
+  s3_bucket VARCHAR(255),
+  s3_key VARCHAR(1000),
+  is_opt_out BOOLEAN NOT NULL DEFAULT FALSE,
+  received_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_inbound_messages_from ON inbound_messages(from_address);

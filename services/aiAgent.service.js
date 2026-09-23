@@ -30,6 +30,11 @@ const insertFields = [
   "auto_reply_enabled",
   "assigned_inbox_name",
   "assigned_workspace_name",
+  "fallback_meeting_url",
+  "meeting_duration_minutes",
+  "working_hours_start",
+  "working_hours_end",
+  "timezone",
   "status",
   "created_by",
 ];
@@ -249,6 +254,11 @@ function normalizeAgentPayload(payload, options = {}) {
     auto_reply_enabled: normalizeBoolean(payload.auto_reply_enabled ?? payload.autoReplyEnabled, requireDefaults ? false : undefined),
     assigned_inbox_name: cleanString(payload.assigned_inbox_name ?? payload.assignedInboxName),
     assigned_workspace_name: cleanString(payload.assigned_workspace_name ?? payload.assignedWorkspaceName),
+    fallback_meeting_url: cleanString(payload.fallback_meeting_url ?? payload.fallbackMeetingUrl),
+    meeting_duration_minutes: normalizeMeetingDuration(payload.meeting_duration_minutes ?? payload.meetingDurationMinutes, requireDefaults ? 30 : undefined),
+    working_hours_start: normalizeTimeOfDay(payload.working_hours_start ?? payload.workingHoursStart, "Working hours start") || (requireDefaults ? "09:00" : undefined),
+    working_hours_end: normalizeTimeOfDay(payload.working_hours_end ?? payload.workingHoursEnd, "Working hours end") || (requireDefaults ? "17:00" : undefined),
+    timezone: cleanString(payload.timezone) || (requireDefaults ? "UTC" : undefined),
     status: cleanString(payload.status) || (requireDefaults ? "Active" : undefined),
     created_by: payload.created_by ?? payload.createdBy ?? null,
   };
@@ -301,6 +311,36 @@ function normalizeThreshold(value) {
   return numberValue;
 }
 
+function normalizeMeetingDuration(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+
+  const numberValue = Number(value);
+  if (!Number.isInteger(numberValue) || numberValue < 5 || numberValue > 480) {
+    const error = new Error("Meeting duration must be a whole number of minutes between 5 and 480");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return numberValue;
+}
+
+// Accepts "9:00", "09:00" or "09:00:00" and normalizes to HH:MM for the TIME column.
+function normalizeTimeOfDay(value, label) {
+  if (value === undefined || value === null || value === "") return undefined;
+
+  const match = String(value).trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  const hour = match ? Number(match[1]) : NaN;
+  const minute = match ? Number(match[2]) : NaN;
+
+  if (!match || hour > 23 || minute > 59) {
+    const error = new Error(`${label} must be a time in HH:MM format`);
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
 function mapAgentRow(row) {
   return {
     id: row.id,
@@ -332,6 +372,13 @@ function mapAgentRow(row) {
     autoReply: row.auto_reply_enabled,
     inbox: row.assigned_inbox_name,
     workspace: row.assigned_workspace_name,
+    fallbackMeetingUrl: row.fallback_meeting_url,
+    meetingDurationMinutes: row.meeting_duration_minutes === null || row.meeting_duration_minutes === undefined
+      ? null
+      : Number(row.meeting_duration_minutes),
+    workingHoursStart: row.working_hours_start,
+    workingHoursEnd: row.working_hours_end,
+    timezone: row.timezone,
     status: row.status,
     createdBy: row.created_by,
     createdAt: row.created_at,

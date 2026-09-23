@@ -4,6 +4,10 @@ const eventLogService = require("./eventLog.service");
 const leadProfileService = require("./leadProfile.service");
 const knowledgeService = require("./knowledge.service");
 const ghlService = require("./ghl.service");
+const googleCalendarService = require("./googleCalendar.service");
+const meetingBookingService = require("./meetingBooking.service");
+
+const MEETING_OBJECTIVE = "schedule a meeting";
 
 class MessageService {
   async listConversations(query = {}) {
@@ -496,6 +500,17 @@ async function ensureDraft(integrationId, campaign, latestInbound, remoteMessage
   const generation = await generateResponse(agent, promptContext);
   const fromEmail = extractEmailAddress(latestInbound.eaccount || latestInbound.to_address_email_list);
   const toEmail = extractEmailAddress(latestInbound.lead || latestInbound.from_address_email);
+  let body = generation.body;
+
+  // "Schedule a Meeting" agents book a real calendar slot before the draft is
+  // stored, so the reply the reviewer sees is the one that mentions the booking.
+  if (generation.wantsMeeting) {
+    body = await applyMeetingBooking(agent, generation.body, {
+      threadId: latestInbound.thread_id,
+      leadEmail: toEmail,
+      leadName: addressName(latestInbound.from_address_json) || nameFromEmail(toEmail),
+    });
+  }
 
   const result = await db.query(
     `INSERT INTO ai_response_drafts (
@@ -534,7 +549,7 @@ async function ensureDraft(integrationId, campaign, latestInbound, remoteMessage
       buildReplySubject(latestInbound.subject),
       fromEmail,
       toEmail,
-      generation.body,
+      body,
       generation.confidence,
       generation.generatedBy,
       generation.error,
@@ -567,13 +582,24 @@ async function generateResponse(agent, context) {
 
       if (!response.ok) throw new Error(payload?.error?.message || "OpenAI generation failed");
 
-      const body = cleanString(payload.choices?.[0]?.message?.content);
-      if (body) {
-        return { body, confidence: 82, generatedBy: "openai", error: null };
+      const content = cleanString(payload.choices?.[0]?.message?.content);
+      if (content) {
+        const parsed = parseMeetingGeneration(agent, content);
+
+        return {
+          body: parsed.draftReply,
+          wantsMeeting: parsed.wantsMeeting,
+          intent: parsed.intent,
+          confidence: 82,
+          generatedBy: "openai",
+          error: null,
+        };
       }
     } catch (error) {
       return {
         body: buildFallbackDraft(agent, context),
+        wantsMeeting: false,
+        intent: "other",
         confidence: 68,
         generatedBy: "local-fallback",
         error: error.message,
@@ -583,10 +609,165 @@ async function generateResponse(agent, context) {
 
   return {
     body: buildFallbackDraft(agent, context),
+    wantsMeeting: false,
+    intent: "other",
     confidence: 72,
     generatedBy: "local-agent",
     error: null,
   };
+}
+
+/**
+ * For the "Schedule a Meeting" objective the model is asked for strict JSON.
+ * A malformed response must degrade to a plain-text draft rather than take down
+ * the whole draft pipeline, so parse failures fall back to the raw content.
+ */
+function parseMeetingGeneration(agent, content) {
+  if (!isMeetingObjective(agent)) {
+    return { draftReply: content, wantsMeeting: false, intent: "other" };
+  }
+
+  try {
+    const parsed = JSON.parse(stripJsonFences(content));
+    const draftReply = cleanString(parsed?.draftReply);
+
+    if (!draftReply) throw new Error("Model returned no draftReply");
+
+    return {
+      draftReply,
+      wantsMeeting: parsed?.wantsMeeting === true,
+      intent: cleanString(parsed?.intent) || "other",
+    };
+  } catch (error) {
+    console.warn("Could not parse meeting-objective model output as JSON, using the raw reply:", error.message);
+    return { draftReply: content, wantsMeeting: false, intent: "other" };
+  }
+}
+
+// Models occasionally ignore "no markdown fences" — tolerate ```json ... ```.
+function stripJsonFences(content) {
+  const fenced = String(content).trim().match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return fenced ? fenced[1] : content;
+}
+
+/**
+ * Second OpenAI pass that rewrites an already-generated draft. Returns null when
+ * the rewrite is unavailable or fails — callers keep the original draft.
+ */
+async function rewriteDraft(agent, instruction, draftReply) {
+  if (String(agent.agent_provider || "").toLowerCase() !== "openai" || !process.env.OPENAI_API_KEY) {
+    return null;
+  }
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: agent.agent_model,
+        temperature: 0.4,
+        messages: [
+          { role: "system", content: instruction },
+          { role: "user", content: draftReply },
+        ],
+      }),
+    });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok) throw new Error(payload?.error?.message || "OpenAI rewrite failed");
+
+    return cleanString(payload.choices?.[0]?.message?.content);
+  } catch (error) {
+    console.warn("Meeting reply rewrite failed, keeping the original draft:", error.message);
+    return null;
+  }
+}
+
+function describePersona(agent) {
+  return [
+    `Persona: ${agent.agent_persona || "helpful, concise, and accurate"}.`,
+    `Tone: ${agent.agent_tone || "consultative"}.`,
+    `Response style: ${agent.agent_response_style || "concise"}.`,
+  ].join(" ");
+}
+
+/**
+ * For a "Schedule a Meeting" agent whose model flagged the lead as wanting a
+ * meeting: try to actually book a slot on the connected Google Calendar and
+ * rewrite the draft to mention it. Any failure (no connection, no free slot,
+ * revoked token, Google outage) silently falls back to the agent's configured
+ * meeting link, and never surfaces to the lead or aborts draft generation.
+ */
+async function applyMeetingBooking(agent, draftReply, { threadId, leadEmail, leadName }) {
+  let booking = { success: false };
+
+  try {
+    const connection = await googleCalendarService.getConnectedForAgent(agent.assigned_ai_agent_id);
+
+    if (connection) {
+      const slot = await meetingBookingService.findFreeSlot(agent, connection);
+
+      if (slot) {
+        booking = await meetingBookingService.bookSlot(
+          agent,
+          connection,
+          { ...slot, threadId },
+          leadEmail,
+          leadName
+        );
+      }
+    }
+  } catch (error) {
+    console.warn("Calendar lookup failed while drafting a meeting reply:", error.message);
+  }
+
+  if (booking.success) {
+    const instruction = [
+      `You just successfully booked this lead a meeting for ${formatMeetingTime(booking.startTime, agent.agent_timezone)} (${agent.agent_timezone || "UTC"}).`,
+      `Rewrite the reply below to naturally mention this, thank them, and include this meeting link: ${booking.meetLink || "the calendar invite they have just received"}.`,
+      `Keep the same tone and persona described earlier: ${describePersona(agent)}`,
+      "Write only the email reply body. Do not include a subject line.",
+    ].join("\n");
+
+    return (await rewriteDraft(agent, instruction, draftReply)) || draftReply;
+  }
+
+  const fallbackUrl = cleanString(agent.agent_fallback_meeting_url);
+
+  if (!fallbackUrl) {
+    console.warn(
+      `AI agent ${agent.assigned_ai_agent_id} has meeting booking enabled but no fallback_meeting_url configured; sending the draft unchanged.`
+    );
+    return draftReply;
+  }
+
+  const instruction = [
+    "No meeting slot could be automatically booked.",
+    `Rewrite the reply below into a warm, confident, conversion-focused message that drives the lead to book a time using this link: ${fallbackUrl}.`,
+    "Never mention any technical failure or that booking was attempted.",
+    `Keep the same tone and persona described earlier: ${describePersona(agent)}`,
+    "Write only the email reply body. Do not include a subject line.",
+  ].join("\n");
+
+  return (await rewriteDraft(agent, instruction, draftReply)) || draftReply;
+}
+
+function formatMeetingTime(startTime, timezone) {
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone || "UTC",
+      weekday: "long",
+      month: "long",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    }).format(new Date(startTime));
+  } catch {
+    return new Date(startTime).toISOString();
+  }
 }
 
 async function sendReply({ replyToId, subject, from, to, body }) {
@@ -651,7 +832,12 @@ async function getCampaignWithAgent(integrationId, campaignId) {
             a.safety_rules AS agent_safety_rules,
             a.knowledge_sources AS agent_knowledge_sources,
             a.ai_provider AS agent_provider,
-            a.ai_model AS agent_model
+            a.ai_model AS agent_model,
+            a.fallback_meeting_url AS agent_fallback_meeting_url,
+            a.meeting_duration_minutes AS agent_meeting_duration_minutes,
+            a.working_hours_start AS agent_working_hours_start,
+            a.working_hours_end AS agent_working_hours_end,
+            a.timezone AS agent_timezone
      FROM plusvibe_campaigns c
      LEFT JOIN ai_agents a ON a.id = c.assigned_ai_agent_id
      WHERE c.integration_id = $1
@@ -877,7 +1063,24 @@ async function buildPromptContext(agent, latestInbound, remoteMessages) {
   };
 }
 
+function isMeetingObjective(agent) {
+  return String(agent?.agent_objective || "").trim().toLowerCase() === MEETING_OBJECTIVE;
+}
+
 function buildSystemPrompt(agent) {
+  const meetingInstructions = isMeetingObjective(agent)
+    ? [
+        "",
+        "OUTPUT FORMAT (strict): respond with a single JSON object and nothing else.",
+        "Do not wrap it in markdown code fences. Do not add commentary before or after it.",
+        'The object must have exactly these keys: {"intent": "interested" | "not_interested" | "question" | "other", "wantsMeeting": boolean, "draftReply": string}',
+        '"intent" classifies the lead\'s latest reply.',
+        '"wantsMeeting" is true only when the lead is interested and would plausibly accept a meeting or call now.',
+        '"draftReply" is the email reply body exactly as it would be sent, with no subject line.',
+        'Do not put a specific meeting date, time, or meeting link in "draftReply" — those are added afterwards.',
+      ]
+    : [];
+
   return [
     `You are ${agent.agent_name}, an AI sales reply assistant for ${agent.agent_company_name}.`,
     `Persona: ${agent.agent_persona || "helpful, concise, and accurate"}.`,
@@ -889,6 +1092,7 @@ function buildSystemPrompt(agent) {
     agent.agent_safety_rules ? `Safety rules: ${agent.agent_safety_rules}.` : "",
     "Use the supplied knowledge context when it is relevant. Never invent facts that are not in the agent instructions, conversation, or knowledge base.",
     "Write only the email reply body. Do not include a subject line.",
+    ...meetingInstructions,
   ].filter(Boolean).join("\n");
 }
 
