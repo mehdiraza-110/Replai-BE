@@ -1,8 +1,8 @@
-const https = require("node:https");
 const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { simpleParser } = require("mailparser");
 const db = require("../config/db.config");
 const suppressionService = require("./suppression.service");
+const { resolveSnsEnvelope } = require("../utils/snsEnvelope.util");
 
 // SES inbound receiving is only available in a handful of regions (not necessarily
 // the same region used for sending) — configurable independently of AWS_REGION.
@@ -15,34 +15,9 @@ class SesInboundEmailService {
    * Handles both the one-time SubscriptionConfirmation handshake and ongoing Notifications.
    */
   async handleSnsMessage(rawBody) {
-    let envelope;
-    try {
-      envelope = typeof rawBody === "string" ? JSON.parse(rawBody) : rawBody;
-    } catch {
-      throw Object.assign(new Error("Invalid SNS message body"), { statusCode: 400 });
-    }
-
-    if (envelope.Type === "SubscriptionConfirmation") {
-      await confirmSnsSubscription(envelope.SubscribeURL);
-      return { status: "SubscriptionConfirmed" };
-    }
-
-    if (envelope.Type === "UnsubscribeConfirmation") {
-      return { status: "Acknowledged" };
-    }
-
-    if (envelope.Type !== "Notification") {
-      return { status: "Ignored", reason: `Unhandled SNS message type: ${envelope.Type}` };
-    }
-
-    let sesNotification;
-    try {
-      sesNotification = JSON.parse(envelope.Message);
-    } catch {
-      throw Object.assign(new Error("SNS notification did not contain a valid SES payload"), { statusCode: 400 });
-    }
-
-    return this.handleSesNotification(sesNotification);
+    const { handled, result, message } = await resolveSnsEnvelope(rawBody);
+    if (handled) return result;
+    return this.handleSesNotification(message);
   }
 
   /**
@@ -106,33 +81,6 @@ function streamToBuffer(stream) {
     stream.on("data", (chunk) => chunks.push(chunk));
     stream.on("error", reject);
     stream.on("end", () => resolve(Buffer.concat(chunks)));
-  });
-}
-
-// SNS requires the subscriber to GET the SubscribeURL once to activate the subscription.
-// This endpoint is public/unauthenticated, so a forged "SubscriptionConfirmation" body
-// could otherwise be used to make this server fetch an arbitrary attacker-chosen HTTPS
-// URL (SSRF) — restrict to real SNS hostnames, not just the https:// scheme.
-const SNS_HOSTNAME_PATTERN = /^sns\.[a-z0-9-]+\.amazonaws\.com$/i;
-
-function confirmSnsSubscription(subscribeUrl) {
-  return new Promise((resolve, reject) => {
-    let parsed;
-    try {
-      parsed = subscribeUrl ? new URL(subscribeUrl) : null;
-    } catch {
-      parsed = null;
-    }
-    if (!parsed || parsed.protocol !== "https:" || !SNS_HOSTNAME_PATTERN.test(parsed.hostname)) {
-      reject(Object.assign(new Error("Refusing to confirm SNS subscription: SubscribeURL was not a valid SNS endpoint"), { statusCode: 400 }));
-      return;
-    }
-    https
-      .get(subscribeUrl, (res) => {
-        res.on("data", () => {});
-        res.on("end", resolve);
-      })
-      .on("error", reject);
   });
 }
 

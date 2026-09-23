@@ -27,6 +27,9 @@ const MAIL_FROM_SUBDOMAIN = process.env.SES_MAIL_FROM_SUBDOMAIN || "mail";
 const DMARC_POLICY = process.env.SES_DMARC_POLICY || "v=DMARC1; p=none;";
 const REPUTATION_EVENT_TYPES = ["SEND", "REJECT", "BOUNCE", "COMPLAINT", "DELIVERY", "OPEN", "CLICK", "RENDERING_FAILURE", "DELIVERY_DELAY"];
 const REPUTATION_WINDOW_DAYS = 14;
+// Per-event bounce/complaint capture (PlusVibe-Plan.md 12A.4) — set once the SNS topic
+// exists (see services/sesBounceComplaint.service.js for the handler it delivers to).
+const SES_BOUNCE_COMPLAINT_SNS_TOPIC_ARN = process.env.SES_BOUNCE_COMPLAINT_SNS_TOPIC_ARN || null;
 
 const sesClient = new SESv2Client({ region: AWS_REGION });
 const route53Client = new Route53Client({ region: AWS_REGION });
@@ -291,6 +294,20 @@ class DomainService {
                 },
               ],
             },
+          },
+        })
+      );
+    }
+
+    if (SES_BOUNCE_COMPLAINT_SNS_TOPIC_ARN && !existingDestinations.some((destination) => destination.Name === "sns-bounce-complaint")) {
+      await sesClient.send(
+        new CreateConfigurationSetEventDestinationCommand({
+          ConfigurationSetName: configurationSetName,
+          EventDestinationName: "sns-bounce-complaint",
+          EventDestination: {
+            Enabled: true,
+            MatchingEventTypes: ["BOUNCE", "COMPLAINT"],
+            SnsDestination: { TopicArn: SES_BOUNCE_COMPLAINT_SNS_TOPIC_ARN },
           },
         })
       );

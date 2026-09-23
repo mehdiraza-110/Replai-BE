@@ -507,3 +507,14 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_inbound_messages_from ON inbound_messages(from_address);
+
+-- Outbound send pipeline support (services/campaignSend.service.js): track per-lead send
+-- state beyond the original Pending/Sent/Replied/Bounced set, and per-lead retry bookkeeping.
+ALTER TABLE campaign_leads DROP CONSTRAINT IF EXISTS campaign_leads_status_check;
+ALTER TABLE campaign_leads ADD CONSTRAINT campaign_leads_status_check
+  CHECK (status IN ('Pending', 'Sent', 'Replied', 'Bounced', 'Suppressed', 'Failed'));
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS sent_at TIMESTAMP;
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS send_attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS mailbox_id INT REFERENCES mailboxes(id) ON DELETE SET NULL;
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS ses_message_id VARCHAR(500);

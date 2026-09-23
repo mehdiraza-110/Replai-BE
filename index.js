@@ -9,6 +9,7 @@ const cookieParser = require("cookie-parser");
 const db = require('./config/db.config');
 const realtimeService = require('./services/realtime.service');
 const warmupService = require('./services/warmup.service');
+const campaignSendService = require('./services/campaignSend.service');
 
 dotenv.config();
 
@@ -40,4 +41,14 @@ cron.schedule('5 0 * * *', () => {
     warmupService.runTick()
         .then((results) => console.log(`Warmup engine tick: ${results.length} mailbox(es) processed`))
         .catch((error) => console.error('Warmup engine tick failed:', error.message));
+});
+
+// Campaign send engine: dispatches a small batch of pending leads per mailbox on every
+// tick, so each mailbox's daily_limit is spread across its sending window rather than
+// sent in a single burst. Runs only against campaigns currently inside their configured
+// sending day/window.
+cron.schedule('*/3 * * * *', () => {
+    campaignSendService.runTick()
+        .then((results) => console.log(`Campaign send engine tick: ${results.length} campaign(s) processed`))
+        .catch((error) => console.error('Campaign send engine tick failed:', error.message));
 });
