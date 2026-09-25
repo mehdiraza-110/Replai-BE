@@ -193,6 +193,58 @@ class MailboxService {
     }
     return { id: rows[0].id, email: rows[0].email };
   }
+
+  /**
+   * The app-native inbox for a mailbox (see `messages` table / sesInboundEmail.service.js,
+   * campaignSend.service.js) — every outbound send and inbound reply, newest first.
+   */
+  async listMailboxMessages(mailboxId, { page = 1, limit = 30 } = {}) {
+    const { rows: mailboxRows } = await db.query(`SELECT id, email FROM mailboxes WHERE id = $1 AND is_deleted = FALSE`, [mailboxId]);
+    if (!mailboxRows[0]) {
+      throw Object.assign(new Error("Mailbox not found"), { statusCode: 404 });
+    }
+
+    const pageNum = Math.max(1, Number.parseInt(page, 10) || 1);
+    const limitNum = Math.min(Math.max(Number.parseInt(limit, 10) || 30, 1), 100);
+    const offset = (pageNum - 1) * limitNum;
+
+    const [itemsResult, totalResult] = await Promise.all([
+      db.query(
+        `SELECT * FROM messages WHERE mailbox_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+        [mailboxId, limitNum, offset]
+      ),
+      db.query(`SELECT COUNT(*)::int AS count FROM messages WHERE mailbox_id = $1`, [mailboxId]),
+    ]);
+
+    const total = totalResult.rows[0]?.count || 0;
+    return {
+      items: itemsResult.rows.map(mapMessageRow),
+      page: pageNum,
+      limit: limitNum,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limitNum)),
+    };
+  }
+}
+
+function mapMessageRow(row) {
+  return {
+    id: row.id,
+    mailboxId: row.mailbox_id,
+    direction: row.direction,
+    campaignId: row.campaign_id,
+    campaignLeadId: row.campaign_lead_id,
+    threadId: row.thread_id,
+    messageId: row.message_id,
+    inReplyTo: row.in_reply_to,
+    fromAddress: row.from_address,
+    toAddress: row.to_address,
+    subject: row.subject,
+    bodyText: row.body_text,
+    bodyHtml: row.body_html,
+    isRead: row.is_read,
+    createdAt: row.created_at,
+  };
 }
 
 function mapMailboxRow(row) {
@@ -210,6 +262,8 @@ function mapMailboxRow(row) {
     status: row.status,
     dailyLimit: row.daily_limit,
     sentToday: row.sent_today,
+    marketDailyLimit: row.market_daily_limit ?? 0,
+    marketSentToday: row.market_sent_today ?? 0,
     warmupStage: row.warmup_stage,
     reputationStatus: row.reputation_status,
     lastSentAt: row.last_sent_at,

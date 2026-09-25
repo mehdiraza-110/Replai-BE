@@ -237,7 +237,7 @@ class WarmupService {
   async runTick() {
     const { rows } = await db.query(
       `SELECT m.*, d.domain AS domain_name, d.status AS domain_status, d.bounce_rate AS domain_bounce_rate, d.complaint_rate AS domain_complaint_rate,
-              ws.name AS warmup_strategy_name, ws.start_daily_limit, ws.steady_state_daily_limit, ws.increment_per_stage, ws.stage_duration_days, ws.safety_tiers
+              ws.name AS warmup_strategy_name, ws.start_daily_limit, ws.steady_state_daily_limit, ws.steady_state_market_daily_limit, ws.increment_per_stage, ws.stage_duration_days, ws.safety_tiers
        FROM mailboxes m
        JOIN warmup_strategies ws ON ws.id = m.warmup_strategy_id AND ws.is_deleted = FALSE
        JOIN domains d ON d.id = m.domain_id
@@ -288,6 +288,12 @@ class WarmupService {
       }
     }
 
+    // Market lane only unlocks once the mailbox has actually reached (and stayed at) Steady
+    // State — a pullback that drops it back into Ramping also drops market volume to 0 for
+    // that day, since a reputation issue serious enough to pause the ramp shouldn't be
+    // masked by continuing to run real campaign sends on the same mailbox.
+    const marketDailyLimit = warmupStage === "Steady State" ? row.steady_state_market_daily_limit : 0;
+
     const { rows: updatedRows } = await db.query(
       `UPDATE mailboxes SET
          daily_limit = $2,
@@ -297,10 +303,12 @@ class WarmupService {
          warmup_last_action = $6,
          warmup_last_tick_at = NOW(),
          sent_today = 0,
+         market_daily_limit = $7,
+         market_sent_today = 0,
          updated_at = NOW()
        WHERE id = $1
        RETURNING *`,
-      [row.id, dailyLimit, warmupStage, reputationStatus, mailboxStatus, warmupLastAction]
+      [row.id, dailyLimit, warmupStage, reputationStatus, mailboxStatus, warmupLastAction, marketDailyLimit]
     );
 
     return mapMailboxRow({

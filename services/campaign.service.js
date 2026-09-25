@@ -311,3 +311,6 @@ function mapCampaignLeadRow(row) {
 }
 
 module.exports = new CampaignService();
+// Shared with services/warmupPool.service.js so warmup-pool emails get the same
+// compliance footer as regular campaign emails, without duplicating the logic.
+module.exports.withOptOutFooter = withOptOutFooter;

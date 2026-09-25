@@ -41,6 +41,8 @@ class SesInboundEmailService {
    * Fetches the raw MIME message from S3, parses it, checks for an opt-out reply,
    * and logs it. This is the piece that actually matters for compliance: any reply
    * whose body matches the opt-out pattern suppresses that sender address immediately.
+   * Also records the message in the app-native per-mailbox inbox (see `messages` table)
+   * when the recipient address matches one of our onboarded mailboxes.
    */
   async processStoredEmail({ bucket, key }) {
     const raw = await fetchRawEmail(bucket, key);
@@ -65,7 +67,46 @@ class SesInboundEmailService {
       [parsed.messageId || null, fromAddress, toAddress, parsed.subject || null, bodyText, bucket, key, isOptOut]
     );
 
+    if (toAddress && fromAddress) {
+      await this.recordInboxMessage({ fromAddress, toAddress, parsed, bodyText });
+    }
+
     return { status: "Processed", fromAddress, toAddress, isOptOut };
+  }
+
+  async recordInboxMessage({ fromAddress, toAddress, parsed, bodyText }) {
+    const { rows: mailboxRows } = await db.query(`SELECT id FROM mailboxes WHERE email = $1 AND is_deleted = FALSE`, [toAddress]);
+    const mailbox = mailboxRows[0];
+    if (!mailbox) return; // Not one of our mailboxes (e.g. a bounce-routing address) — nothing to show in an inbox.
+
+    const { rows: leadRows } = await db.query(
+      `SELECT id, campaign_id, status FROM campaign_leads WHERE mailbox_id = $1 AND email = $2 ORDER BY sent_at DESC NULLS LAST LIMIT 1`,
+      [mailbox.id, fromAddress]
+    );
+    const lead = leadRows[0] || null;
+
+    await db.query(
+      `INSERT INTO messages (mailbox_id, direction, campaign_id, campaign_lead_id, thread_id, message_id, in_reply_to, from_address, to_address, subject, body_text, body_html)
+       VALUES ($1, 'inbound', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      [
+        mailbox.id,
+        lead?.campaign_id || null,
+        lead?.id || null,
+        `${mailbox.id}:${fromAddress}`,
+        parsed.messageId || null,
+        parsed.inReplyTo || null,
+        fromAddress,
+        toAddress,
+        parsed.subject || null,
+        bodyText,
+        parsed.html || null,
+      ]
+    );
+
+    if (lead && lead.status !== "Replied") {
+      await db.query(`UPDATE campaign_leads SET status = 'Replied' WHERE id = $1`, [lead.id]);
+      await db.query(`UPDATE campaigns SET reply_count = reply_count + 1, updated_at = NOW() WHERE id = $1`, [lead.campaign_id]);
+    }
   }
 }
 

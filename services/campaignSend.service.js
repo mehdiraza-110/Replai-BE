@@ -43,7 +43,12 @@ class CampaignSendService {
 
     let sentCount = 0;
     for (const mailbox of mailboxes) {
-      const remainingCapacity = mailbox.daily_limit - mailbox.sent_today;
+      // Warmup sends draw from the permanent warmup-lane allowance (daily_limit/sent_today);
+      // real campaigns draw from the separate market-lane allowance, which only unlocks once
+      // a mailbox finishes ramping. See warmup.service.js tickMailbox.
+      const remainingCapacity = campaign.is_warmup
+        ? mailbox.daily_limit - mailbox.sent_today
+        : mailbox.market_daily_limit - mailbox.market_sent_today;
       const batchSize = Math.max(0, Math.min(MAX_SENDS_PER_MAILBOX_PER_TICK, remainingCapacity));
       if (batchSize === 0) continue;
 
@@ -66,6 +71,10 @@ class CampaignSendService {
       mailboxFilter = `AND m.id = ANY($${params.length}::int[])`;
     }
 
+    const capacityFilter = campaign.is_warmup
+      ? "m.sent_today < m.daily_limit"
+      : "m.market_daily_limit > 0 AND m.market_sent_today < m.market_daily_limit";
+
     const { rows } = await db.query(
       `SELECT m.*, d.status AS domain_status, d.configuration_set_name
        FROM mailboxes m
@@ -73,7 +82,7 @@ class CampaignSendService {
        WHERE m.is_deleted = FALSE
          AND m.status = 'Active'
          AND d.status = 'Verified'
-         AND m.sent_today < m.daily_limit
+         AND ${capacityFilter}
          ${mailboxFilter}
        ORDER BY m.sent_today ASC, m.id ASC`,
       params
@@ -106,7 +115,7 @@ class CampaignSendService {
     const listUnsubscribeHeaders = suppressionService.buildListUnsubscribeHeaders({ email: lead.email, campaignId: campaign.id });
     const fromAddress = mailbox.display_name ? `"${escapeHeaderValue(mailbox.display_name)}" <${mailbox.email}>` : mailbox.email;
 
-    const raw = buildRawMimeMessage({
+    const { raw, messageId: rfcMessageId } = buildRawMimeMessage({
       from: fromAddress,
       to: lead.email,
       subject,
@@ -127,17 +136,26 @@ class CampaignSendService {
       const response = await sesClient.send(command);
 
       await db.query(
-        `UPDATE campaign_leads SET status = 'Sent', sent_at = NOW(), mailbox_id = $2, ses_message_id = $3
+        `UPDATE campaign_leads SET status = 'Sent', sent_at = NOW(), mailbox_id = $2, ses_message_id = $3, rfc_message_id = $4
          WHERE id = $1`,
-        [lead.id, mailbox.id, response.MessageId || null]
+        [lead.id, mailbox.id, response.MessageId || null, rfcMessageId]
       );
       await db.query(
-        `UPDATE mailboxes SET sent_today = sent_today + 1, last_sent_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        campaign.is_warmup
+          ? `UPDATE mailboxes SET sent_today = sent_today + 1, last_sent_at = NOW(), updated_at = NOW() WHERE id = $1`
+          : `UPDATE mailboxes SET market_sent_today = market_sent_today + 1, last_sent_at = NOW(), updated_at = NOW() WHERE id = $1`,
         [mailbox.id]
       );
       await db.query(
         `UPDATE campaigns SET sent_today = sent_today + 1, sent_total = sent_total + 1, updated_at = NOW() WHERE id = $1`,
         [campaign.id]
+      );
+      // Record the send in the mailbox's app-native inbox too, so the "open inbox" view
+      // shows the full thread (what we sent + any reply), not just replies.
+      await db.query(
+        `INSERT INTO messages (mailbox_id, direction, campaign_id, campaign_lead_id, thread_id, message_id, from_address, to_address, subject, body_text)
+         VALUES ($1, 'outbound', $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [mailbox.id, campaign.id, lead.id, threadIdFor(mailbox.id, lead.email), rfcMessageId, mailbox.email, lead.email, subject, body]
       );
 
       return { sent: true };
@@ -222,7 +240,12 @@ function buildRawMimeMessage({ from, to, subject, body, extraHeaders = {} }) {
     `Message-ID: ${messageId}`,
     ...Object.entries(extraHeaders).map(([key, value]) => `${key}: ${value}`),
   ];
-  return Buffer.from(`${headerLines.join("\r\n")}\r\n\r\n${body}`, "utf8");
+  return { raw: Buffer.from(`${headerLines.join("\r\n")}\r\n\r\n${body}`, "utf8"), messageId };
+}
+
+/** Deterministic thread key shared by outbound sends and inbound replies for a given mailbox+lead. */
+function threadIdFor(mailboxId, leadEmail) {
+  return `${mailboxId}:${String(leadEmail || "").trim().toLowerCase()}`;
 }
 
 function encodeSubject(subject) {
@@ -233,3 +256,8 @@ function encodeSubject(subject) {
 }
 
 module.exports = new CampaignSendService();
+// Shared with services/inbox.service.js so a unified-inbox reply is built and threaded
+// exactly like a campaign send, rather than duplicating the MIME/thread-id logic.
+module.exports.buildRawMimeMessage = buildRawMimeMessage;
+module.exports.threadIdFor = threadIdFor;
+module.exports.sesClient = sesClient;

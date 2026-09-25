@@ -53,6 +53,18 @@ async function deleteMailbox(req, res) {
   }
 }
 
+async function listMailboxMessages(req, res) {
+  try {
+    const data = await mailboxService.listMailboxMessages(req.params.id, {
+      page: req.query.page,
+      limit: req.query.limit,
+    });
+    res.status(200).json({ success: true, message: "Messages fetched successfully", data });
+  } catch (error) {
+    sendError(res, error, "Unable to fetch messages");
+  }
+}
+
 function sendError(res, error, fallbackMessage) {
   res.status(error.statusCode || 500).json({
     success: false,
@@ -68,4 +80,5 @@ module.exports = {
   refreshMailbox,
   refreshAllMailboxes,
   deleteMailbox,
+  listMailboxMessages,
 };

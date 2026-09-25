@@ -18,6 +18,8 @@ const domainRoutes = require('./domain.routes');
 const mailboxRoutes = require('./mailbox.routes');
 const warmupRoutes = require('./warmup.routes');
 const campaignRoutes = require('./campaign.routes');
+const inboxRoutes = require('./inbox.routes');
+const warmupPoolRoutes = require('./warmup-pool.routes');
 const unsubscribeRoutes = require('./unsubscribe.routes');
 const suppressionRoutes = require('./suppression.routes');
 const sesInboundRoutes = require('./ses-inbound.routes');
@@ -46,6 +48,8 @@ router.use('/unsubscribe', unsubscribeRoutes);
 router.use('/suppressions', suppressionRoutes);
 router.use('/ses-inbound', sesInboundRoutes);
 router.use('/ses-events', sesEventsRoutes);
+router.use('/mailer-inbox', inboxRoutes);
+router.use('/warmup-pool', warmupPoolRoutes);
 
 
 module.exports = router;

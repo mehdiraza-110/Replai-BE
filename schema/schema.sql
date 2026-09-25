@@ -518,3 +518,51 @@ ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS send_attempts INT NOT NULL D
 ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS last_error TEXT;
 ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS mailbox_id INT REFERENCES mailboxes(id) ON DELETE SET NULL;
 ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS ses_message_id VARCHAR(500);
+-- The actual RFC822 Message-ID header used on the outbound send (not SES's internal
+-- ses_message_id above) — kept for reference/debugging even though thread grouping
+-- below uses mailbox+lead-email instead of In-Reply-To/References header matching.
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS rfc_message_id VARCHAR(500);
+
+-- Per-mailbox inbox (app-native, not a real IMAP/SMTP mailbox): every outbound send and
+-- every inbound reply for a mailbox, so the "open inbox" UI on the Mailboxes page has
+-- something to show. Threading is deliberately simple: (mailbox, lead email) rather than
+-- In-Reply-To/References header matching, since we control both send and receive and
+-- already tie campaign_leads to the mailbox that sent to it.
+CREATE TABLE IF NOT EXISTS messages (
+  id SERIAL PRIMARY KEY,
+  mailbox_id INT NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
+  direction VARCHAR(20) NOT NULL CHECK (direction IN ('outbound', 'inbound')),
+  campaign_id INT REFERENCES campaigns(id) ON DELETE SET NULL,
+  campaign_lead_id INT REFERENCES campaign_leads(id) ON DELETE SET NULL,
+  thread_id VARCHAR(400) NOT NULL,
+  message_id VARCHAR(500),
+  in_reply_to VARCHAR(500),
+  from_address VARCHAR(350) NOT NULL,
+  to_address VARCHAR(350) NOT NULL,
+  subject TEXT,
+  body_text TEXT,
+  body_html TEXT,
+  is_read BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox ON messages(mailbox_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(mailbox_id, thread_id, created_at);
+
+-- Always-on warmup lane (services/warmupPool.service.js, campaignSend.service.js): every
+-- mailbox keeps sending a fixed daily quota of real, single-use warmup emails forever,
+-- separate from and in addition to real market campaign sends, once it finishes ramping.
+ALTER TABLE warmup_strategies ADD COLUMN IF NOT EXISTS steady_state_market_daily_limit INT NOT NULL DEFAULT 20;
+
+-- `daily_limit`/`sent_today` (existing columns) remain the warmup-lane counters, ramped
+-- 5 -> steady_state_daily_limit by warmup.service.js exactly as before. These new columns
+-- are the separate market-lane counters, unlocked (set > 0) only once ramp completes.
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS market_daily_limit INT NOT NULL DEFAULT 0;
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS market_sent_today INT NOT NULL DEFAULT 0;
+
+-- Marks the one singleton "always active" campaign that holds the shared warmup lead
+-- pool in its own campaign_leads rows (single-use — a lead is never re-sent once its
+-- status flips to Sent) rather than a customer-uploaded list, and whose sends draw
+-- mailbox capacity from the warmup lane (daily_limit/sent_today) instead of the market
+-- lane. See services/warmupPool.service.js.
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS is_warmup BOOLEAN NOT NULL DEFAULT FALSE;

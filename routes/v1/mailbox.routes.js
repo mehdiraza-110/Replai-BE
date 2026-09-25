@@ -7,6 +7,7 @@ router.get("/", mailboxController.listMailboxes);
 router.post("/", mailboxController.createMailboxes);
 router.post("/refresh", mailboxController.refreshAllMailboxes);
 router.post("/:id/refresh", mailboxController.refreshMailbox);
+router.get("/:id/messages", mailboxController.listMailboxMessages);
 router.delete("/:id", mailboxController.deleteMailbox);
 
 module.exports = router;
