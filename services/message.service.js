@@ -560,6 +560,11 @@ async function ensureDraft(integrationId, campaign, latestInbound, remoteMessage
   return mapDraft(result.rows[0]);
 }
 
+// Reasoning-style models (gpt-5*, o-series) only accept the default temperature.
+function temperatureParams(model, value) {
+  return /^(gpt-5|o\d)/i.test(String(model || "")) ? {} : { temperature: value };
+}
+
 async function generateResponse(agent, context) {
   if (String(agent.agent_provider || "").toLowerCase() === "openai" && process.env.OPENAI_API_KEY) {
     try {
@@ -571,7 +576,7 @@ async function generateResponse(agent, context) {
         },
         body: JSON.stringify({
           model: agent.agent_model,
-          temperature: 0.4,
+          ...temperatureParams(agent.agent_model, 0.4),
           messages: [
             { role: "system", content: buildSystemPrompt(agent) },
             { role: "user", content: JSON.stringify(context, null, 2) },
@@ -668,7 +673,7 @@ async function rewriteDraft(agent, instruction, draftReply) {
       },
       body: JSON.stringify({
         model: agent.agent_model,
-        temperature: 0.4,
+        ...temperatureParams(agent.agent_model, 0.4),
         messages: [
           { role: "system", content: instruction },
           { role: "user", content: draftReply },
