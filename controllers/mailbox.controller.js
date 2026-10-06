@@ -26,6 +26,28 @@ async function createMailboxes(req, res) {
   }
 }
 
+async function quoteMailboxes(req, res) {
+  try {
+    const count = Number.parseInt(req.body?.count, 10);
+    if (!Number.isFinite(count) || count < 1 || count > 500) {
+      throw Object.assign(new Error("count must be between 1 and 500"), { statusCode: 400 });
+    }
+    const data = await require("../services/maildoso.service").quoteMailboxes(count);
+    res.status(200).json({ success: true, message: "Mailbox cost estimated", data });
+  } catch (error) {
+    sendError(res, error, "Unable to estimate the cost");
+  }
+}
+
+async function syncMaildoso(req, res) {
+  try {
+    const data = await require("../services/maildoso.service").syncMailboxes();
+    res.status(200).json({ success: true, message: "Maildoso mailboxes synced", data });
+  } catch (error) {
+    sendError(res, error, "Unable to sync Maildoso mailboxes");
+  }
+}
+
 async function refreshMailbox(req, res) {
   try {
     const data = await mailboxService.refreshMailbox(req.params.id);
@@ -77,6 +99,8 @@ function sendError(res, error, fallbackMessage) {
 module.exports = {
   listMailboxes,
   createMailboxes,
+  syncMaildoso,
+  quoteMailboxes,
   refreshMailbox,
   refreshAllMailboxes,
   deleteMailbox,

@@ -1,7 +1,8 @@
 const crypto = require("crypto");
-const { SESv2Client, SendEmailCommand } = require("@aws-sdk/client-sesv2");
+const { SESv2Client } = require("@aws-sdk/client-sesv2");
 const db = require("../config/db.config");
 const suppressionService = require("./suppression.service");
+const { sendRawEmail } = require("./mailTransport.service");
 
 const AWS_REGION = process.env.AWS_REGION || "us-east-1";
 const sesClient = new SESv2Client({ region: AWS_REGION });
@@ -49,8 +50,20 @@ class CampaignSendService {
       const remainingCapacity = campaign.is_warmup
         ? mailbox.daily_limit - mailbox.sent_today
         : mailbox.market_daily_limit - mailbox.market_sent_today;
-      const batchSize = Math.max(0, Math.min(MAX_SENDS_PER_MAILBOX_PER_TICK, remainingCapacity));
+      let batchSize = Math.max(0, Math.min(MAX_SENDS_PER_MAILBOX_PER_TICK, remainingCapacity));
       if (batchSize === 0) continue;
+
+      // Follow-ups to people this mailbox already emailed take priority over new leads: a
+      // sequence that stalls mid-way wastes the first touch. Warmup pool has no follow-ups.
+      if (!campaign.is_warmup) {
+        const dueFollowUps = await this.getDueFollowUps(campaign.id, mailbox.id, batchSize);
+        for (const lead of dueFollowUps) {
+          const outcome = await this.sendToLead(campaign, mailbox, lead, { followUp: lead.followup });
+          if (outcome.sent) sentCount += 1;
+          batchSize -= 1;
+        }
+        if (batchSize <= 0) continue;
+      }
 
       const leads = await this.getPendingLeads(campaign.id, batchSize);
       for (const lead of leads) {
@@ -101,7 +114,33 @@ class CampaignSendService {
     return rows;
   }
 
-  async sendToLead(campaign, mailbox, lead) {
+  /**
+   * Leads this mailbox emailed earlier whose next follow-up step is now due: the delay (in
+   * days) is counted from the lead's last email. Only leads still in 'Sent' qualify, so a
+   * reply, bounce, opt-out or suppression automatically ends the sequence.
+   */
+  async getDueFollowUps(campaignId, mailboxId, limit) {
+    const { rows } = await db.query(
+      `SELECT cl.*, fu.step_order AS fu_step_order, fu.body AS fu_body
+       FROM campaign_leads cl
+       JOIN LATERAL (
+         SELECT step_order, delay_days, body
+         FROM campaign_followups
+         WHERE campaign_id = cl.campaign_id
+         ORDER BY step_order ASC
+         OFFSET cl.followup_step LIMIT 1
+       ) fu ON TRUE
+       WHERE cl.campaign_id = $1 AND cl.mailbox_id = $2 AND cl.status = 'Sent'
+         AND cl.last_contacted_at + (fu.delay_days * INTERVAL '1 day') <= NOW()
+         AND (cl.followup_retry_after IS NULL OR cl.followup_retry_after <= NOW())
+       ORDER BY cl.last_contacted_at ASC
+       LIMIT $3`,
+      [campaignId, mailboxId, limit]
+    );
+    return rows.map((row) => ({ ...row, followup: { step: row.followup_step + 1, body: row.fu_body } }));
+  }
+
+  async sendToLead(campaign, mailbox, lead, { followUp = null } = {}) {
     // Belt-and-suspenders: campaign creation already filters known suppressions at
     // import time, but a lead could opt out (or a new bounce/complaint land) any time
     // between then and now — re-check immediately before every send.
@@ -110,9 +149,11 @@ class CampaignSendService {
       return { sent: false, reason: "suppressed" };
     }
 
-    const subject = personalize(campaign.subject, lead);
-    const body = personalize(campaign.body, lead);
+    const baseSubject = personalize(campaign.subject, lead);
+    const subject = followUp ? (/^re:/i.test(baseSubject) ? baseSubject : `Re: ${baseSubject}`) : baseSubject;
+    const body = personalize(followUp ? followUp.body : campaign.body, lead);
     const listUnsubscribeHeaders = suppressionService.buildListUnsubscribeHeaders({ email: lead.email, campaignId: campaign.id });
+    const threadHeaders = followUp && lead.rfc_message_id ? { "In-Reply-To": lead.rfc_message_id, References: lead.rfc_message_id } : {};
     const fromAddress = mailbox.display_name ? `"${escapeHeaderValue(mailbox.display_name)}" <${mailbox.email}>` : mailbox.email;
 
     const { raw, messageId: rfcMessageId } = buildRawMimeMessage({
@@ -120,34 +161,48 @@ class CampaignSendService {
       to: lead.email,
       subject,
       body,
-      extraHeaders: listUnsubscribeHeaders,
+      extraHeaders: { ...listUnsubscribeHeaders, ...threadHeaders },
+      messageIdDomain: mailboxDomain(mailbox),
     });
 
     try {
-      const command = new SendEmailCommand({
-        FromEmailAddress: fromAddress,
-        Destination: { ToAddresses: [lead.email] },
-        Content: { Raw: { Data: raw } },
-        ConfigurationSetName: mailbox.configuration_set_name || undefined,
-        // Tags come back on bounce/complaint SNS events so sesBounceComplaint.service.js
-        // can attribute them to the right campaign for suppression/audit purposes.
-        EmailTags: [{ Name: "campaign_id", Value: String(campaign.id) }],
+      // Tags come back on bounce/complaint SNS events so sesBounceComplaint.service.js
+      // can attribute them to the right campaign for suppression/audit purposes (SES only).
+      const providerMessageId = await sendRawEmail({
+        mailbox,
+        fromAddress,
+        to: lead.email,
+        raw,
+        sesClient,
+        tags: [{ Name: "campaign_id", Value: String(campaign.id) }],
       });
-      const response = await sesClient.send(command);
 
-      await db.query(
-        `UPDATE campaign_leads SET status = 'Sent', sent_at = NOW(), mailbox_id = $2, ses_message_id = $3, rfc_message_id = $4
-         WHERE id = $1`,
-        [lead.id, mailbox.id, response.MessageId || null, rfcMessageId]
-      );
+      if (followUp) {
+        // The thread's original rfc_message_id stays as the In-Reply-To anchor; only the step
+        // counter and last-contact clock move.
+        await db.query(
+          `UPDATE campaign_leads SET followup_step = $2, last_contacted_at = NOW(), followup_retry_after = NULL, last_error = NULL WHERE id = $1`,
+          [lead.id, followUp.step]
+        );
+      } else {
+        await db.query(
+          `UPDATE campaign_leads SET status = 'Sent', sent_at = NOW(), last_contacted_at = NOW(), mailbox_id = $2, ses_message_id = $3, rfc_message_id = $4
+           WHERE id = $1`,
+          [lead.id, mailbox.id, providerMessageId, rfcMessageId]
+        );
+      }
       await db.query(
         campaign.is_warmup
           ? `UPDATE mailboxes SET sent_today = sent_today + 1, last_sent_at = NOW(), updated_at = NOW() WHERE id = $1`
           : `UPDATE mailboxes SET market_sent_today = market_sent_today + 1, last_sent_at = NOW(), updated_at = NOW() WHERE id = $1`,
         [mailbox.id]
       );
+      // Follow-ups count toward today's volume but not sent_total, which is the denominator
+      // of reply/bounce rate and should stay "first emails sent".
       await db.query(
-        `UPDATE campaigns SET sent_today = sent_today + 1, sent_total = sent_total + 1, updated_at = NOW() WHERE id = $1`,
+        followUp
+          ? `UPDATE campaigns SET sent_today = sent_today + 1, updated_at = NOW() WHERE id = $1`
+          : `UPDATE campaigns SET sent_today = sent_today + 1, sent_total = sent_total + 1, updated_at = NOW() WHERE id = $1`,
         [campaign.id]
       );
       // Record the send in the mailbox's app-native inbox too, so the "open inbox" view
@@ -160,6 +215,15 @@ class CampaignSendService {
 
       return { sent: true };
     } catch (error) {
+      if (followUp) {
+        // A failed follow-up must not mark the lead Failed (the first email already landed);
+        // just back off an hour before this step is tried again.
+        await db.query(
+          `UPDATE campaign_leads SET last_error = $2, followup_retry_after = NOW() + INTERVAL '1 hour' WHERE id = $1`,
+          [lead.id, error.message || String(error)]
+        );
+        return { sent: false, reason: "send_error", error: error.message };
+      }
       const attempts = lead.send_attempts + 1;
       const status = attempts >= MAX_SEND_ATTEMPTS ? "Failed" : "Pending";
       await db.query(
@@ -228,12 +292,18 @@ function escapeHeaderValue(value) {
   return String(value || "").replace(/["\r\n]/g, "");
 }
 
-function buildRawMimeMessage({ from, to, subject, body, extraHeaders = {} }) {
-  const messageId = `<${crypto.randomUUID()}@replyos>`;
+/** Domain part of the mailbox address, used so Message-IDs are on the sender's own domain. */
+function mailboxDomain(mailbox) {
+  return String(mailbox.email || "").split("@")[1] || undefined;
+}
+
+function buildRawMimeMessage({ from, to, subject, body, extraHeaders = {}, messageIdDomain = "replyos" }) {
+  const messageId = `<${crypto.randomUUID()}@${messageIdDomain}>`;
   const headerLines = [
     `From: ${from}`,
     `To: ${to}`,
     `Subject: ${encodeSubject(subject)}`,
+    `Date: ${new Date().toUTCString()}`,
     `MIME-Version: 1.0`,
     `Content-Type: text/plain; charset="UTF-8"`,
     `Content-Transfer-Encoding: 7bit`,
@@ -260,4 +330,5 @@ module.exports = new CampaignSendService();
 // exactly like a campaign send, rather than duplicating the MIME/thread-id logic.
 module.exports.buildRawMimeMessage = buildRawMimeMessage;
 module.exports.threadIdFor = threadIdFor;
+module.exports.mailboxDomain = mailboxDomain;
 module.exports.sesClient = sesClient;

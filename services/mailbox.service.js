@@ -69,7 +69,7 @@ class MailboxService {
     };
   }
 
-  async createMailboxes({ domain, localParts, displayName, dailyLimit, createdBy }) {
+  async createMailboxes({ domain, localParts, displayName, dailyLimit, createdBy, acceptedMonthlyIncreaseCents }) {
     const domainName = String(domain || "").trim().toLowerCase();
     if (!domainName) {
       throw Object.assign(new Error("domain is required"), { statusCode: 400 });
@@ -85,6 +85,11 @@ class MailboxService {
     const domainRow = domainRows[0];
     if (!domainRow) {
       throw Object.assign(new Error(`Domain ${domainName} hasn't been onboarded yet`), { statusCode: 404 });
+    }
+
+    // Maildoso-managed domains create real, billable mailboxes at Maildoso (cost-confirmed).
+    if (domainRow.provider === "Maildoso") {
+      return this.createMaildosoMailboxes({ domainRow, localParts, displayName, acceptedMonthlyIncreaseCents });
     }
 
     const limit = Number.isFinite(Number(dailyLimit)) && Number(dailyLimit) > 0 ? Math.floor(Number(dailyLimit)) : 20;
@@ -130,6 +135,41 @@ class MailboxService {
     }
 
     return results;
+  }
+
+  async createMaildosoMailboxes({ domainRow, localParts, displayName, acceptedMonthlyIncreaseCents }) {
+    const maildosoService = require("./maildoso.service");
+    const cleaned = Array.from(new Set(localParts.map((part) => String(part || "").trim().toLowerCase()).filter(Boolean)));
+    const invalid = cleaned.filter((part) => !LOCAL_PART_PATTERN.test(part));
+    if (invalid.length > 0) {
+      throw Object.assign(new Error(`Invalid mailbox name(s): ${invalid.join(", ")}`), { statusCode: 400 });
+    }
+
+    const { rows: existing } = await db.query(`SELECT email FROM mailboxes WHERE email = ANY($1::text[]) AND is_deleted = FALSE`, [
+      cleaned.map((part) => `${part}@${domainRow.domain}`),
+    ]);
+    const existingEmails = new Set(existing.map((row) => row.email));
+    const toCreate = cleaned.filter((part) => !existingEmails.has(`${part}@${domainRow.domain}`));
+
+    const failed = [...existingEmails].map((email) => ({ email, status: "Failed", error: "A mailbox with this email already exists" }));
+    if (toCreate.length === 0) return failed;
+
+    const { results } = await maildosoService.provisionMailboxes({
+      domain: domainRow.domain,
+      mailboxes: toCreate.map((localPart) => ({ localPart, ...nameForMailbox(localPart, displayName) })),
+      acceptedMonthlyIncreaseCents,
+    });
+
+    const { rows } = await db.query(
+      `SELECT m.*, d.domain AS domain_name, d.status AS domain_status, d.bounce_rate AS domain_bounce_rate, d.complaint_rate AS domain_complaint_rate
+       FROM mailboxes m JOIN domains d ON d.id = m.domain_id WHERE m.email = ANY($1::text[]) AND m.is_deleted = FALSE`,
+      [results.map((result) => result.email)]
+    );
+    const rowsByEmail = new Map(rows.map((row) => [row.email, row]));
+    return [
+      ...results.map((result) => ({ ...result, record: rowsByEmail.has(result.email) ? mapMailboxRow(rowsByEmail.get(result.email)) : undefined })),
+      ...failed,
+    ];
   }
 
   async refreshMailbox(id) {
@@ -245,6 +285,16 @@ function mapMessageRow(row) {
     isRead: row.is_read,
     createdAt: row.created_at,
   };
+}
+
+/** Maildoso needs a first and last name per mailbox: use the shared display name, else derive from the address. */
+function nameForMailbox(localPart, displayName) {
+  const titleCase = (word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+  const fromDisplay = String(displayName || "").trim().split(/\s+/).filter(Boolean);
+  const tokens = fromDisplay.length > 0 ? fromDisplay : localPart.split(/[._+-]+/).filter((token) => /^[a-z]+$/i.test(token));
+  const firstName = titleCase(tokens[0] || localPart.replace(/[^a-z]/gi, "") || "Team");
+  const lastName = titleCase(tokens.slice(1).join(" ") || "Team");
+  return { firstName, lastName };
 }
 
 function mapMailboxRow(row) {

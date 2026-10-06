@@ -47,7 +47,14 @@ class SesInboundEmailService {
   async processStoredEmail({ bucket, key }) {
     const raw = await fetchRawEmail(bucket, key);
     const parsed = await simpleParser(raw);
+    return this.processParsedEmail({ parsed, bucket, key });
+  }
 
+  /**
+   * Shared by the SES/S3 path above and the IMAP poller (imapInbox.service.js): opt-out
+   * detection, the inbound_messages audit row, and the per-mailbox inbox record.
+   */
+  async processParsedEmail({ parsed, bucket = null, key = null }) {
     const fromAddress = parsed.from?.value?.[0]?.address?.toLowerCase() || null;
     const toAddress = parsed.to?.value?.[0]?.address?.toLowerCase() || null;
     const bodyText = String(parsed.text || "").trim();
@@ -85,9 +92,10 @@ class SesInboundEmailService {
     );
     const lead = leadRows[0] || null;
 
-    await db.query(
+    const { rows: insertedRows } = await db.query(
       `INSERT INTO messages (mailbox_id, direction, campaign_id, campaign_lead_id, thread_id, message_id, in_reply_to, from_address, to_address, subject, body_text, body_html)
-       VALUES ($1, 'inbound', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+       VALUES ($1, 'inbound', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       RETURNING id`,
       [
         mailbox.id,
         lead?.campaign_id || null,
@@ -106,6 +114,14 @@ class SesInboundEmailService {
     if (lead && lead.status !== "Replied") {
       await db.query(`UPDATE campaign_leads SET status = 'Replied' WHERE id = $1`, [lead.id]);
       await db.query(`UPDATE campaigns SET reply_count = reply_count + 1, updated_at = NOW() WHERE id = $1`, [lead.campaign_id]);
+    }
+
+    // Let the campaign's AI agent (if any) draft — or send — a reply. Fire-and-forget: a model
+    // or send failure must never lose the inbound message that was just recorded.
+    if (lead?.campaign_id) {
+      require("./nativeAgentReply.service")
+        .handleInbound({ mailboxId: mailbox.id, campaignId: lead.campaign_id, leadId: lead.id, inboundMessageId: insertedRows[0].id })
+        .catch((error) => console.error("Native AI reply failed:", error.message));
     }
   }
 }

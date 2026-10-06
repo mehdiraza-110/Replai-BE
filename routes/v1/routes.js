@@ -24,6 +24,7 @@ const unsubscribeRoutes = require('./unsubscribe.routes');
 const suppressionRoutes = require('./suppression.routes');
 const sesInboundRoutes = require('./ses-inbound.routes');
 const sesEventsRoutes = require('./ses-events.routes');
+const postalRoutes = require('./postal.routes');
 
 // User routes
 router.use('/users', userRoutes);
@@ -48,6 +49,7 @@ router.use('/unsubscribe', unsubscribeRoutes);
 router.use('/suppressions', suppressionRoutes);
 router.use('/ses-inbound', sesInboundRoutes);
 router.use('/ses-events', sesEventsRoutes);
+router.use('/postal', postalRoutes);
 router.use('/mailer-inbox', inboxRoutes);
 router.use('/warmup-pool', warmupPoolRoutes);
 

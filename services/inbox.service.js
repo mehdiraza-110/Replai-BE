@@ -1,7 +1,7 @@
-const { SendEmailCommand } = require("@aws-sdk/client-sesv2");
 const db = require("../config/db.config");
 const suppressionService = require("./suppression.service");
-const { buildRawMimeMessage, threadIdFor, sesClient } = require("./campaignSend.service");
+const { buildRawMimeMessage, threadIdFor, sesClient, mailboxDomain } = require("./campaignSend.service");
+const { sendRawEmail } = require("./mailTransport.service");
 
 /**
  * The unified inbox: every thread (one per mailbox+lead pair) across every mailbox,
@@ -102,7 +102,17 @@ class InboxService {
       leadName = leadRows[0]?.full_name || null;
     }
 
+    const { rows: draftRows } = await db.query(
+      `SELECT * FROM ai_response_drafts
+       WHERE source = 'native' AND mailbox_id = $1 AND thread_id = $2 AND status = 'Pending' AND is_deleted = FALSE
+       ORDER BY created_at DESC LIMIT 1`,
+      [mailboxId, threadId]
+    );
+
     return {
+      aiDraft: draftRows[0]
+        ? { id: draftRows[0].id, body: draftRows[0].body, subject: draftRows[0].subject, confidence: Number(draftRows[0].confidence), generatedBy: draftRows[0].generated_by }
+        : null,
       mailbox: { id: mailbox.id, email: mailbox.email, displayName: mailbox.display_name },
       leadEmail: messageRows.find((row) => row.direction === "inbound")?.from_address
         || messageRows.find((row) => row.direction === "outbound")?.to_address,
@@ -141,7 +151,7 @@ class InboxService {
       throw Object.assign(new Error("Mailbox not found"), { statusCode: 404 });
     }
     if (mailbox.domain_status !== "Verified") {
-      throw Object.assign(new Error("This mailbox's domain is not SES-verified"), { statusCode: 409 });
+      throw Object.assign(new Error("This mailbox's domain is not verified"), { statusCode: 409 });
     }
 
     const { rows: threadRows } = await db.query(
@@ -167,17 +177,18 @@ class InboxService {
       to: leadEmail,
       subject,
       body: trimmedBody,
-      extraHeaders: latest.message_id ? { ...listUnsubscribeHeaders, "In-Reply-To": latest.message_id } : listUnsubscribeHeaders,
+      extraHeaders: latest.message_id ? { ...listUnsubscribeHeaders, "In-Reply-To": latest.message_id, References: latest.message_id } : listUnsubscribeHeaders,
+      messageIdDomain: mailboxDomain(mailbox),
     });
 
-    const command = new SendEmailCommand({
-      FromEmailAddress: fromAddress,
-      Destination: { ToAddresses: [leadEmail] },
-      Content: { Raw: { Data: raw } },
-      ConfigurationSetName: mailbox.configuration_set_name || undefined,
-      EmailTags: latest.campaign_id ? [{ Name: "campaign_id", Value: String(latest.campaign_id) }] : undefined,
+    await sendRawEmail({
+      mailbox,
+      fromAddress,
+      to: leadEmail,
+      raw,
+      sesClient,
+      tags: latest.campaign_id ? [{ Name: "campaign_id", Value: String(latest.campaign_id) }] : undefined,
     });
-    await sesClient.send(command);
 
     const { rows: inserted } = await db.query(
       `INSERT INTO messages (mailbox_id, direction, campaign_id, campaign_lead_id, thread_id, message_id, in_reply_to, from_address, to_address, subject, body_text)

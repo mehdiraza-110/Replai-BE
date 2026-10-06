@@ -579,6 +579,13 @@ class DomainService {
   }
 
   async refreshDomainStatus(domain) {
+    // Maildoso-managed domains have no SES identity: their DNS/verification lives at Maildoso,
+    // so only the reputation numbers (derived from our own sends/bounces) are refreshed here.
+    const { rows: providerRows } = await db.query(`SELECT provider FROM domains WHERE domain = $1 AND is_deleted = FALSE`, [domain]);
+    if (providerRows[0]?.provider === "Maildoso") {
+      return mapDomainRow(await require("./maildoso.service").refreshDomainReputation(domain));
+    }
+
     const [identity, spfStatus, dmarcStatus] = await Promise.all([
       sesClient.send(new GetEmailIdentityCommand({ EmailIdentity: domain })),
       checkSpfRecord(domain),

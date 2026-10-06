@@ -581,3 +581,52 @@ ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS market_sent_today INT NOT NULL DE
 -- mailbox capacity from the warmup lane (daily_limit/sent_today) instead of the market
 -- lane. See services/warmupPool.service.js.
 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS is_warmup BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Maildoso (SMTP/IMAP) mailboxes. `provider` selects the send/receive path: 'ses' (default,
+-- existing behaviour) or 'maildoso' (nodemailer SMTP out, IMAP polling in — see
+-- services/mailTransport.service.js and services/imapInbox.service.js). Credentials are
+-- AES-256-GCM encrypted (utils/secretBox.util.js); `external_id` is Maildoso's own id.
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS provider VARCHAR(32) NOT NULL DEFAULT 'ses';
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS external_id VARCHAR(80);
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS smtp_host VARCHAR(255);
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS smtp_port INT;
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS imap_host VARCHAR(255);
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS imap_port INT;
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS password_encrypted TEXT;
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS imap_last_uid BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS imap_uid_validity BIGINT;
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS imap_last_polled_at TIMESTAMP;
+ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS imap_last_error TEXT;
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS external_id VARCHAR(80);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mailboxes_provider_external ON mailboxes(provider, external_id) WHERE external_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_mailboxes_provider ON mailboxes(provider) WHERE is_deleted = FALSE;
+
+-- IMAP-detected hard bounces (services/imapInbox.service.js) suppress with source 'imap_bounce'.
+ALTER TABLE suppressions DROP CONSTRAINT IF EXISTS suppressions_source_check;
+ALTER TABLE suppressions ADD CONSTRAINT suppressions_source_check
+  CHECK (source IN ('link_click', 'list_unsubscribe_header', 'reply_keyword', 'ses_complaint', 'ses_bounce', 'imap_bounce', 'manual'));
+
+-- Follow-up sequencing (services/campaignSend.service.js sendDueFollowUps): which follow-up
+-- step a lead has received, when it was last emailed, and a retry backoff after a failed send.
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS followup_step INT NOT NULL DEFAULT 0;
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS last_contacted_at TIMESTAMP;
+ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS followup_retry_after TIMESTAMP;
+UPDATE campaign_leads SET last_contacted_at = sent_at WHERE last_contacted_at IS NULL AND sent_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_campaign_leads_followup_due ON campaign_leads(campaign_id, mailbox_id, last_contacted_at) WHERE status = 'Sent';
+
+-- Postal (self-hosted, services/postalEvents.service.js) hard bounces suppress with source 'postal_bounce'.
+-- mailboxes.provider / domains.provider are free text, so 'postal' / 'Postal' need no DDL.
+ALTER TABLE suppressions DROP CONSTRAINT IF EXISTS suppressions_source_check;
+ALTER TABLE suppressions ADD CONSTRAINT suppressions_source_check
+  CHECK (source IN ('link_click', 'list_unsubscribe_header', 'reply_keyword', 'ses_complaint', 'ses_bounce', 'imap_bounce', 'postal_bounce', 'manual'));
+
+-- AI auto-reply drafts for the native (Maildoso) inbox, alongside the existing PlusVibe ones.
+-- services/nativeAgentReply.service.js: source = 'native', mailbox_id = the mailbox that got the reply.
+ALTER TABLE ai_response_drafts ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'plusvibe';
+ALTER TABLE ai_response_drafts ADD COLUMN IF NOT EXISTS mailbox_id INT REFERENCES mailboxes(id) ON DELETE CASCADE;
+
+-- Postal webhook bounces (services/postalEvents.service.js) suppress with source 'postal_bounce'.
+ALTER TABLE suppressions DROP CONSTRAINT IF EXISTS suppressions_source_check;
+ALTER TABLE suppressions ADD CONSTRAINT suppressions_source_check
+  CHECK (source IN ('link_click', 'list_unsubscribe_header', 'reply_keyword', 'ses_complaint', 'ses_bounce', 'imap_bounce', 'postal_bounce', 'manual'));
