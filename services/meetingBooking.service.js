@@ -8,6 +8,8 @@ const CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars";
 const LOOKAHEAD_BUSINESS_DAYS = 5;
 const MAX_CALENDAR_DAYS_SCANNED = 14;
 const DEFAULT_DURATION_MINUTES = 30;
+const DEFAULT_OFFER_COUNT = 3;
+const SLOT_GRID_MS = 30 * 60 * 1000;
 const DEFAULT_WORKING_HOURS_START = "09:00";
 const DEFAULT_WORKING_HOURS_END = "17:00";
 const DEFAULT_TIMEZONE = "UTC";
@@ -17,21 +19,43 @@ const MIN_LEAD_TIME_MS = 30 * 60 * 1000;
 
 class MeetingBookingService {
   /**
-   * Finds the first free `meeting_duration_minutes` window inside the agent's
-   * working hours over the next 5 business days, in the agent's timezone.
-   * Returns { startTime, endTime } as ISO strings, or null when nothing fits.
+   * Proposes up to `count` free `meeting_duration_minutes` windows inside the
+   * agent's working hours over the next 5 business days, spread across days and
+   * skipping any start time in `excludeStarts` (slots offered earlier).
+   * Returns [{ startTime, endTime }] as ISO strings; empty when nothing fits.
    */
-  async findFreeSlot(agent, connection) {
-    if (!connection) return null;
+  async findFreeSlots(agent, connection, { count = DEFAULT_OFFER_COUNT, excludeStarts = [] } = {}) {
+    if (!connection) return [];
 
     const settings = resolveAgentSettings(agent);
     const windows = buildWorkingWindows(new Date(), settings);
-    if (windows.length === 0) return null;
+    if (windows.length === 0) return [];
 
+    const busy = await this.fetchBusy(connection, windows[0].start, windows[windows.length - 1].end, settings.timezone);
+    const excluded = new Set(excludeStarts.map((value) => new Date(value).getTime()));
+    const days = candidateSlotsByDay(windows, busy, settings.durationMinutes * 60 * 1000, excluded);
+
+    return pickSpreadSlots(days, count).map((slot) => ({
+      startTime: new Date(slot.start).toISOString(),
+      endTime: new Date(slot.end).toISOString(),
+    }));
+  }
+
+  /** True when nothing on the calendar overlaps `slot` and it is still in the future. */
+  async isSlotFree(agent, connection, slot) {
+    const start = new Date(slot?.startTime).getTime();
+    const end = new Date(slot?.endTime).getTime();
+    if (!connection || !Number.isFinite(start) || !Number.isFinite(end) || start <= Date.now()) return false;
+
+    const { timezone } = resolveAgentSettings(agent);
+    const busy = await this.fetchBusy(connection, start, end, timezone);
+
+    return !busy.some((interval) => interval.start < end && interval.end > start);
+  }
+
+  async fetchBusy(connection, timeMin, timeMax, timeZone) {
     const accessToken = await googleCalendarService.getValidAccessToken(connection);
     const calendarId = connection.calendar_id || "primary";
-    const timeMin = windows[0].start;
-    const timeMax = windows[windows.length - 1].end;
 
     const response = await fetch(FREE_BUSY_URL, {
       method: "POST",
@@ -42,7 +66,7 @@ class MeetingBookingService {
       body: JSON.stringify({
         timeMin: new Date(timeMin).toISOString(),
         timeMax: new Date(timeMax).toISOString(),
-        timeZone: settings.timezone,
+        timeZone,
         items: [{ id: calendarId }],
       }),
     });
@@ -55,19 +79,64 @@ class MeetingBookingService {
     }
 
     const calendarBusy = payload?.calendars?.[calendarId]?.busy;
-    const busy = normalizeBusyIntervals(
+    return normalizeBusyIntervals(
       Array.isArray(calendarBusy)
         ? calendarBusy
         : Object.values(payload?.calendars || {}).flatMap((entry) => entry?.busy || [])
     );
+  }
 
-    const slot = firstFreeSlot(windows, busy, settings.durationMinutes * 60 * 1000);
-    if (!slot) return null;
+  /** The offer awaiting the lead's answer on this thread, or null. */
+  async getActiveOffer(threadId) {
+    if (!threadId) return null;
 
-    return {
-      startTime: new Date(slot.start).toISOString(),
-      endTime: new Date(slot.end).toISOString(),
-    };
+    const result = await db.query(
+      `SELECT * FROM meeting_slot_offers
+       WHERE thread_id = $1 AND status = 'offered'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [threadId]
+    );
+
+    return result.rows[0] || null;
+  }
+
+  /** Records a new offer, superseding any outstanding one on the thread. */
+  async createOffer({ agentId, threadId, leadEmail, slots }) {
+    await db.query(
+      `UPDATE meeting_slot_offers SET status = 'superseded', updated_at = NOW()
+       WHERE thread_id = $1 AND status = 'offered'`,
+      [threadId]
+    );
+    const result = await db.query(
+      `INSERT INTO meeting_slot_offers (ai_agent_id, thread_id, lead_email, slots)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [agentId, threadId, leadEmail || null, JSON.stringify(slots)]
+    );
+
+    return result.rows[0];
+  }
+
+  async markOfferAccepted(offerId) {
+    await db.query(`UPDATE meeting_slot_offers SET status = 'accepted', updated_at = NOW() WHERE id = $1`, [offerId]);
+  }
+
+  /** Starts of every slot already proposed on the thread, so new offers differ. */
+  async getOfferedStarts(threadId) {
+    const result = await db.query(`SELECT slots FROM meeting_slot_offers WHERE thread_id = $1`, [threadId]);
+    return result.rows.flatMap((row) => (row.slots || []).map((slot) => slot.startTime));
+  }
+
+  async hasBooking(threadId) {
+    if (!threadId) return false;
+
+    const result = await db.query(
+      `SELECT 1 FROM meeting_bookings WHERE thread_id = $1 AND status = 'booked' LIMIT 1`,
+      [threadId]
+    );
+
+    return result.rowCount > 0;
   }
 
   /**
@@ -341,6 +410,57 @@ function firstFreeSlot(windows, busy, durationMs) {
   return null;
 }
 
+/**
+ * Free, grid-aligned slots per working window (one list per day that has any),
+ * skipping starts in `excluded`.
+ */
+function candidateSlotsByDay(windows, busy, durationMs, excluded = new Set()) {
+  const step = Math.max(durationMs, SLOT_GRID_MS);
+
+  return windows
+    .map((window) => {
+      const slots = [];
+
+      for (let start = Math.ceil(window.start / SLOT_GRID_MS) * SLOT_GRID_MS; start + durationMs <= window.end; start += step) {
+        const end = start + durationMs;
+        if (excluded.has(start)) continue;
+        if (busy.some((interval) => interval.start < end && interval.end > start)) continue;
+        slots.push({ start, end });
+      }
+
+      return slots;
+    })
+    .filter((slots) => slots.length > 0);
+}
+
+/**
+ * Picks up to `count` slots, one per day first (alternating an early and a later
+ * time of day), then more from the same days if there are fewer days than slots.
+ */
+function pickSpreadSlots(days, count) {
+  const picked = [];
+  const used = days.map(() => new Set());
+
+  while (picked.length < count) {
+    const before = picked.length;
+
+    for (let day = 0; day < days.length && picked.length < count; day += 1) {
+      const remaining = days[day].filter((slot) => !used[day].has(slot.start));
+      if (remaining.length === 0) continue;
+
+      const preferred = picked.length % 2 === 0 ? 0 : Math.floor(remaining.length * 0.6);
+      const slot = remaining[Math.min(preferred, remaining.length - 1)];
+
+      used[day].add(slot.start);
+      picked.push(slot);
+    }
+
+    if (picked.length === before) break;
+  }
+
+  return picked.sort((a, b) => a.start - b.start);
+}
+
 function extractMeetLink(event) {
   if (event?.hangoutLink) return event.hangoutLink;
 
@@ -368,6 +488,8 @@ module.exports = new MeetingBookingService();
 module.exports.__testables = {
   buildWorkingWindows,
   firstFreeSlot,
+  candidateSlotsByDay,
+  pickSpreadSlots,
   zonedWallClockToUtc,
   parseTimeOfDay,
   resolveAgentSettings,

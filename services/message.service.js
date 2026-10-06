@@ -497,15 +497,30 @@ async function ensureDraft(integrationId, campaign, latestInbound, remoteMessage
 
   const agent = campaign;
   const promptContext = await buildPromptContext(agent, latestInbound, remoteMessages);
+  const meetingOffer = isMeetingObjective(agent)
+    ? await meetingBookingService.getActiveOffer(latestInbound.thread_id).catch(() => null)
+    : null;
+
+  // Tell the model which slots the lead was offered so it can spot their pick.
+  if (meetingOffer) {
+    promptContext.offeredSlots = meetingOffer.slots.map((slot, index) => ({
+      number: index + 1,
+      time: describeSlot(slot.startTime, agent.agent_timezone),
+    }));
+  }
+
   const generation = await generateResponse(agent, promptContext);
   const fromEmail = extractEmailAddress(latestInbound.eaccount || latestInbound.to_address_email_list);
   const toEmail = extractEmailAddress(latestInbound.lead || latestInbound.from_address_email);
   let body = generation.body;
 
-  // "Schedule a Meeting" agents book a real calendar slot before the draft is
-  // stored, so the reply the reviewer sees is the one that mentions the booking.
-  if (generation.wantsMeeting) {
+  // "Schedule a Meeting" agents first offer free calendar slots; once the lead
+  // picks one in a later reply, that slot is booked. Either way the reply the
+  // reviewer sees is the one that mentions the offer or the booking.
+  if (generation.wantsMeeting || generation.selectedSlot) {
     body = await applyMeetingBooking(agent, generation.body, {
+      offer: meetingOffer,
+      selectedSlot: generation.selectedSlot,
       threadId: latestInbound.thread_id,
       leadEmail: toEmail,
       leadName: addressName(latestInbound.from_address_json) || nameFromEmail(toEmail),
@@ -578,7 +593,7 @@ async function generateResponse(agent, context) {
           model: agent.agent_model,
           ...temperatureParams(agent.agent_model, 0.4),
           messages: [
-            { role: "system", content: buildSystemPrompt(agent) },
+            { role: "system", content: buildSystemPrompt(agent, context) },
             { role: "user", content: JSON.stringify(context, null, 2) },
           ],
         }),
@@ -594,6 +609,7 @@ async function generateResponse(agent, context) {
         return {
           body: parsed.draftReply,
           wantsMeeting: parsed.wantsMeeting,
+          selectedSlot: parsed.selectedSlot,
           intent: parsed.intent,
           confidence: 82,
           generatedBy: "openai",
@@ -604,6 +620,7 @@ async function generateResponse(agent, context) {
       return {
         body: buildFallbackDraft(agent, context),
         wantsMeeting: false,
+        selectedSlot: null,
         intent: "other",
         confidence: 68,
         generatedBy: "local-fallback",
@@ -615,6 +632,7 @@ async function generateResponse(agent, context) {
   return {
     body: buildFallbackDraft(agent, context),
     wantsMeeting: false,
+    selectedSlot: null,
     intent: "other",
     confidence: 72,
     generatedBy: "local-agent",
@@ -629,7 +647,7 @@ async function generateResponse(agent, context) {
  */
 function parseMeetingGeneration(agent, content) {
   if (!isMeetingObjective(agent)) {
-    return { draftReply: content, wantsMeeting: false, intent: "other" };
+    return { draftReply: content, wantsMeeting: false, selectedSlot: null, intent: "other" };
   }
 
   try {
@@ -641,11 +659,12 @@ function parseMeetingGeneration(agent, content) {
     return {
       draftReply,
       wantsMeeting: parsed?.wantsMeeting === true,
+      selectedSlot: Number.isInteger(parsed?.selectedSlot) ? parsed.selectedSlot : null,
       intent: cleanString(parsed?.intent) || "other",
     };
   } catch (error) {
     console.warn("Could not parse meeting-objective model output as JSON, using the raw reply:", error.message);
-    return { draftReply: content, wantsMeeting: false, intent: "other" };
+    return { draftReply: content, wantsMeeting: false, selectedSlot: null, intent: "other" };
   }
 }
 
@@ -701,43 +720,91 @@ function describePersona(agent) {
 
 /**
  * For a "Schedule a Meeting" agent whose model flagged the lead as wanting a
- * meeting: try to actually book a slot on the connected Google Calendar and
- * rewrite the draft to mention it. Any failure (no connection, no free slot,
- * revoked token, Google outage) silently falls back to the agent's configured
- * meeting link, and never surfaces to the lead or aborts draft generation.
+ * meeting, a two-step conversation:
+ *  1. No offer yet (or the lead rejected it): find free slots on the connected
+ *     Google Calendar, save them as an offer, and rewrite the draft to list them.
+ *  2. The lead picked an offered slot: re-check it is still free, book it, and
+ *     rewrite the draft to confirm with the meeting link.
+ * Any failure (no connection, no free slot, revoked token, Google outage) falls
+ * back to the agent's configured meeting link and never surfaces to the lead or
+ * aborts draft generation.
  */
-async function applyMeetingBooking(agent, draftReply, { threadId, leadEmail, leadName }) {
-  let booking = { success: false };
+async function applyMeetingBooking(agent, draftReply, { threadId, leadEmail, leadName, offer, selectedSlot }) {
+  const timezone = agent.agent_timezone || "UTC";
+  let slotTaken = false;
 
   try {
+    // One meeting per thread: a later "thanks!" must not trigger another offer.
+    if (await meetingBookingService.hasBooking(threadId)) return draftReply;
+
     const connection = await googleCalendarService.getConnectedForAgent(agent.assigned_ai_agent_id);
 
     if (connection) {
-      const slot = await meetingBookingService.findFreeSlot(agent, connection);
+      const chosen = offer && selectedSlot ? offer.slots[selectedSlot - 1] : null;
 
-      if (slot) {
-        booking = await meetingBookingService.bookSlot(
-          agent,
-          connection,
-          { ...slot, threadId },
+      if (chosen) {
+        if (await meetingBookingService.isSlotFree(agent, connection, chosen)) {
+          const booking = await meetingBookingService.bookSlot(
+            agent,
+            connection,
+            { ...chosen, threadId },
+            leadEmail,
+            leadName
+          );
+
+          if (booking.success) {
+            await meetingBookingService.markOfferAccepted(offer.id);
+
+            const when = describeSlot(booking.startTime, timezone);
+            const instruction = [
+              `You just successfully booked this lead a meeting for ${when}.`,
+              `Rewrite the reply below to naturally confirm this, thank them, and include this meeting link: ${booking.meetLink || "the calendar invite they have just received"}.`,
+              `Keep the same tone and persona described earlier: ${describePersona(agent)}`,
+              "Write only the email reply body. Do not include a subject line.",
+            ].join("\n");
+            const rewritten = (await rewriteDraft(agent, instruction, draftReply)) || draftReply;
+
+            return ensureIncludes(
+              rewritten,
+              [booking.meetLink].filter(Boolean),
+              `You're booked for ${when}.${booking.meetLink ? ` Meeting link: ${booking.meetLink}` : " The calendar invite is on its way."}`
+            );
+          }
+        }
+
+        slotTaken = true;
+      }
+
+      const slots = await meetingBookingService.findFreeSlots(agent, connection, {
+        excludeStarts: await meetingBookingService.getOfferedStarts(threadId),
+      });
+
+      if (slots.length > 0) {
+        await meetingBookingService.createOffer({
+          agentId: agent.assigned_ai_agent_id,
+          threadId,
           leadEmail,
-          leadName
-        );
+          slots,
+        });
+
+        const labels = slots.map((slot) => describeSlot(slot.startTime, timezone));
+        const list = labels.map((label) => `- ${label}`).join("\n");
+        const instruction = [
+          slotTaken
+            ? "The time the lead picked is no longer available. Apologise briefly and offer these alternatives instead."
+            : "The lead is interested in a meeting. Offer them these available time slots.",
+          `List each of these times exactly as written, one per line, and ask which one works best for them:\n${list}`,
+          "Do not say anything is booked and do not include a meeting link.",
+          `Keep the same tone and persona described earlier: ${describePersona(agent)}`,
+          "Write only the email reply body. Do not include a subject line.",
+        ].join("\n");
+        const rewritten = (await rewriteDraft(agent, instruction, draftReply)) || draftReply;
+
+        return ensureIncludes(rewritten, labels, `Here are some times that could work:\n${list}\nWhich works best for you?`);
       }
     }
   } catch (error) {
     console.warn("Calendar lookup failed while drafting a meeting reply:", error.message);
-  }
-
-  if (booking.success) {
-    const instruction = [
-      `You just successfully booked this lead a meeting for ${formatMeetingTime(booking.startTime, agent.agent_timezone)} (${agent.agent_timezone || "UTC"}).`,
-      `Rewrite the reply below to naturally mention this, thank them, and include this meeting link: ${booking.meetLink || "the calendar invite they have just received"}.`,
-      `Keep the same tone and persona described earlier: ${describePersona(agent)}`,
-      "Write only the email reply body. Do not include a subject line.",
-    ].join("\n");
-
-    return (await rewriteDraft(agent, instruction, draftReply)) || draftReply;
   }
 
   const fallbackUrl = cleanString(agent.agent_fallback_meeting_url);
@@ -750,7 +817,7 @@ async function applyMeetingBooking(agent, draftReply, { threadId, leadEmail, lea
   }
 
   const instruction = [
-    "No meeting slot could be automatically booked.",
+    "No meeting slot could be automatically offered or booked.",
     `Rewrite the reply below into a warm, confident, conversion-focused message that drives the lead to book a time using this link: ${fallbackUrl}.`,
     "Never mention any technical failure or that booking was attempted.",
     `Keep the same tone and persona described earlier: ${describePersona(agent)}`,
@@ -758,6 +825,15 @@ async function applyMeetingBooking(agent, draftReply, { threadId, leadEmail, lea
   ].join("\n");
 
   return (await rewriteDraft(agent, instruction, draftReply)) || draftReply;
+}
+
+/** The rewrite is a model call; make sure the facts the lead needs survived it. */
+function ensureIncludes(body, required, appendix) {
+  return required.every((text) => body.includes(text)) ? body : `${body}\n\n${appendix}`;
+}
+
+function describeSlot(startTime, timezone) {
+  return `${formatMeetingTime(startTime, timezone)} (${timezone || "UTC"})`;
 }
 
 function formatMeetingTime(startTime, timezone) {
@@ -1072,15 +1148,19 @@ function isMeetingObjective(agent) {
   return String(agent?.agent_objective || "").trim().toLowerCase() === MEETING_OBJECTIVE;
 }
 
-function buildSystemPrompt(agent) {
+function buildSystemPrompt(agent, context = {}) {
+  const offeredSlots = Array.isArray(context.offeredSlots) ? context.offeredSlots : [];
   const meetingInstructions = isMeetingObjective(agent)
     ? [
         "",
         "OUTPUT FORMAT (strict): respond with a single JSON object and nothing else.",
         "Do not wrap it in markdown code fences. Do not add commentary before or after it.",
-        'The object must have exactly these keys: {"intent": "interested" | "not_interested" | "question" | "other", "wantsMeeting": boolean, "draftReply": string}',
+        'The object must have exactly these keys: {"intent": "interested" | "not_interested" | "question" | "other", "wantsMeeting": boolean, "selectedSlot": integer | null, "draftReply": string}',
         '"intent" classifies the lead\'s latest reply.',
-        '"wantsMeeting" is true only when the lead is interested and would plausibly accept a meeting or call now.',
+        '"wantsMeeting" is true only when the lead is interested and would plausibly accept a meeting or call now, or has answered a meeting offer.',
+        offeredSlots.length > 0
+          ? `You previously offered the lead these meeting times: ${JSON.stringify(offeredSlots)}. "selectedSlot" is the "number" of the offered time the lead clearly chose in their latest reply. Use null when they chose none, were ambiguous, or asked for other times (then set "wantsMeeting" true if they still want to meet). If they chose one, "draftReply" is a short thank-you that does not repeat the time.`
+          : '"selectedSlot" must be null because no times have been offered yet.',
         '"draftReply" is the email reply body exactly as it would be sent, with no subject line.',
         'Do not put a specific meeting date, time, or meeting link in "draftReply" — those are added afterwards.',
       ]

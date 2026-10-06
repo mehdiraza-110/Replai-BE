@@ -318,6 +318,21 @@ CREATE TABLE IF NOT EXISTS meeting_bookings (
 CREATE INDEX IF NOT EXISTS idx_meeting_bookings_thread ON meeting_bookings(thread_id);
 CREATE INDEX IF NOT EXISTS idx_meeting_bookings_agent ON meeting_bookings(ai_agent_id, created_at DESC);
 
+-- Slots the agent has proposed to a lead on a thread. The lead's next reply is
+-- matched against `slots`; the chosen one is booked and the offer is accepted.
+CREATE TABLE IF NOT EXISTS meeting_slot_offers (
+  id SERIAL PRIMARY KEY,
+  ai_agent_id INT NOT NULL REFERENCES ai_agents(id) ON DELETE CASCADE,
+  thread_id VARCHAR(255) NOT NULL,
+  lead_email VARCHAR(255),
+  slots JSONB NOT NULL,
+  status VARCHAR(32) NOT NULL DEFAULT 'offered' CHECK (status IN ('offered', 'accepted', 'superseded')),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_meeting_slot_offers_thread ON meeting_slot_offers(thread_id, status);
+
 CREATE TABLE IF NOT EXISTS domains (
   id SERIAL PRIMARY KEY,
   domain VARCHAR(255) UNIQUE NOT NULL,
