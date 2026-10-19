@@ -1,5 +1,6 @@
 const adminService = require("../services/admin.service");
 const memberService = require("../services/member.service");
+const adminDomainsService = require("../services/adminDomains.service");
 const adminOrderService = require("../services/adminOrder.service");
 const { WorkspaceError } = require("../services/workspace.service");
 
@@ -58,4 +59,9 @@ module.exports = {
   updateOrder: handle("We couldn't update this request. Please try again.", 200, "Request updated", (req) => adminOrderService.update(req.user.id, req.params.id, req.body || {})),
   applyLimits: handle("We couldn't apply this limit. Nothing was changed. Please try again.", 200, "Limit applied", (req) => adminOrderService.applyLimits(req.user.id, req.params.id, req.body || {})),
   assignDomains: handle("We couldn't assign these domains. Nothing was changed. Please try again.", 200, "Domains assigned", (req) => adminOrderService.assignDomains(req.user.id, req.params.id, req.body || {})),
+
+  listDomains: handle("We couldn't load domains. Please try again.", 200, null, (req) => adminDomainsService.list(req.query)),
+  getDomain: handle("We couldn't load this domain. Please try again.", 200, null, (req) => adminDomainsService.get(req.params.id)),
+  previewAssignDomains: handle("We couldn't check this assignment. Nothing was changed. Please try again.", 200, null, (req) => adminOrderService.previewAssignDomains((req.body || {}).domains, (req.body || {}).workspaceId)),
+  assignDomainsTo: handle("We couldn't assign these domains. Nothing was changed. Please try again.", 200, "Domains assigned", (req) => adminOrderService.assignDomains(req.user.id, (req.body || {}).workspaceId, req.body || {})),
 };

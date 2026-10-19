@@ -17,6 +17,11 @@ router.delete('/workspaces/:id/members/:userId', admin.removeMember);
 
 router.post('/workspaces/:id/assign-domains', admin.assignDomains);
 
+router.get('/domains', admin.listDomains);
+router.post('/domains/assign/preview', admin.previewAssignDomains);
+router.post('/domains/assign', admin.assignDomainsTo);
+router.get('/domains/:id', admin.getDomain);
+
 router.get('/orders', admin.listOrders);
 router.get('/orders/count', admin.countOrders);
 router.get('/orders/:id', admin.getOrder);

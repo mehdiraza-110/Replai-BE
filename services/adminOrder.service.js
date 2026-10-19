@@ -3,6 +3,7 @@ const quota = require("./quota.service");
 const eventLog = require("./eventLog.service");
 const orderService = require("./order.service");
 const systemMail = require("./systemMail.service");
+const domainsSvc = require("./adminDomains.service");
 const { WorkspaceError } = require("./workspace.service");
 
 const STATUSES = ["requested", "approved", "in_progress", "fulfilled", "rejected", "cancelled"];
@@ -14,7 +15,6 @@ const TRANSITIONS = {
   rejected: [],
   cancelled: [],
 };
-const DOMAIN_RE = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 const label = (s) => String(s).replace("_", " ");
 
 const ADMIN_SELECT = `${orderService.SELECT.replace("SELECT r.id,", "SELECT w.name AS ws_name, w.slug AS ws_slug, w.limits AS ws_limits, r.id,")}
@@ -228,30 +228,26 @@ const adminOrderService = {
     return result;
   },
 
+  // Moves domains (with all their mailboxes) to another workspace. History tied to the source workspace's campaigns,
+  // agents and integrations stays behind; source campaigns lose the moved mailboxes (and pause when none is left);
+  // warm-up progress is kept and strategies are cloned into the target. See adminDomains.service.
   async assignDomains(adminId, workspaceIdRaw, body = {}) {
     const targetId = intParam(workspaceIdRaw, "workspace");
-    if (!Array.isArray(body.domains) || body.domains.length === 0) throw new WorkspaceError("Provide the list of domains to assign.", 400);
-    if (body.domains.length > 100) throw new WorkspaceError("You can assign at most 100 domains at a time.", 400);
-    const names = [];
-    for (const d of body.domains) {
-      const v = typeof d === "string" ? d.trim().toLowerCase() : "";
-      if (!DOMAIN_RE.test(v)) throw new WorkspaceError(`"${String(d).slice(0, 80)}" is not a valid domain name.`, 400);
-      if (!names.includes(v)) names.push(v);
-    }
+    const names = domainsSvc.parseDomains(body.domains);
     let orderId = null;
     if (body.orderId !== undefined && body.orderId !== null) {
       if (!Number.isInteger(body.orderId) || body.orderId < 1) throw new WorkspaceError("Order ID must be a number.", 400);
       orderId = body.orderId;
     }
+    const notes = domainsSvc.parseNotes(body.notes);
     const confirmFromPlatform = body.confirmFromPlatform === true;
 
     const client = await db.getClient();
     let result;
+    let plan;
     try {
       await client.query("BEGIN");
-      const ws = await client.query(`SELECT id, name, slug FROM workspaces WHERE id = $1 AND is_deleted = FALSE FOR UPDATE`, [targetId]);
-      if (!ws.rows[0]) throw new WorkspaceError("That workspace could not be found.", 404);
-      const target = ws.rows[0];
+      const target = await domainsSvc.loadTarget(client, targetId, true);
 
       let order = null;
       if (orderId) {
@@ -266,125 +262,19 @@ const adminOrderService = {
         }
       }
 
-      const dom = await client.query(
-        `SELECT d.id, d.domain, d.workspace_id, w.slug AS ws_slug, w.name AS ws_name
-         FROM domains d LEFT JOIN workspaces w ON w.id = d.workspace_id
-         WHERE d.domain = ANY($1::text[]) AND COALESCE(d.is_deleted, FALSE) = FALSE
-         ORDER BY d.id FOR UPDATE OF d`,
-        [names],
-      );
-      const found = new Set(dom.rows.map((r) => r.domain));
-      const missing = names.filter((n) => !found.has(n));
-      if (missing.length) throw new WorkspaceError(`These domains don't exist: ${missing.join(", ")}.`, 404);
-      const already = dom.rows.filter((r) => r.workspace_id === targetId).map((r) => r.domain);
-      if (already.length) throw new WorkspaceError(`Already in ${target.name}: ${already.join(", ")}.`, 409);
-      const fromKoval = dom.rows.filter((r) => r.ws_slug === "koval-group").map((r) => r.domain);
-      if (fromKoval.length && !confirmFromPlatform) {
+      plan = await domainsSvc.buildPlan(client, target, names, { lock: true });
+      if (plan.blocked.length) throw domainsSvc.blockedError(plan.blocked[0]);
+      // Moving a domain OUT of the platform workspace needs an explicit confirmation; moving INTO it does not.
+      if (plan.fromPlatform.length && !confirmFromPlatform) {
         throw new WorkspaceError(
-          `Refusing to move ${fromKoval.join(", ")} out of the Koval Group workspace. Koval Group's live sending domains must not be moved by accident. If these domains were provisioned on the platform account and are meant for the client, resend with "confirmFromPlatform": true.`,
+          `Refusing to move ${plan.fromPlatform.join(", ")} out of the Koval Group workspace. Koval Group's live sending domains must not be moved by accident. If these domains were provisioned on the platform account and are meant for the client, resend with "confirmFromPlatform": true.`,
           409,
           "CONFIRM_FROM_PLATFORM_REQUIRED",
         );
       }
 
-      const domainIds = dom.rows.map((r) => r.id);
-      const mb = await client.query(
-        `SELECT id, email, domain_id, workspace_id FROM mailboxes WHERE domain_id = ANY($1::int[]) ORDER BY id FOR UPDATE`,
-        [domainIds],
-      );
-      const mailboxIds = mb.rows.map((r) => r.id);
-      const mailboxEmails = mb.rows.map((r) => r.email.toLowerCase());
-      const stray = mb.rows.filter((r) => r.workspace_id !== dom.rows.find((d) => d.id === r.domain_id).workspace_id);
-      if (stray.length) {
-        throw new WorkspaceError(`Mailbox ${stray[0].email} is not in the same workspace as its domain. Fix that data issue before assigning.`, 409);
-      }
-      const sourceIds = [...new Set(dom.rows.map((r) => r.workspace_id))];
+      await domainsSvc.applyPlan(client, plan, { adminId, orderId, notes });
 
-      if (mailboxIds.length) {
-        // Active or paused campaigns that list these mailboxes explicitly.
-        const camps = await client.query(
-          `SELECT id, name FROM campaigns WHERE is_deleted = FALSE AND workspace_id = ANY($1::int[])
-             AND mailbox_mode = 'specific' AND mailbox_ids && $2::int[] LIMIT 5`,
-          [sourceIds, mailboxIds],
-        );
-        if (camps.rows.length) {
-          throw new WorkspaceError(
-            `These mailboxes are selected in campaigns (${camps.rows.map((c) => `"${c.name}"`).join(", ")}). Stop or delete those campaigns before moving them.`,
-            409,
-          );
-        }
-        // Mailbox already used to send to campaign leads.
-        const leads = await client.query(`SELECT COUNT(*)::int AS n FROM campaign_leads WHERE mailbox_id = ANY($1::int[])`, [mailboxIds]);
-        if (leads.rows[0].n) {
-          throw new WorkspaceError(
-            `Some of these mailboxes have already sent campaign emails (${leads.rows[0].n} campaign lead records). Their history is tied to the current workspace's campaigns and can't be carried over safely.`,
-            409,
-          );
-        }
-        const msgs = await client.query(
-          `SELECT COUNT(*)::int AS n FROM messages WHERE mailbox_id = ANY($1::int[]) AND (campaign_id IS NOT NULL OR campaign_lead_id IS NOT NULL)`,
-          [mailboxIds],
-        );
-        if (msgs.rows[0].n) {
-          throw new WorkspaceError(
-            `Some of these mailboxes have campaign message history (${msgs.rows[0].n} messages) tied to the current workspace's campaigns, which can't be carried over safely.`,
-            409,
-          );
-        }
-        const drafts = await client.query(
-          `SELECT COUNT(*)::int AS n FROM ai_response_drafts WHERE mailbox_id = ANY($1::int[]) AND (ai_agent_id IS NOT NULL OR integration_id IS NOT NULL)`,
-          [mailboxIds],
-        );
-        if (drafts.rows[0].n) {
-          throw new WorkspaceError(
-            `Some of these mailboxes have AI reply drafts linked to the current workspace's agents (${drafts.rows[0].n} drafts), which can't be carried over safely.`,
-            409,
-          );
-        }
-        // Workflows of the source workspace that reference the mailboxes (trigger or send_reply nodes).
-        const wfs = await client.query(`SELECT id, name, graph FROM workflows WHERE is_deleted = FALSE AND workspace_id = ANY($1::int[])`, [sourceIds]);
-        const idSet = new Set(mailboxIds);
-        const usedBy = wfs.rows.filter((w) =>
-          ((w.graph && w.graph.nodes) || []).some((n) => {
-            const d = n.data || {};
-            const ids = [...(Array.isArray(d.mailboxIds) ? d.mailboxIds : []), ...(d.mailboxId != null ? [d.mailboxId] : [])];
-            return ids.some((x) => idSet.has(Number(x)));
-          }),
-        );
-        if (usedBy.length) {
-          throw new WorkspaceError(
-            `These mailboxes are used by automation workflows (${usedBy.slice(0, 5).map((w) => `"${w.name}"`).join(", ")}). Remove them from those workflows first.`,
-            409,
-          );
-        }
-      }
-
-      // ---- all checks passed: move everything ----
-      await client.query(`UPDATE domains SET workspace_id = $1, updated_at = NOW() WHERE id = ANY($2::int[])`, [targetId, domainIds]);
-      let warmupStrategyId = null;
-      if (mailboxIds.length) {
-        const strat = await client.query(
-          `SELECT id, start_daily_limit FROM warmup_strategies WHERE workspace_id = $1 AND is_deleted = FALSE ORDER BY id ASC LIMIT 1`,
-          [targetId],
-        );
-        warmupStrategyId = strat.rows[0] ? strat.rows[0].id : null;
-        // The old strategy belongs to the source workspace: reset to the target's default ramp (what Maildoso sync
-        // does for new mailboxes) or to none when the target has no strategy yet (sync assigns one once it exists).
-        await client.query(
-          `UPDATE mailboxes SET workspace_id = $1, warmup_strategy_id = $2,
-             daily_limit = COALESCE($3, daily_limit), warmup_stage = 'New',
-             warmup_started_at = CASE WHEN $2::int IS NULL THEN NULL ELSE NOW() END,
-             warmup_last_tick_at = NULL, warmup_last_action = NULL, updated_at = NOW()
-           WHERE id = ANY($4::int[])`,
-          [targetId, warmupStrategyId, strat.rows[0] ? strat.rows[0].start_daily_limit : null, mailboxIds],
-        );
-        await client.query(`UPDATE messages SET workspace_id = $1 WHERE mailbox_id = ANY($2::int[])`, [targetId, mailboxIds]);
-        await client.query(`UPDATE ai_response_drafts SET workspace_id = $1 WHERE mailbox_id = ANY($2::int[])`, [targetId, mailboxIds]);
-        await client.query(
-          `UPDATE inbound_messages SET workspace_id = $1 WHERE workspace_id = ANY($2::int[]) AND LOWER(to_address) = ANY($3::text[])`,
-          [targetId, sourceIds, mailboxEmails],
-        );
-      }
       let orderOut = null;
       if (order) {
         if (order.status === "approved") {
@@ -394,22 +284,8 @@ const adminOrderService = {
         }
         orderOut = { id: order.id, status: "in_progress", movedFromApproved: order.status === "approved" };
       }
-      // Assigned domains/mailboxes count as the workspace's usage, but an admin assignment is never blocked by a limit.
-      await quota.record(targetId, "domains", domainIds.length, { source: "admin_assign" }, client);
-      if (mailboxIds.length) await quota.record(targetId, "mailboxes", mailboxIds.length, { source: "admin_assign" }, client);
       await client.query("COMMIT");
-      result = {
-        workspace: { id: target.id, name: target.name, slug: target.slug },
-        domains: dom.rows.map((d) => ({
-          id: d.id,
-          domain: d.domain,
-          from_workspace: { id: d.workspace_id, name: d.ws_name, slug: d.ws_slug },
-          mailboxes: mb.rows.filter((m) => m.domain_id === d.id).map((m) => ({ id: m.id, email: m.email })),
-        })),
-        mailboxesMoved: mailboxIds.length,
-        warmupStrategyId,
-        order: orderOut,
-      };
+      result = { ...domainsSvc.resultOf(plan), order: orderOut };
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
       throw e;
@@ -431,13 +307,22 @@ const adminOrderService = {
       appWorkspaceId: targetId,
       createdBy: adminId,
       metadata: {
-        orderId: orderId,
+        orderId,
         domains: result.domains.map((d) => ({ domain: d.domain, fromWorkspaceId: d.from_workspace.id, mailboxes: d.mailboxes.length })),
         mailboxesMoved: result.mailboxesMoved,
         confirmFromPlatform,
+        notes,
+        campaigns: result.campaigns.map((c) => ({ id: c.id, name: c.name, paused: c.willPause, remainingMailboxes: c.remainingMailboxes })),
+        warmupStrategies: result.warmup.strategies,
       },
     });
+    await domainsSvc.afterAssign(plan, result, { adminId });
     return result;
+  },
+
+  // Read-only: what assignDomains would do (same validation), without changing anything.
+  async previewAssignDomains(domains, targetWorkspaceId) {
+    return domainsSvc.previewAssign({ domains, workspaceId: targetWorkspaceId });
   },
 };
 
