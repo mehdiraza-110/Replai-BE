@@ -21,6 +21,8 @@ const isTrigger = (type) => String(type).startsWith("trigger.");
 const SUMMARY_SELECT = `
   w.id, w.name, w.description, w.is_active, w.updated_at,
   jsonb_array_length(COALESCE(w.graph->'nodes', '[]'::jsonb)) AS node_count,
+  (SELECT n->>'type' FROM jsonb_array_elements(COALESCE(w.graph->'nodes', '[]'::jsonb)) n
+     WHERE n->>'type' LIKE 'trigger.%' LIMIT 1) AS trigger_type,
   (SELECT jsonb_build_object('status', r.status, 'started_at', r.started_at)
      FROM workflow_runs r WHERE r.workflow_id = w.id AND r.workspace_id = w.workspace_id AND r.dry_run = FALSE
      ORDER BY r.started_at DESC, r.id DESC LIMIT 1) AS last_run`;
@@ -49,6 +51,7 @@ function mapSummary(row) {
     description: row.description,
     is_active: row.is_active,
     node_count: Number(row.node_count) || 0,
+    trigger_type: row.trigger_type || null,
     updated_at: row.updated_at,
     last_run: row.last_run || null,
   };
