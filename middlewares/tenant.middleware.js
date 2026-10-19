@@ -75,4 +75,15 @@ const requireProduct = (product) => (req, res, next) => {
   next();
 };
 
-module.exports = { TenantGuard, TenantGuardAllowEnded, tenantGuardExcept, requireProduct };
+// Only the platform team (super admin, also while "viewing as") may buy/add/remove domains and mailboxes.
+// Everyone else requests them through Orders.
+const requireSuperAdmin = (req, res, next) => {
+  if (req.user && req.user.isSuperAdmin) return next();
+  return res.status(403).json({
+    success: false,
+    code: 'SUPER_ADMIN_ONLY',
+    message: 'Only the platform team can add or remove domains and mailboxes. Use Orders to request them.',
+  });
+};
+
+module.exports = { requireSuperAdmin, TenantGuard, TenantGuardAllowEnded, tenantGuardExcept, requireProduct };

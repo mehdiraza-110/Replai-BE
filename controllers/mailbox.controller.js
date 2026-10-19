@@ -44,7 +44,7 @@ async function quoteMailboxes(req, res) {
 
 async function syncMaildoso(req, res) {
   try {
-    const data = await require("../services/maildoso.service").syncMailboxes({ workspaceId: req.workspaceId });
+    const data = await require("../services/maildoso.service").syncMailboxes({ workspaceId: null }); // super admin only (route-gated): account-wide sync; new domains land in the platform pool (Koval Group)
     res.status(200).json({ success: true, message: "Maildoso mailboxes synced", data });
   } catch (error) {
     sendError(res, error, "Unable to sync Maildoso mailboxes");
