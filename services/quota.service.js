@@ -140,7 +140,21 @@ async function buildError(workspaceId, kind, lim, used, quantity, client) {
   } else {
     message = `Trial limit reached: ${lim.limit} ${noun}. Contact support to raise it.`;
   }
+  notifyLimitReached(workspaceId, kind, lim, used, resetsAt);
   return new QuotaError(message, { kind, limit: lim.limit, period: lim.period, used, resetsAt });
+}
+
+// Fire-and-forget "limit reached" email to the workspace owners/admins (deduplicated there, once per limit per 24 h).
+// Must never add latency to, or throw into, the quota path: deferred to the next tick and every failure swallowed.
+function notifyLimitReached(workspaceId, kind, lim, used, resetsAt) {
+  try {
+    if (used < lim.limit) return;
+    setImmediate(() => {
+      try {
+        Promise.resolve(require("./systemMail.service").limitReached(workspaceId, kind, lim, resetsAt)).catch(() => {});
+      } catch (_) { /* best effort */ }
+    });
+  } catch (_) { /* best effort */ }
 }
 
 function assertArgs(kind, quantity) {
@@ -258,7 +272,15 @@ const quotaService = {
       const lim = limitFor(limits, key);
       if (!lim) continue;
       const used = await usedNow(workspaceId, key, lim.period);
-      out.push({ key, label: LABELS[key], limit: lim.limit, period: lim.period, used, remaining: Math.max(0, lim.limit - used) });
+      // resets_at: when a rolling-window limit that is currently reached frees room again (null otherwise).
+      let resetsAt = null;
+      if (lim.period === "day" && used >= lim.limit && lim.limit > 0) {
+        try {
+          const at = await windowResetsAt(workspaceId, key, lim.limit, used, 1);
+          resetsAt = at ? new Date(at).toISOString() : null;
+        } catch (_) { resetsAt = null; }
+      }
+      out.push({ key, label: LABELS[key], limit: lim.limit, period: lim.period, used, remaining: Math.max(0, lim.limit - used), resets_at: resetsAt });
     }
     return out;
   },

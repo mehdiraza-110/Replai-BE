@@ -2,6 +2,7 @@ const db = require("../config/db.config");
 const quota = require("./quota.service");
 const eventLog = require("./eventLog.service");
 const orderService = require("./order.service");
+const systemMail = require("./systemMail.service");
 const { WorkspaceError } = require("./workspace.service");
 
 const STATUSES = ["requested", "approved", "in_progress", "fulfilled", "rejected", "cancelled"];
@@ -16,11 +17,24 @@ const TRANSITIONS = {
 const DOMAIN_RE = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 const label = (s) => String(s).replace("_", " ");
 
-const ADMIN_SELECT = `${orderService.SELECT.replace("SELECT r.id,", "SELECT w.name AS ws_name, w.slug AS ws_slug, r.id,")}
+const ADMIN_SELECT = `${orderService.SELECT.replace("SELECT r.id,", "SELECT w.name AS ws_name, w.slug AS ws_slug, w.limits AS ws_limits, r.id,")}
   JOIN workspaces w ON w.id = r.workspace_id`;
 
 function mapAdmin(r) {
-  return { ...orderService.mapRow(r), workspace: { id: r.workspace_id, name: r.ws_name, slug: r.ws_slug } };
+  const out = { ...orderService.mapRow(r), workspace: { id: r.workspace_id, name: r.ws_name, slug: r.ws_slug } };
+  if (r.type === "limits") {
+    // Live value of the limit now vs what was asked for (the request itself keeps the value at request time).
+    const d = r.details || {};
+    const live = quota.limitFor(r.ws_limits, d.limitKey);
+    out.limit_info = {
+      key: d.limitKey,
+      label: quota.LABELS[d.limitKey] || d.limitKey,
+      current_limit: live ? live.limit : null,
+      period: live ? live.period : d.period || null,
+      requested_limit: d.requestedLimit,
+    };
+  }
+  return out;
 }
 
 function intParam(v, what) {
@@ -144,7 +158,74 @@ const adminOrderService = {
         metadata: { orderId: id, type: before.type, quantity: before.quantity, from: before.status, to: body.status },
       });
     }
-    return this.get(id);
+    const result = await this.get(id);
+    if (changedStatus) systemMail.fire(() => systemMail.orderStatusChanged({ ...result, workspace_id: before.workspace_id, requested_by_id: result.requested_by && result.requested_by.id }, body.status));
+    return result;
+  },
+
+  // Raises the workspace limit asked for in a "limits" order (keeps the period) and marks the order fulfilled.
+  async applyLimits(adminId, idRaw, body = {}) {
+    const id = intParam(idRaw, "request");
+    let notes;
+    if (body.admin_notes !== undefined && body.admin_notes !== null) {
+      if (typeof body.admin_notes !== "string") throw new WorkspaceError("Admin notes must be text.", 400);
+      notes = body.admin_notes.trim() || undefined;
+      if (notes && notes.length > 2000) throw new WorkspaceError("Admin notes can be at most 2000 characters.", 400);
+    }
+    const client = await db.getClient();
+    let order;
+    let from;
+    let to;
+    let key;
+    try {
+      await client.query("BEGIN");
+      const cur = await client.query(`SELECT id, workspace_id, status, type, details FROM provisioning_requests WHERE id = $1 FOR UPDATE`, [id]);
+      order = cur.rows[0];
+      if (!order) throw new WorkspaceError("That request could not be found.", 404);
+      if (order.type !== "limits") throw new WorkspaceError("Only \"more limits\" requests can be applied this way.", 400);
+      if (!["requested", "approved", "in_progress"].includes(order.status)) {
+        throw new WorkspaceError(`This request is ${label(order.status)} and can no longer be applied.`, 409);
+      }
+      const d = order.details || {};
+      key = d.limitKey;
+      to = d.requestedLimit;
+      if (!quota.KINDS.includes(key) || !Number.isInteger(to) || to < 1) throw new WorkspaceError("This request has no valid limit to apply.", 409);
+      const ws = await client.query(`SELECT id, limits FROM workspaces WHERE id = $1 FOR UPDATE`, [order.workspace_id]);
+      if (!ws.rows[0]) throw new WorkspaceError("That workspace could not be found.", 404);
+      const limits = ws.rows[0].limits || {};
+      const live = quota.limitFor(limits, key);
+      if (!live) throw new WorkspaceError(`${quota.LABELS[key]} has no limit on this workspace any more, so there is nothing to raise.`, 409);
+      from = live.limit;
+      if (to <= from) {
+        throw new WorkspaceError(`The ${quota.LABELS[key].toLowerCase()} limit is already ${from.toLocaleString("en-US")}, which is not below the requested ${to.toLocaleString("en-US")}. Mark the request fulfilled or rejected instead.`, 409);
+      }
+      const next = { ...limits, [key]: { ...(limits[key] || {}), limit: to, period: live.period } };
+      await client.query(`UPDATE workspaces SET limits = $2::jsonb, updated_at = NOW() WHERE id = $1`, [order.workspace_id, JSON.stringify(next)]);
+      const sets = ["status = 'fulfilled'", "fulfilled_at = NOW()", "updated_at = NOW()", "handled_by = $2"];
+      const params = [id, adminId];
+      if (notes !== undefined) {
+        params.push(notes);
+        sets.push(`admin_notes = $${params.length}`);
+      }
+      await client.query(`UPDATE provisioning_requests SET ${sets.join(", ")} WHERE id = $1`, params);
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+    await audit({
+      eventType: "order.limits_applied",
+      source: "admin",
+      status: "Success",
+      appWorkspaceId: order.workspace_id,
+      createdBy: adminId,
+      metadata: { orderId: id, limitKey: key, from, to, previousStatus: order.status },
+    });
+    const result = await this.get(id);
+    systemMail.fire(() => systemMail.limitsApplied({ ...result, workspace_id: order.workspace_id, requested_by_id: result.requested_by && result.requested_by.id }, from, to));
+    return result;
   },
 
   async assignDomains(adminId, workspaceIdRaw, body = {}) {
@@ -311,7 +392,7 @@ const adminOrderService = {
         } else {
           await client.query(`UPDATE provisioning_requests SET handled_by = $2, updated_at = NOW() WHERE id = $1`, [order.id, adminId]);
         }
-        orderOut = { id: order.id, status: "in_progress" };
+        orderOut = { id: order.id, status: "in_progress", movedFromApproved: order.status === "approved" };
       }
       // Assigned domains/mailboxes count as the workspace's usage, but an admin assignment is never blocked by a limit.
       await quota.record(targetId, "domains", domainIds.length, { source: "admin_assign" }, client);
@@ -335,6 +416,14 @@ const adminOrderService = {
     } finally {
       client.release();
     }
+    if (result.order && result.order.movedFromApproved) {
+      const oid = result.order.id;
+      systemMail.fire(async () => {
+        const o = await this.get(oid);
+        await systemMail.orderStatusChanged({ ...o, workspace_id: targetId, requested_by_id: o.requested_by && o.requested_by.id }, "in_progress");
+      });
+    }
+    if (result.order) delete result.order.movedFromApproved;
     await audit({
       eventType: "admin.domains_assigned",
       source: "admin",

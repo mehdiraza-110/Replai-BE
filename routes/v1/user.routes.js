@@ -13,6 +13,11 @@ router.post('/login', userController.login.bind(userController));
 router.post('/logout', userController.logout.bind(userController));
 router.get('/me', SessionGuard, userController.me.bind(userController));
 
+// Password reset (public). Registered before the "/:id" routes.
+router.post('/forgot-password', userController.forgotPassword.bind(userController));
+router.get('/reset-password/validate', userController.validateResetToken.bind(userController));
+router.post('/reset-password', userController.resetPassword.bind(userController));
+
 // Create a new user (public signup; privileged fields are ignored)
 router.post('/', userController.createUser.bind(userController));
 

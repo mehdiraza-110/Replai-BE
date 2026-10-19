@@ -77,12 +77,13 @@ function mapSummary(row) {
 }
 
 async function meta(workspaceId) {
-  const [mailboxes, agents, integration, campaigns, coldCampaigns] = await Promise.all([
+  const [mailboxes, agents, integration, campaigns, coldCampaigns, calendars] = await Promise.all([
     db.query(`SELECT id, email FROM mailboxes WHERE workspace_id = $1 AND is_deleted = FALSE ORDER BY email`, [workspaceId]),
     db.query(`SELECT id, name FROM ai_agents WHERE workspace_id = $1 AND is_deleted = FALSE ORDER BY name`, [workspaceId]),
     hasPlusVibe(workspaceId),
     db.query(`SELECT plusvibe_campaign_id AS id, name, assigned_ai_agent_id AS "agentId" FROM plusvibe_campaigns WHERE workspace_id = $1 AND is_deleted = FALSE ORDER BY name`, [workspaceId]),
     db.query(`SELECT id, name, ai_agent_id AS "agentId" FROM campaigns WHERE workspace_id = $1 AND is_deleted = FALSE AND is_warmup = FALSE ORDER BY name`, [workspaceId]),
+    db.query(`SELECT DISTINCT ai_agent_id FROM calendar_connections WHERE workspace_id = $1 AND provider = 'google' AND status = 'connected' ORDER BY ai_agent_id`, [workspaceId]),
   ]);
   return {
     mailboxes: mailboxes.rows,
@@ -90,6 +91,7 @@ async function meta(workspaceId) {
     plusvibeConnected: integration,
     plusvibeCampaigns: campaigns.rows,
     campaigns: coldCampaigns.rows,
+    calendarAgentIds: calendars.rows.map((r) => r.ai_agent_id),
     triggers: executor.describeTriggerTypes(),
   };
 }
@@ -137,9 +139,49 @@ function defaultReplyGraph() {
   };
 }
 
-async function create(workspaceId, userId, { name, description, template } = {}) {
-  if (template !== undefined && template !== null && template !== "default_reply") throw new WorkflowError('Unknown template. Use "default_reply" or leave it out.');
-  const graph = template === "default_reply" ? defaultReplyGraph() : { nodes: [], edges: [] };
+const TEMPLATES = ["default_reply", "book_meetings"];
+
+/**
+ * "Book meetings": every reply either picks one of the times offered earlier (-> book it, confirm with the Meet link) or
+ * gets new times offered. A time that turns out to be taken goes back to offering times, with an apology.
+ * Agents are "the campaign's agent" so it works out of the box for campaigns that have an agent assigned.
+ */
+function bookMeetingsGraph({ trigger = "inbox_mail", mode = "review" } = {}) {
+  const plusvibe = trigger === "plusvibe_reply";
+  const aiMode = ["auto_send", "review", "agent_default"].includes(mode) ? mode : "review";
+  const node = (id, type, x, y, data = {}) => ({ id, type, position: { x, y }, data });
+  const send = plusvibe ? { via: "plusvibe" } : { via: "mailbox" };
+  return {
+    nodes: [
+      node("trigger", plusvibe ? "trigger.plusvibe_reply" : "trigger.inbox_mail", 40, 220, plusvibe ? { campaignIds: "all" } : { mailboxIds: "all" }),
+      node("save", "action.save_to_db", 320, 220),
+      node("selected", "condition.slot_selected", 600, 220),
+      node("book", "action.book_meeting", 900, 80, { agentId: "campaign" }),
+      node("ai-booked", "action.ai_agent", 1200, 20, { agentId: "campaign", mode: aiMode }),
+      node("send-booked", "action.send_reply", 1500, 20, send),
+      node("offer", "action.offer_times", 1200, 360, { agentId: "campaign", count: 3 }),
+      node("ai-offer", "action.ai_agent", 1500, 360, { agentId: "campaign", mode: aiMode }),
+      node("send-offer", "action.send_reply", 1800, 360, send),
+    ],
+    edges: [
+      { id: "e-trigger-save", source: "trigger", target: "save" },
+      { id: "e-save-selected", source: "save", target: "selected" },
+      { id: "e-selected-book", source: "selected", target: "book", sourceHandle: "yes" },
+      { id: "e-selected-offer", source: "selected", target: "offer", sourceHandle: "no" },
+      { id: "e-book-ai-booked", source: "book", target: "ai-booked", sourceHandle: "booked" },
+      { id: "e-book-offer", source: "book", target: "offer", sourceHandle: "unavailable" },
+      { id: "e-ai-booked-send", source: "ai-booked", target: "send-booked" },
+      { id: "e-offer-ai", source: "offer", target: "ai-offer" },
+      { id: "e-ai-offer-send", source: "ai-offer", target: "send-offer" },
+    ],
+  };
+}
+
+async function create(workspaceId, userId, { name, description, template, trigger, mode } = {}) {
+  if (template !== undefined && template !== null && !TEMPLATES.includes(template)) throw new WorkflowError('Unknown template. Use "default_reply", "book_meetings" or leave it out.');
+  if (trigger !== undefined && trigger !== null && trigger !== "inbox_mail" && trigger !== "plusvibe_reply") throw new WorkflowError('The trigger must be "inbox_mail" or "plusvibe_reply".');
+  if (mode !== undefined && mode !== null && !["auto_send", "review", "agent_default"].includes(mode)) throw new WorkflowError('The reply mode must be "auto_send", "review" or "agent_default".');
+  const graph = template === "default_reply" ? defaultReplyGraph() : template === "book_meetings" ? bookMeetingsGraph({ trigger: trigger || "inbox_mail", mode: mode || "review" }) : { nodes: [], edges: [] };
   // The limit check and the insert share one transaction under the workspace's quota lock, so parallel creates can't overshoot.
   const client = await db.getClient();
   let id;
@@ -368,10 +410,14 @@ async function validateGraph(workspaceId, rawGraph) {
     const src = byId.get(e.source);
     if (e.source === e.target) problems.push({ nodeId: e.source, message: "A step cannot connect to itself." });
     if (isTrigger(byId.get(e.target)?.type)) problems.push({ nodeId: e.target, message: "Nothing can connect into the trigger." });
-    if (src?.type === "condition.keyword") {
-      if (e.sourceHandle !== "yes" && e.sourceHandle !== "no") problems.push({ nodeId: e.source, message: 'Connect the keyword check\'s "yes" or "no" output.' });
+    const handles = executor.NODE_HANDLES[src?.type];
+    if (handles) {
+      if (!handles.includes(e.sourceHandle)) {
+        const label = src.type === "condition.keyword" ? "keyword check" : src.type === "condition.slot_selected" ? "slot-selected check" : "book-meeting step";
+        problems.push({ nodeId: e.source, message: `Connect the ${label}'s ${handles.map((h) => `"${h}"`).join(" or ")} output.` });
+      }
     } else if (e.sourceHandle) {
-      problems.push({ nodeId: e.source, message: "Only a keyword check has separate yes/no outputs." });
+      problems.push({ nodeId: e.source, message: "Only a keyword check, a slot-selected check and a book-meeting step have separate outputs." });
     }
     const key = `${e.source}|${e.sourceHandle || ""}|${e.target}`;
     if (seenEdge.has(key)) problems.push({ nodeId: e.source, message: "The same connection is drawn twice." });
@@ -401,16 +447,30 @@ async function validateGraph(workspaceId, rawGraph) {
   if (visited !== nodes.length) problems.push({ message: "The workflow has a loop. Steps must flow forward only." });
 
   // Per-node data and ownership of every referenced resource.
-  const [mailboxRows, agentRows, campaignRows, plusvibe] = await Promise.all([
+  const [mailboxRows, agentRows, campaignRows, plusvibe, calendarRows] = await Promise.all([
     db.query(`SELECT id FROM mailboxes WHERE workspace_id = $1 AND is_deleted = FALSE`, [workspaceId]),
     db.query(`SELECT id FROM ai_agents WHERE workspace_id = $1 AND is_deleted = FALSE`, [workspaceId]),
     db.query(`SELECT plusvibe_campaign_id AS id FROM plusvibe_campaigns WHERE workspace_id = $1 AND is_deleted = FALSE`, [workspaceId]),
     hasPlusVibe(workspaceId),
+    db.query(`SELECT DISTINCT ai_agent_id FROM calendar_connections WHERE workspace_id = $1 AND provider = 'google' AND status = 'connected'`, [workspaceId]),
   ]);
+  const calendarAgentIds = new Set(calendarRows.rows.map((r) => r.ai_agent_id));
   const mailboxIds = new Set(mailboxRows.rows.map((r) => r.id));
   const agentIds = new Set(agentRows.rows.map((r) => r.id));
   const campaignIds = new Set(campaignRows.rows.map((r) => String(r.id)));
   const triggerType = trigger?.type;
+
+  // Steps reachable from a "Slot selected" check's yes output (a booking only makes sense there).
+  const afterSlotYes = new Set();
+  {
+    const stack = edges.filter((e) => byId.get(e.source)?.type === "condition.slot_selected" && e.sourceHandle === "yes").map((e) => e.target);
+    while (stack.length) {
+      const id = stack.pop();
+      if (afterSlotYes.has(id)) continue;
+      afterSlotYes.add(id);
+      for (const next of outgoing.get(id) || []) stack.push(next);
+    }
+  }
 
   for (const n of nodes) {
     const d = n.data;
@@ -454,6 +514,31 @@ async function validateGraph(workspaceId, rawGraph) {
         }
         if (d.matchOn !== "reply" && d.matchOn !== "subject") problems.push({ nodeId: n.id, message: "Choose whether to check the reply or the subject." });
         break;
+      case "action.offer_times":
+      case "action.book_meeting": {
+        if (n.type === "action.offer_times" && d.count !== undefined && !(Number.isInteger(d.count) && d.count >= 1 && d.count <= 5)) problems.push({ nodeId: n.id, message: "Offer between 1 and 5 times." });
+        if (d.agentId === "campaign") {
+          if (triggerType && triggerType !== "trigger.plusvibe_reply" && triggerType !== "trigger.inbox_mail") problems.push({ nodeId: n.id, message: "\"The campaign's agent\" only works with the PlusVibe reply or mailbox reply trigger." });
+        } else if (!isPosInt(d.agentId) || !agentIds.has(d.agentId)) problems.push({ nodeId: n.id, message: "Choose an AI agent from this workspace." });
+        else if (!calendarAgentIds.has(d.agentId)) problems.push({ nodeId: n.id, message: "Connect Google Calendar for this agent first." });
+        if (triggerType === "trigger.mail_sent") problems.push({ nodeId: n.id, message: "Meetings need a reply trigger, not \"email sent\"." });
+        if (n.type === "action.book_meeting" && !afterSlotYes.has(n.id)) problems.push({ nodeId: n.id, message: 'Book meeting must come after a "Slot selected" check, on its "yes" output.' });
+        break;
+      }
+      case "condition.slot_selected":
+        if (triggerType === "trigger.mail_sent") problems.push({ nodeId: n.id, message: "Checking for a chosen time needs a reply trigger, not \"email sent\"." });
+        break;
+      case "action.notify_email": {
+        const to = d.to === undefined ? [] : d.to;
+        if (!Array.isArray(to) || to.length > 10 || !to.every((a) => typeof a === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(a.trim()))) {
+          problems.push({ nodeId: n.id, message: "Recipients must be valid email addresses (up to 10)." });
+        } else if (to.length === 0 && d.notifyOwners !== true) problems.push({ nodeId: n.id, message: "Add at least one recipient, or notify the workspace owners and admins." });
+        if (d.notifyOwners !== undefined && typeof d.notifyOwners !== "boolean") problems.push({ nodeId: n.id, message: "Notify owners must be on or off." });
+        if (d.includeReply !== undefined && typeof d.includeReply !== "boolean") problems.push({ nodeId: n.id, message: "Include reply must be on or off." });
+        if (typeof d.subject !== "string" || !d.subject.trim() || d.subject.length > 200) problems.push({ nodeId: n.id, message: "Write a subject of up to 200 characters." });
+        if (typeof d.message !== "string" || !d.message.trim() || d.message.length > 4000) problems.push({ nodeId: n.id, message: "Write a message of up to 4000 characters." });
+        break;
+      }
       default:
         break;
     }

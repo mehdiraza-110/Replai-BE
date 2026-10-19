@@ -2,6 +2,8 @@ const crypto = require("crypto");
 const db = require("../config/db.config");
 const userService = require("./user.service");
 const { WorkspaceError } = require("./workspace.service");
+const emailService = require("./email.service");
+const passwordResetService = require("./passwordReset.service");
 
 const RANK = { member: 1, admin: 2, owner: 3 };
 const PRODUCTS = ["auto_responder", "cold_mailer"];
@@ -109,6 +111,32 @@ function parseUserId(value) {
   return id;
 }
 
+// Best-effort "you've been added" email. A newly created user also gets a 7-day "set your password" link
+// (the temporary password itself is never emailed). Never throws.
+async function sendAddedEmail({ email, workspaceName, role, created, userId }) {
+  try {
+    const paragraphs = [`You've been added to <strong>${emailService.escapeHtml(workspaceName)}</strong> on ReplyOS as ${role === "admin" ? "an" : "a"} <strong>${emailService.escapeHtml(role)}</strong>.`];
+    let cta = { label: "Sign in", url: emailService.appUrl("login") };
+    let footnote = "";
+    if (created) {
+      const token = await passwordResetService.issueToken(userId, "invite");
+      paragraphs.push("An account has been created for you. Set your password to get started.");
+      cta = { label: "Set your password", url: emailService.appUrl(`reset-password?token=${token}`) };
+      footnote = "This link is valid for 7 days. After that you can use \"Forgot password?\" on the sign-in page.";
+    }
+    const { html, text } = emailService.renderEmail({
+      title: `You've been added to ${workspaceName}`,
+      preheader: `You now have access to ${workspaceName} on ReplyOS.`,
+      paragraphs,
+      cta,
+      footnote,
+    });
+    await emailService.send({ to: email, subject: `You've been added to ${workspaceName}`, html, text, category: "member-added" });
+  } catch (error) {
+    console.error("Member added email failed:", error.message);
+  }
+}
+
 const memberService = {
   async list(workspaceId, viewerId) {
     const { rows } = await db.query(`${MEMBER_SELECT} WHERE wm.workspace_id = $1 ORDER BY wm.created_at, u.id`, [workspaceId]);
@@ -169,6 +197,7 @@ const memberService = {
       throw error;
     }
     const member = shape(await getMemberRow(workspaceId, userId), actor.userId);
+    await sendAddedEmail({ email, workspaceName: workspace.name, role, created, userId });
     return temporaryPassword ? { member, temporaryPassword } : { member };
   },
 

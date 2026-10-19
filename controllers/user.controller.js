@@ -2,6 +2,12 @@ const userService = require('../services/user.service');
 const jwtUtil = require('../utils/jwt.util');
 const workspaceService = require('../services/workspace.service');
 const { uploadToS3, deleteFromS3 } = require('../utils/s3.util');
+const passwordResetService = require('../services/passwordReset.service');
+
+function clientIp(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return forwarded || req.ip || (req.socket && req.socket.remoteAddress) || null;
+}
 
 class UserController {
   // Create a new user
@@ -404,6 +410,11 @@ class UserController {
 
       const result = await userService.changePassword(userId, currentPassword, newPassword);
 
+      // Best-effort confirmation email; never fails the request.
+      userService.getUserById(userId)
+        .then((u) => u && passwordResetService.sendPasswordChangedEmail(u.email, u.first_name))
+        .catch(() => {});
+
       res.status(200).json({
         success: true,
         message: result.message,
@@ -431,6 +442,48 @@ class UserController {
         message: 'Error changing password',
         error: error.message
       });
+    }
+  }
+
+  // Forgot password: always the same generic answer, whether or not the account exists.
+  async forgotPassword(req, res) {
+    const generic = { success: true, message: "If an account exists for that email, we've sent a reset link.", data: null };
+    try {
+      const { email } = req.body || {};
+      const outcome = await passwordResetService.requestReset(email, clientIp(req));
+      if (outcome.limited) {
+        return res.status(429).json({ success: false, message: 'Too many reset requests. Please wait a while and try again.' });
+      }
+      // The token/email work continues in the background so response timing does not depend on the account.
+      outcome.done.catch(() => {});
+      return res.status(200).json(generic);
+    } catch (error) {
+      console.error('Error handling forgot password:', error.message);
+      return res.status(200).json(generic);
+    }
+  }
+
+  async validateResetToken(req, res) {
+    try {
+      const valid = await passwordResetService.validate(req.query.token);
+      res.status(200).json({ success: true, message: 'OK', data: { valid } });
+    } catch (error) {
+      console.error('Error validating reset token:', error.message);
+      res.status(200).json({ success: true, message: 'OK', data: { valid: false } });
+    }
+  }
+
+  async resetPassword(req, res) {
+    try {
+      const { token, password } = req.body || {};
+      const result = await passwordResetService.resetPassword(token, password);
+      res.status(200).json({ success: true, message: result.message, data: null });
+    } catch (error) {
+      if (error instanceof passwordResetService.ResetError) {
+        return res.status(error.status).json({ success: false, message: error.message });
+      }
+      console.error('Error resetting password:', error.message);
+      res.status(500).json({ success: false, message: 'We could not update your password right now. Please try again.' });
     }
   }
 

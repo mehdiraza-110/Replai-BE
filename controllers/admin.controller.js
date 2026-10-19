@@ -56,5 +56,6 @@ module.exports = {
   countOrders: handle("We couldn't load the order counts. Please try again.", 200, null, () => adminOrderService.count()),
   getOrder: handle("We couldn't load this request. Please try again.", 200, null, (req) => adminOrderService.get(req.params.id)),
   updateOrder: handle("We couldn't update this request. Please try again.", 200, "Request updated", (req) => adminOrderService.update(req.user.id, req.params.id, req.body || {})),
+  applyLimits: handle("We couldn't apply this limit. Nothing was changed. Please try again.", 200, "Limit applied", (req) => adminOrderService.applyLimits(req.user.id, req.params.id, req.body || {})),
   assignDomains: handle("We couldn't assign these domains. Nothing was changed. Please try again.", 200, "Domains assigned", (req) => adminOrderService.assignDomains(req.user.id, req.params.id, req.body || {})),
 };

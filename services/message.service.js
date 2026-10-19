@@ -298,7 +298,7 @@ class MessageService {
       return { status: "Skipped", reason: "No AI agent is assigned to this campaign" };
     }
 
-    const draft = await ensureDraft(workspaceId, integration.id, campaign, latestInbound, remoteMessages, { force: false });
+    const draft = await ensureDraft(workspaceId, integration.id, campaign, latestInbound, remoteMessages, { force: false, override });
 
     await eventLogService.record({
       eventType: "ai.draft.webhook_generated",
@@ -537,7 +537,9 @@ async function ensureDraft(workspaceId, integrationId, campaign, latestInbound, 
 
   const agent = campaign;
   const promptContext = await buildPromptContext(workspaceId, agent, latestInbound, remoteMessages);
-  const meetingOffer = isMeetingObjective(agent)
+  // A workflow with explicit meeting nodes owns the meeting logic: the built-in offer/booking is skipped for this draft.
+  const skipBuiltInMeeting = options.override?.skipBuiltInMeeting === true;
+  const meetingOffer = !skipBuiltInMeeting && isMeetingObjective(agent)
     ? await meetingBookingService.getActiveOffer(latestInbound.thread_id, workspaceId).catch(() => null)
     : null;
 
@@ -557,7 +559,9 @@ async function ensureDraft(workspaceId, integrationId, campaign, latestInbound, 
   // "Schedule a Meeting" agents first offer free calendar slots; once the lead
   // picks one in a later reply, that slot is booked. Either way the reply the
   // reviewer sees is the one that mentions the offer or the booking.
-  if (generation.wantsMeeting || generation.selectedSlot) {
+  if (skipBuiltInMeeting) {
+    body = await applyWorkflowMeeting(agent, generation.body, options.override.meeting);
+  } else if (generation.wantsMeeting || generation.selectedSlot) {
     body = await applyMeetingBooking(agent, generation.body, {
       offer: meetingOffer,
       selectedSlot: generation.selectedSlot,
@@ -977,6 +981,100 @@ async function applyMeetingBooking(agent, draftReply, { threadId, leadEmail, lea
   ].join("\n");
 
   return (await rewriteDraft(agent, instruction, draftReply)) || draftReply;
+}
+
+/**
+ * Workflow meeting step: the explicit workflow nodes (offer times / book meeting) already decided what happens on the
+ * calendar; this only writes the reply for that outcome, with the same wording and safeguards as applyMeetingBooking.
+ * `meeting` is { mode: 'offer', slots:[{label}], apologise? } | { mode:'booked', when, meetLink? } | { mode:'unavailable' }
+ * | { mode:'fallback', url }. Never throws; no meeting state -> the reply is returned unchanged.
+ */
+async function applyWorkflowMeeting(agent, draftReply, meeting) {
+  if (!meeting || !meeting.mode) return draftReply;
+  const persona = `Keep the same tone and persona described earlier: ${describePersona(agent)}`;
+  const tail = "Write only the email reply body. Do not include a subject line.";
+
+  if (meeting.mode === "offer") {
+    const labels = (meeting.slots || []).map((slot) => slot.label).filter(Boolean);
+    if (labels.length === 0) return draftReply;
+    const list = labels.map((label) => `- ${label}`).join("\n");
+    const instruction = [
+      meeting.apologise
+        ? "The time the lead picked is no longer available. Apologise briefly and offer these alternatives instead."
+        : "The lead is interested in a meeting. Offer them these available time slots.",
+      `List each of these times exactly as written, one per line, and ask which one works best for them:\n${list}`,
+      "Do not say anything is booked and do not include a meeting link.",
+      persona,
+      tail,
+    ].join("\n");
+    const rewritten = (await rewriteDraft(agent, instruction, draftReply)) || draftReply;
+    return ensureIncludes(rewritten, labels, `${meeting.apologise ? "Sorry, that time is no longer available. " : ""}Here are some times that could work:\n${list}\nWhich works best for you?`);
+  }
+
+  if (meeting.mode === "booked") {
+    const when = meeting.when;
+    const instruction = [
+      `You just successfully booked this lead a meeting for ${when}.`,
+      `Rewrite the reply below to naturally confirm this, thank them, and include this meeting link: ${meeting.meetLink || "the calendar invite they have just received"}.`,
+      persona,
+      tail,
+    ].join("\n");
+    const rewritten = (await rewriteDraft(agent, instruction, draftReply)) || draftReply;
+    return ensureIncludes(
+      rewritten,
+      [when, meeting.meetLink].filter(Boolean),
+      `You're booked for ${when}.${meeting.meetLink ? ` Meeting link: ${meeting.meetLink}` : " The calendar invite is on its way."}`
+    );
+  }
+
+  if (meeting.mode === "unavailable") {
+    const instruction = [
+      "The time the lead picked is no longer available.",
+      "Apologise briefly and ask them to suggest another time that works for them.",
+      "Do not say anything is booked and do not include a meeting link.",
+      persona,
+      tail,
+    ].join("\n");
+    return (await rewriteDraft(agent, instruction, draftReply)) || draftReply;
+  }
+
+  if (meeting.mode === "fallback") {
+    const fallbackUrl = cleanString(meeting.url);
+    if (!fallbackUrl) return draftReply;
+    const instruction = [
+      "No meeting slot could be automatically offered or booked.",
+      `Rewrite the reply below into a warm, confident, conversion-focused message that drives the lead to book a time using this link: ${fallbackUrl}.`,
+      "Never mention any technical failure or that booking was attempted.",
+      persona,
+      tail,
+    ].join("\n");
+    const rewritten = (await rewriteDraft(agent, instruction, draftReply)) || draftReply;
+    return ensureIncludes(rewritten, [fallbackUrl], `You can pick a time that suits you here: ${fallbackUrl}`);
+  }
+
+  return draftReply;
+}
+
+/**
+ * One plain model call with the agent's own provider and the workspace's key resolution (workspace key, else the platform
+ * key when allowed). Counts one ai_requests unit. Returns the text, or null when no key/provider is available or the call
+ * failed. A QuotaError propagates (callers decide). Used by workflow nodes that need a strict-JSON answer.
+ */
+async function askModel(agent, { system, user, action = "classification" }) {
+  let resolved = null;
+  try {
+    resolved = await resolveProviderKey(agent);
+  } catch {
+    return null;
+  }
+  if (!resolved) return null;
+  await quotaService.consume(agent.workspace_id, "ai_requests", 1, { action });
+  try {
+    return await PROVIDER_ADAPTERS[resolved.provider].call({ apiKey: resolved.apiKey, model: agent.agent_model, system, user, temperature: 0, action });
+  } catch (error) {
+    console.warn("Model call failed:", error.message);
+    return null;
+  }
 }
 
 /** The rewrite is a model call; make sure the facts the lead needs survived it. */
@@ -1539,4 +1637,4 @@ async function buildAlreadyHandledError(workspaceId, draftId, knownStatus) {
 module.exports = new MessageService();
 // Shared with services/nativeAgentReply.service.js so native-inbox AI replies are generated by
 // exactly the same agent prompt / meeting-booking logic as PlusVibe ones.
-module.exports.agentHelpers = { generateResponse, isMeetingObjective, applyMeetingBooking, buildReplySubject, stripQuotedReply, describeSlot, mapDraft };
+module.exports.agentHelpers = { generateResponse, isMeetingObjective, applyMeetingBooking, applyWorkflowMeeting, askModel, buildReplySubject, stripQuotedReply, describeSlot, mapDraft };

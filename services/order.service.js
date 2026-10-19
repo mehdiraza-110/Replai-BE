@@ -1,10 +1,13 @@
 const db = require("../config/db.config");
 const { WorkspaceError } = require("./workspace.service");
 const quota = require("./quota.service");
+const systemMail = require("./systemMail.service");
 
 const OPEN = ["requested", "approved", "in_progress"];
 const MAX_OPEN = 10;
 const DOMAIN_RE = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+const LIMIT_KEYS = ["domains", "mailboxes", "emails", "workflows", "ai_requests"];
+const MAX_REQUESTED_LIMIT = 1000000;
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 const SELECT = `SELECT r.id, r.workspace_id, r.type, r.quantity, r.details, r.status, r.admin_notes, r.created_at, r.updated_at,
@@ -92,6 +95,34 @@ async function validateDetails(workspaceId, type, raw) {
   return out;
 }
 
+// "More limits" request: which limit, the new value, optional notes. Only limits that are set can be raised.
+async function validateLimitDetails(workspaceId, raw) {
+  if (raw === undefined || raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new WorkspaceError("Tell us which limit you want raised and the new value.", 400);
+  }
+  if (typeof raw.limitKey !== "string" || !LIMIT_KEYS.includes(raw.limitKey)) {
+    throw new WorkspaceError(`Choose which limit to raise: ${LIMIT_KEYS.join(", ")}.`, 400);
+  }
+  const label = quota.LABELS[raw.limitKey];
+  const current = quota.limitFor(await quota.getLimits(workspaceId), raw.limitKey);
+  if (!current) {
+    throw new WorkspaceError(`${label} has no limit on your workspace, so there is nothing to raise.`, 400);
+  }
+  if (!isInt(raw.requestedLimit) || raw.requestedLimit > MAX_REQUESTED_LIMIT) {
+    throw new WorkspaceError(`The new limit must be a whole number of at most ${MAX_REQUESTED_LIMIT.toLocaleString("en-US")}.`, 400);
+  }
+  if (raw.requestedLimit <= current.limit) {
+    throw new WorkspaceError(`The new limit must be higher than your current ${label.toLowerCase()} limit of ${current.limit.toLocaleString("en-US")}.`, 400);
+  }
+  const out = { limitKey: raw.limitKey, requestedLimit: raw.requestedLimit, currentLimit: current.limit, period: current.period };
+  if (raw.notes !== undefined && raw.notes !== null) {
+    if (typeof raw.notes !== "string") throw new WorkspaceError("Notes must be text.", 400);
+    if (raw.notes.length > 1000) throw new WorkspaceError("Notes can be at most 1000 characters.", 400);
+    if (raw.notes.trim()) out.notes = raw.notes.trim();
+  }
+  return out;
+}
+
 const orderService = {
   OPEN,
   mapRow,
@@ -111,12 +142,16 @@ const orderService = {
   },
 
   async create(workspaceId, userId, body = {}) {
-    if (body.type !== "domains" && body.type !== "mailboxes") throw new WorkspaceError('Choose what you want to order: "domains" or "mailboxes".', 400);
-    if (!isInt(body.quantity) || body.quantity < 1 || body.quantity > 500) {
+    if (body.type !== "domains" && body.type !== "mailboxes" && body.type !== "limits") {
+      throw new WorkspaceError('Choose what you want to order: "domains", "mailboxes" or "limits".', 400);
+    }
+    const isLimits = body.type === "limits";
+    if (!isLimits && (!isInt(body.quantity) || body.quantity < 1 || body.quantity > 500)) {
       throw new WorkspaceError("Quantity must be a whole number between 1 and 500.", 400);
     }
-    const details = await validateDetails(workspaceId, body.type, body.details);
-    await quota.assertOrderQuantity(workspaceId, body.type, body.quantity);
+    const quantity = isLimits ? 1 : body.quantity;
+    const details = isLimits ? await validateLimitDetails(workspaceId, body.details) : await validateDetails(workspaceId, body.type, body.details);
+    if (!isLimits) await quota.assertOrderQuantity(workspaceId, body.type, quantity);
 
     const client = await db.getClient();
     try {
@@ -133,10 +168,12 @@ const orderService = {
       const { rows } = await client.query(
         `INSERT INTO provisioning_requests (workspace_id, type, quantity, details, requested_by)
          VALUES ($1, $2, $3, $4::jsonb, $5) RETURNING id`,
-        [workspaceId, body.type, body.quantity, JSON.stringify(details), userId],
+        [workspaceId, body.type, quantity, JSON.stringify(details), userId],
       );
       await client.query("COMMIT");
-      return this.get(workspaceId, rows[0].id);
+      const created = await this.get(workspaceId, rows[0].id);
+      systemMail.fire(() => systemMail.orderCreated({ ...created, workspace_id: workspaceId }));
+      return created;
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
       throw e;

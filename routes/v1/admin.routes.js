@@ -21,6 +21,7 @@ router.get('/orders', admin.listOrders);
 router.get('/orders/count', admin.countOrders);
 router.get('/orders/:id', admin.getOrder);
 router.patch('/orders/:id', admin.updateOrder);
+router.post('/orders/:id/apply-limits', admin.applyLimits);
 
 router.get('/users', admin.listUsers);
 router.patch('/users/:id', admin.updateUser);

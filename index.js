@@ -85,3 +85,10 @@ cron.schedule('*/10 * * * *', () => {
     require('./services/maildoso.service').syncMailboxes()
         .catch((error) => console.error('Maildoso sync failed:', error.message));
 });
+
+// Trial milestone emails (7/3/1 days before the end, and when it has ended). Hourly, deduplicated in the database.
+try {
+    require('./services/trialNotifier.service').start();
+} catch (error) {
+    console.error('Trial notifier could not start:', error.message);
+}

@@ -79,7 +79,9 @@ class NativeAgentReplyService {
       })),
     };
 
-    const meetingOffer = helpers.isMeetingObjective(agent) ? await meetingBookingService.getActiveOffer(inbound.thread_id, workspaceId).catch(() => null) : null;
+    // A workflow with explicit meeting nodes owns the meeting logic (override.skipBuiltInMeeting): the built-in offer/booking is skipped.
+    const skipBuiltInMeeting = override?.skipBuiltInMeeting === true;
+    const meetingOffer = !skipBuiltInMeeting && helpers.isMeetingObjective(agent) ? await meetingBookingService.getActiveOffer(inbound.thread_id, workspaceId).catch(() => null) : null;
     if (meetingOffer) {
       context.offeredSlots = meetingOffer.slots.map((slot, index) => ({
         number: index + 1,
@@ -89,7 +91,9 @@ class NativeAgentReplyService {
 
     const generation = await helpers.generateResponse(agent, context);
     let body = generation.body;
-    if (generation.wantsMeeting || generation.selectedSlot) {
+    if (skipBuiltInMeeting) {
+      body = await helpers.applyWorkflowMeeting(agent, generation.body, override.meeting);
+    } else if (generation.wantsMeeting || generation.selectedSlot) {
       body = await helpers.applyMeetingBooking(agent, generation.body, {
         offer: meetingOffer,
         selectedSlot: generation.selectedSlot,
