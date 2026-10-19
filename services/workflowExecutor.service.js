@@ -132,7 +132,7 @@ async function runWorkflow(workflow, { event = {}, dryRun = false } = {}) {
         activated.add(edge.target);
       }
     }
-    if (state.suppressed && !state.sent && !state.draftCreated) status = "skipped";
+    if ((state.suppressed || state.noAgent) && !state.sent && !state.draftCreated) status = "skipped";
   } catch (error) {
     status = "failed";
     errorMessage = error.message || String(error);
@@ -158,26 +158,35 @@ async function runWorkflow(workflow, { event = {}, dryRun = false } = {}) {
 // Lookup / matching
 // ---------------------------------------------------------------------------------------------------------------
 
+/**
+ * Among the active workflows of this trigger type whose scope matches the event, the MOST SPECIFIC wins: a list that
+ * contains the event's campaign/mailbox beats "all"; ties go to the lowest workflow id.
+ */
 async function findActiveWorkflow(workspaceId, triggerType, event) {
   const { rows } = await db.query(
     `SELECT * FROM workflows WHERE workspace_id = $1 AND is_active = TRUE AND is_deleted = FALSE ORDER BY id`,
     [workspaceId]
   );
+  let best = null;
+  let bestRank = 0;
   for (const workflow of rows) {
     const trigger = (workflow.graph?.nodes || []).find((n) => n.type === triggerType);
-    if (trigger && triggerMatches(trigger, event)) return workflow;
+    if (!trigger) continue;
+    const rank = triggerMatchRank(trigger, event);
+    if (rank > bestRank) { best = workflow; bestRank = rank; } // rows are id-ordered, so ties keep the lowest id
   }
-  return null;
+  return best;
 }
 
-function triggerMatches(trigger, event) {
+/** 0 = no match, 1 = matches via "all", 2 = matches via an explicit list containing the event's id. */
+function triggerMatchRank(trigger, event) {
   const data = trigger.data || {};
   if (trigger.type === "trigger.plusvibe_reply") {
-    if (data.campaignIds === "all" || data.campaignIds === undefined) return true;
-    return Array.isArray(data.campaignIds) && event.campaignId != null && data.campaignIds.map(String).includes(String(event.campaignId));
+    if (data.campaignIds === "all" || data.campaignIds === undefined) return 1;
+    return Array.isArray(data.campaignIds) && event.campaignId != null && data.campaignIds.map(String).includes(String(event.campaignId)) ? 2 : 0;
   }
-  if (data.mailboxIds === "all" || data.mailboxIds === undefined) return true;
-  return Array.isArray(data.mailboxIds) && event.mailboxId != null && data.mailboxIds.map(Number).includes(Number(event.mailboxId));
+  if (data.mailboxIds === "all" || data.mailboxIds === undefined) return 1;
+  return Array.isArray(data.mailboxIds) && event.mailboxId != null && data.mailboxIds.map(Number).includes(Number(event.mailboxId)) ? 2 : 0;
 }
 
 function normalizeEvent(triggerType, event = {}) {
@@ -278,14 +287,56 @@ async function keywordCondition(node, ctx) {
   return { branch: keyword ? "yes" : "no", output: { matched: Boolean(keyword), keyword: keyword || null, matchOn: data.matchOn } };
 }
 
+const NO_CAMPAIGN_AGENT = "This campaign has no AI agent assigned.";
+
+/** The agent assigned to the campaign the reply belongs to (workspace-scoped), or null. */
+async function resolveCampaignAgentId(workspaceId, triggerType, event) {
+  if (event.campaignId == null || event.campaignId === "") return null;
+  if (triggerType === "trigger.plusvibe_reply") {
+    const { rows } = await db.query(
+      `SELECT assigned_ai_agent_id AS id FROM plusvibe_campaigns WHERE plusvibe_campaign_id = $1 AND workspace_id = $2 AND is_deleted = FALSE LIMIT 1`,
+      [String(event.campaignId), workspaceId]
+    );
+    return rows[0]?.id || null;
+  }
+  if (triggerType === "trigger.inbox_mail") {
+    const campaignId = Number(event.campaignId);
+    if (!Number.isInteger(campaignId)) return null;
+    const { rows } = await db.query(`SELECT ai_agent_id AS id FROM campaigns WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE LIMIT 1`, [campaignId, workspaceId]);
+    return rows[0]?.id || null;
+  }
+  return null;
+}
+
 async function aiAgent(node, ctx) {
   const { workspaceId, event, dryRun, state, triggerType } = ctx;
   const data = node.data || {};
-  const mode = data.mode === "review" ? "review" : "auto_send";
+  const mode = data.mode === "review" ? "review" : data.mode === "agent_default" ? "agent_default" : "auto_send";
 
-  const { rows: agentRows } = await db.query(`SELECT * FROM ai_agents WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE`, [data.agentId, workspaceId]);
+  let agentId = data.agentId;
+  if (agentId === "campaign") {
+    if (triggerType !== "trigger.plusvibe_reply" && triggerType !== "trigger.inbox_mail") throw new Error("\"The campaign's agent\" only works with the PlusVibe reply or mailbox reply trigger.");
+    if (dryRun && (event.campaignId == null || event.campaignId === "")) {
+      // A test has no real campaign, so there is no agent to look up; show what a real reply would do.
+      state.draft = { dry: true };
+      return { output: { wouldGenerateDraft: true, agent: "the agent assigned to the reply's campaign", mode, note: "Dry run: the agent is chosen from the real reply's campaign. No AI provider was called and nothing was saved." } };
+    }
+    agentId = await resolveCampaignAgentId(workspaceId, triggerType, event);
+    if (!agentId) {
+      state.noAgent = true;
+      return { status: "skipped", output: { reason: "no_agent", detail: NO_CAMPAIGN_AGENT, message: NO_CAMPAIGN_AGENT } };
+    }
+  }
+
+  const { rows: agentRows } = await db.query(`SELECT * FROM ai_agents WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE`, [agentId, workspaceId]);
   const agentRow = agentRows[0];
-  if (!agentRow) throw new Error("The AI agent for this step no longer exists in this workspace.");
+  if (!agentRow) {
+    if (data.agentId === "campaign") {
+      state.noAgent = true;
+      return { status: "skipped", output: { reason: "no_agent", detail: NO_CAMPAIGN_AGENT, message: NO_CAMPAIGN_AGENT } };
+    }
+    throw new Error("The AI agent for this step no longer exists in this workspace.");
+  }
 
   // Same gates as the built-in path: an opted-out / suppressed address never gets an AI answer.
   const leadEmail = event.leadEmail;
@@ -297,6 +348,7 @@ async function aiAgent(node, ctx) {
 
   if (dryRun) {
     state.draft = { dry: true };
+    if (mode === "agent_default") state.reviewOnly = true; // never decided in a test: the real run decides from the real confidence
     return {
       output: {
         wouldGenerateDraft: true,
@@ -323,8 +375,10 @@ async function aiAgentPlusVibe({ data, ctx, agentRow, mode }) {
   }
   state.draft = { source: "plusvibe", id: result.draft.id, lead_email: event.leadEmail };
   state.draftCreated = true;
-  if (mode === "review") state.reviewOnly = true;
-  return { output: { draftId: result.draft.id, mode, confidence: Number(result.draft.confidence) } };
+  // The built-in PlusVibe path only ever drafts (drafts wait in Human Review; approveDraft is a manual action), so
+  // "agent_default" == "review" here.
+  if (mode === "review" || mode === "agent_default") state.reviewOnly = true;
+  return { output: { draftId: result.draft.id, mode, confidence: Number(result.draft.confidence), ...(mode === "agent_default" ? { note: "PlusVibe replies are never auto-sent by the agent's own settings; left as a draft for human review." } : {}) } };
 }
 
 function overrideOf(data, agentRow) {
@@ -358,13 +412,35 @@ async function aiAgentNative({ data, ctx, agentRow, mode }) {
   state.draftCreated = true;
 
   let note;
-  if (mode === "review") {
+  if (mode === "agent_default") {
+    // Exactly the built-in gating (nativeAgentReply's `autoSend`): every condition must hold, else it waits for review.
+    const campaign = await campaignForGate(workspaceId, event.campaignId);
+    const autoSend =
+      Boolean(campaign) &&
+      !campaign.human_review_required &&
+      Boolean(agentRow.auto_reply_enabled) &&
+      !agentRow.require_human_review &&
+      Number(result.confidence) >= Number(agentRow.confidence_threshold);
+    if (!autoSend) {
+      state.reviewOnly = true;
+      note = "Following the agent's settings: left as a draft for human review.";
+    } else {
+      note = "Following the agent's settings: sent automatically.";
+    }
+  } else if (mode === "review") {
     state.reviewOnly = true;
   } else if (Number(result.confidence) < Number(agentRow.confidence_threshold)) {
     state.reviewOnly = true;
     note = `Confidence ${result.confidence} is below the agent's threshold ${agentRow.confidence_threshold}; left as a draft for review.`;
   }
   return { output: { draftId: result.draftId, mode, confidence: Number(result.confidence), generatedBy: result.generatedBy, note } };
+}
+
+async function campaignForGate(workspaceId, campaignId) {
+  const id = Number(campaignId);
+  if (!campaignId || !Number.isInteger(id)) return null;
+  const { rows } = await db.query(`SELECT * FROM campaigns WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE`, [id, workspaceId]);
+  return rows[0] || null;
 }
 
 async function sendReply(node, ctx) {

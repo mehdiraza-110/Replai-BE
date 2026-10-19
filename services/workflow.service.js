@@ -23,6 +23,8 @@ const SUMMARY_SELECT = `
   jsonb_array_length(COALESCE(w.graph->'nodes', '[]'::jsonb)) AS node_count,
   (SELECT n->>'type' FROM jsonb_array_elements(COALESCE(w.graph->'nodes', '[]'::jsonb)) n
      WHERE n->>'type' LIKE 'trigger.%' LIMIT 1) AS trigger_type,
+  (SELECT n->'data' FROM jsonb_array_elements(COALESCE(w.graph->'nodes', '[]'::jsonb)) n
+     WHERE n->>'type' LIKE 'trigger.%' LIMIT 1) AS trigger_data,
   (SELECT jsonb_build_object('status', r.status, 'started_at', r.started_at)
      FROM workflow_runs r WHERE r.workflow_id = w.id AND r.workspace_id = w.workspace_id AND r.dry_run = FALSE
      ORDER BY r.started_at DESC, r.id DESC LIMIT 1) AS last_run`;
@@ -44,6 +46,21 @@ async function get(workspaceId, id) {
   return { ...mapSummary(rows[0]), graph: rows[0].graph };
 }
 
+/** "all" | "specific" | null (no trigger). A missing/"all" filter value means every campaign/mailbox. */
+function triggerScope(type, data) {
+  if (!type) return null;
+  return scopeList(type, data) === "all" ? "all" : "specific";
+}
+
+const FILTER_KEY = { "trigger.plusvibe_reply": "campaignIds", "trigger.inbox_mail": "mailboxIds", "trigger.mail_sent": "mailboxIds" };
+
+/** "all" or an array of string ids, read from a trigger node's data. */
+function scopeList(type, data) {
+  const value = (data || {})[FILTER_KEY[type]];
+  if (Array.isArray(value)) return value.map(String);
+  return "all";
+}
+
 function mapSummary(row) {
   return {
     id: row.id,
@@ -52,23 +69,26 @@ function mapSummary(row) {
     is_active: row.is_active,
     node_count: Number(row.node_count) || 0,
     trigger_type: row.trigger_type || null,
+    trigger_scope: triggerScope(row.trigger_type, row.trigger_data),
     updated_at: row.updated_at,
     last_run: row.last_run || null,
   };
 }
 
 async function meta(workspaceId) {
-  const [mailboxes, agents, integration, campaigns] = await Promise.all([
+  const [mailboxes, agents, integration, campaigns, coldCampaigns] = await Promise.all([
     db.query(`SELECT id, email FROM mailboxes WHERE workspace_id = $1 AND is_deleted = FALSE ORDER BY email`, [workspaceId]),
     db.query(`SELECT id, name FROM ai_agents WHERE workspace_id = $1 AND is_deleted = FALSE ORDER BY name`, [workspaceId]),
     hasPlusVibe(workspaceId),
-    db.query(`SELECT plusvibe_campaign_id AS id, name FROM plusvibe_campaigns WHERE workspace_id = $1 AND is_deleted = FALSE ORDER BY name`, [workspaceId]),
+    db.query(`SELECT plusvibe_campaign_id AS id, name, assigned_ai_agent_id AS "agentId" FROM plusvibe_campaigns WHERE workspace_id = $1 AND is_deleted = FALSE ORDER BY name`, [workspaceId]),
+    db.query(`SELECT id, name, ai_agent_id AS "agentId" FROM campaigns WHERE workspace_id = $1 AND is_deleted = FALSE AND is_warmup = FALSE ORDER BY name`, [workspaceId]),
   ]);
   return {
     mailboxes: mailboxes.rows,
     agents: agents.rows,
     plusvibeConnected: integration,
     plusvibeCampaigns: campaigns.rows,
+    campaigns: coldCampaigns.rows,
     triggers: executor.describeTriggerTypes(),
   };
 }
@@ -157,12 +177,8 @@ async function update(workspaceId, id, body = {}, { draft = false } = {}) {
     }
 
     if (isActive) {
-      const triggerType = (graph.nodes.find((n) => isTrigger(n.type)) || {}).type;
-      const others = await client.query(`SELECT id, name, graph FROM workflows WHERE workspace_id = $1 AND is_active = TRUE AND is_deleted = FALSE AND id <> $2`, [workspaceId, id]);
-      const clash = others.rows.find((w) => (w.graph?.nodes || []).some((n) => n.type === triggerType));
-      if (clash) {
-        throw new WorkflowError(`"${clash.name}" is already active for the same trigger. Turn it off first, then activate this one.`, 409);
-      }
+      const clash = await findScopeClash(client, workspaceId, id, graph);
+      if (clash) throw new WorkflowError(clash, 409);
     }
 
     await client.query(
@@ -177,6 +193,46 @@ async function update(workspaceId, id, body = {}, { draft = false } = {}) {
     client.release();
   }
   return get(workspaceId, id);
+}
+
+/**
+ * Two active workflows of the same trigger type may coexist as long as their scopes do not overlap. Scope is "all" or a
+ * list of ids; they overlap only when both are "all" or the lists share an id ("all" + specific is allowed: specific wins).
+ * Returns a user-facing message for the first clash, or null.
+ */
+async function findScopeClash(client, workspaceId, id, graph) {
+  const trigger = (graph.nodes || []).find((n) => isTrigger(n.type));
+  if (!trigger) return null;
+  const isCampaign = trigger.type === "trigger.plusvibe_reply";
+  const noun = isCampaign ? "campaigns" : "mailboxes";
+  const mine = scopeList(trigger.type, trigger.data);
+  const others = await client.query(`SELECT id, name, graph FROM workflows WHERE workspace_id = $1 AND is_active = TRUE AND is_deleted = FALSE AND id <> $2 ORDER BY id`, [workspaceId, id]);
+  for (const w of others.rows) {
+    const t = (w.graph?.nodes || []).find((n) => n.type === trigger.type);
+    if (!t) continue;
+    const theirs = scopeList(trigger.type, t.data);
+    if (mine === "all" && theirs === "all") {
+      return `"${w.name}" is already active and covers all ${noun} for this trigger. Turn it off, or limit one of the two workflows to specific ${noun}.`;
+    }
+    if (mine === "all" || theirs === "all") continue;
+    const shared = mine.filter((v) => theirs.includes(v));
+    if (shared.length) {
+      const label = await describeScopeItem(client, workspaceId, isCampaign, shared[0]);
+      const more = shared.length > 1 ? ` (and ${shared.length - 1} more)` : "";
+      return `"${w.name}" is already active for the same ${isCampaign ? "campaign" : "mailbox"} ${label}${more}. Remove it from one of the two workflows or turn "${w.name}" off first.`;
+    }
+  }
+  return null;
+}
+
+async function describeScopeItem(client, workspaceId, isCampaign, value) {
+  try {
+    const { rows } = isCampaign
+      ? await client.query(`SELECT name FROM plusvibe_campaigns WHERE plusvibe_campaign_id = $1 AND workspace_id = $2 AND is_deleted = FALSE LIMIT 1`, [String(value), workspaceId])
+      : await client.query(`SELECT email AS name FROM mailboxes WHERE id = $1 AND workspace_id = $2 LIMIT 1`, [Number(value), workspaceId]);
+    if (rows[0]?.name) return `"${rows[0].name}"`;
+  } catch (_) { /* fall through to the raw id */ }
+  return `"${value}"`;
 }
 
 async function remove(workspaceId, id) {
@@ -358,8 +414,10 @@ async function validateGraph(workspaceId, rawGraph) {
       case "action.save_to_db":
         break;
       case "action.ai_agent":
-        if (!isPosInt(d.agentId) || !agentIds.has(d.agentId)) problems.push({ nodeId: n.id, message: "Choose an AI agent from this workspace." });
-        if (d.mode !== "auto_send" && d.mode !== "review") problems.push({ nodeId: n.id, message: "Choose whether the AI sends automatically or leaves the reply for review." });
+        if (d.agentId === "campaign") {
+          if (triggerType && triggerType !== "trigger.plusvibe_reply" && triggerType !== "trigger.inbox_mail") problems.push({ nodeId: n.id, message: "\"The campaign's agent\" only works with the PlusVibe reply or mailbox reply trigger." });
+        } else if (!isPosInt(d.agentId) || !agentIds.has(d.agentId)) problems.push({ nodeId: n.id, message: "Choose an AI agent from this workspace." });
+        if (d.mode !== "auto_send" && d.mode !== "review" && d.mode !== "agent_default") problems.push({ nodeId: n.id, message: "Choose whether the AI sends automatically, leaves the reply for review, or follows the agent's own settings." });
         if (d.tone !== undefined && (typeof d.tone !== "string" || d.tone.length > 200)) problems.push({ nodeId: n.id, message: "Tone must be text of 200 characters or fewer." });
         if (d.instructions !== undefined && (typeof d.instructions !== "string" || d.instructions.length > 4000)) problems.push({ nodeId: n.id, message: "Instructions must be text of 4000 characters or fewer." });
         if (triggerType === "trigger.mail_sent") problems.push({ nodeId: n.id, message: "An AI reply needs a reply trigger, not \"email sent\"." });
