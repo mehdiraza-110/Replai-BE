@@ -21,7 +21,8 @@ class CampaignService {
     const limitNum = Math.min(Math.max(Number.parseInt(limit, 10) || 10, 1), 100);
     const offset = (pageNum - 1) * limitNum;
 
-    const conditions = ["is_deleted = FALSE", "workspace_id = $1"];
+    // The system warm-up lane is an internal pool, not a customer campaign: never listed here.
+    const conditions = ["is_deleted = FALSE", "is_warmup = FALSE", "workspace_id = $1"];
     const params = [workspaceId];
 
     const searchTerm = String(search || "").trim();
@@ -60,6 +61,39 @@ class CampaignService {
       total,
       totalPages: Math.max(1, Math.ceil(total / limitNum)),
     };
+  }
+
+  /** Soft delete: stops sending, keeps leads/messages/history. Role checks live in the controller. */
+  async deleteCampaign(campaignId, { workspaceId, userId = null } = {}) {
+    const id = Number(campaignId);
+    const notFound = () => Object.assign(new Error("Campaign not found"), { statusCode: 404, code: "CAMPAIGN_NOT_FOUND" });
+    if (!Number.isInteger(id) || id <= 0) throw notFound();
+    const { rows } = await db.query(
+      `SELECT id, name, is_warmup FROM campaigns WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE`,
+      [id, workspaceId]
+    );
+    const campaign = rows[0];
+    if (!campaign) throw notFound();
+    if (campaign.is_warmup) {
+      throw Object.assign(new Error("The warm-up lane is managed automatically and can't be deleted."), { statusCode: 400, code: "CAMPAIGN_WARMUP_PROTECTED" });
+    }
+    const { rowCount } = await db.query(
+      `UPDATE campaigns SET is_deleted = TRUE, status = 'Paused', updated_at = NOW()
+       WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE AND is_warmup = FALSE`,
+      [id, workspaceId]
+    );
+    if (!rowCount) throw notFound();
+    await require("./eventLog.service").record({
+      eventType: "campaign.deleted",
+      source: "campaigns",
+      status: "Success",
+      appWorkspaceId: workspaceId,
+      campaignId: String(campaign.id),
+      campaignName: campaign.name,
+      createdBy: userId,
+      metadata: { campaignId: campaign.id, name: campaign.name },
+    });
+    return { id: campaign.id, name: campaign.name };
   }
 
   async createCampaign({

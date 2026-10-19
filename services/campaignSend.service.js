@@ -71,6 +71,11 @@ class CampaignSendService {
 
     let sentCount = 0;
     for (const mailbox of mailboxes) {
+      // A campaign deleted/paused while this tick was running must stop sending right away.
+      if (!campaign.is_warmup) {
+        const { rows: live } = await db.query(`SELECT 1 FROM campaigns WHERE id = $1 AND status = 'Active' AND is_deleted = FALSE`, [campaign.id]);
+        if (!live[0]) return { campaignId: campaign.id, sent: sentCount, reason: "campaign_inactive" };
+      }
       // Warmup sends draw from the permanent warmup-lane allowance (daily_limit/sent_today);
       // real campaigns draw from the separate market-lane allowance, which only unlocks once
       // a mailbox finishes ramping. See warmup.service.js tickMailbox.

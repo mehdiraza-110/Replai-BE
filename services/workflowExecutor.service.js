@@ -32,7 +32,7 @@ const DEFAULT_PRIORITY = 100;
 const TRIGGER_TYPES = {
   "trigger.inbox_mail": {
     label: "Reply lands in a mailbox",
-    description: "A prospect replies to one of your own (Maildoso/SES/IMAP) mailboxes.",
+    description: "A prospect replies to one of your own mailboxes.",
     configKey: "mailboxIds",
     eventFields: ["mailboxId", "campaignId?", "leadId?", "inboundMessageId", "threadId", "fromAddress", "toAddress", "subject", "body"],
   },

@@ -113,6 +113,10 @@ class WarmupService {
       throw Object.assign(new Error("Provide mailboxIds, domain, or all:true"), { statusCode: 400 });
     }
 
+    // Mailboxes already on this strategy are left completely untouched (re-assigning must not wipe their ramp).
+    const { rows: targeted } = await db.query(`SELECT id, warmup_strategy_id FROM mailboxes WHERE ${conditions.join(" AND ")}`, params);
+    const alreadyAssignedCount = targeted.filter((row) => Number(row.warmup_strategy_id) === Number(strategyId)).length;
+
     params.push(strategyId, strategy.start_daily_limit);
     const { rows } = await db.query(
       `UPDATE mailboxes SET
@@ -123,12 +127,18 @@ class WarmupService {
          warmup_last_tick_at = NULL,
          warmup_last_action = NULL,
          updated_at = NOW()
-       WHERE ${conditions.join(" AND ")}
-       RETURNING *`,
+       WHERE ${conditions.join(" AND ")} AND warmup_strategy_id IS DISTINCT FROM $${params.length - 1}
+       RETURNING id`,
       params
     );
 
-    return { strategy: mapStrategyRow(strategy), assignedCount: rows.length };
+    const result = { strategy: mapStrategyRow(strategy), assignedCount: rows.length, alreadyAssignedCount };
+    if (target?.mailboxIds?.length) {
+      const found = new Set(targeted.map((row) => Number(row.id)));
+      const skipped = target.mailboxIds.map(Number).filter((id) => !found.has(id));
+      if (skipped.length) result.skippedMailboxIds = skipped;
+    }
+    return result;
   }
 
   async generateAiSchedule({ domain, mailboxIds, workspaceId }) {

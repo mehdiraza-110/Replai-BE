@@ -29,6 +29,18 @@ async function createCampaign(req, res) {
   }
 }
 
+async function deleteCampaign(req, res) {
+  try {
+    if (!(req.user?.isSuperAdmin === true || ["owner", "admin"].includes(req.workspace?.role))) {
+      return res.status(403).json({ success: false, message: "Only workspace owners and admins can delete campaigns.", code: "CAMPAIGN_FORBIDDEN", data: null });
+    }
+    const data = await campaignService.deleteCampaign(req.params.id, { workspaceId: req.workspaceId, userId: req.user?.id ?? null });
+    res.status(200).json({ success: true, message: "Campaign deleted successfully", data });
+  } catch (error) {
+    sendError(res, error, "Unable to delete campaign");
+  }
+}
+
 async function parseLeadsFile(req, res) {
   try {
     if (!req.file) {
@@ -83,6 +95,7 @@ function sendError(res, error, fallbackMessage) {
 module.exports = {
   listCampaigns,
   createCampaign,
+  deleteCampaign,
   parseLeadsFile,
   listCampaignLeads,
 };
