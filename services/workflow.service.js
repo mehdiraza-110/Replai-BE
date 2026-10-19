@@ -4,6 +4,9 @@ const executor = require("./workflowExecutor.service");
 
 const MAX_NODES = 50;
 const MAX_EDGES = 100;
+const DEFAULT_PRIORITY = 100;
+const MIN_PRIORITY = 1;
+const MAX_PRIORITY = 1000;
 
 class WorkflowError extends Error {
   constructor(message, status = 400, problems = null) {
@@ -20,7 +23,7 @@ const isTrigger = (type) => String(type).startsWith("trigger.");
 // ---------------------------------------------------------------------------------------------------------------
 
 const SUMMARY_SELECT = `
-  w.id, w.name, w.description, w.is_active, w.updated_at,
+  w.id, w.name, w.description, w.is_active, w.priority, w.updated_at,
   jsonb_array_length(COALESCE(w.graph->'nodes', '[]'::jsonb)) AS node_count,
   (SELECT n->>'type' FROM jsonb_array_elements(COALESCE(w.graph->'nodes', '[]'::jsonb)) n
      WHERE n->>'type' LIKE 'trigger.%' LIMIT 1) AS trigger_type,
@@ -68,9 +71,11 @@ function mapSummary(row) {
     name: row.name,
     description: row.description,
     is_active: row.is_active,
+    priority: row.priority ?? DEFAULT_PRIORITY,
     node_count: Number(row.node_count) || 0,
     trigger_type: row.trigger_type || null,
     trigger_scope: triggerScope(row.trigger_type, row.trigger_data),
+    trigger_targets: row.trigger_type ? scopeList(row.trigger_type, row.trigger_data) : null,
     updated_at: row.updated_at,
     last_run: row.last_run || null,
   };
@@ -121,6 +126,12 @@ function cleanName(value) {
   if (!name) throw new WorkflowError("Give the workflow a name.");
   if (name.length > 180) throw new WorkflowError("The workflow name must be 180 characters or fewer.");
   return name;
+}
+
+function cleanPriority(value) {
+  const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
+  if (!Number.isInteger(n) || n < MIN_PRIORITY || n > MAX_PRIORITY) throw new WorkflowError(`Run order must be a whole number from ${MIN_PRIORITY} to ${MAX_PRIORITY} (lower runs first).`);
+  return n;
 }
 
 function defaultReplyGraph() {
@@ -177,7 +188,8 @@ function bookMeetingsGraph({ trigger = "inbox_mail", mode = "review" } = {}) {
   };
 }
 
-async function create(workspaceId, userId, { name, description, template, trigger, mode } = {}) {
+async function create(workspaceId, userId, { name, description, template, trigger, mode, priority } = {}) {
+  const prio = priority === undefined || priority === null ? DEFAULT_PRIORITY : cleanPriority(priority);
   if (template !== undefined && template !== null && !TEMPLATES.includes(template)) throw new WorkflowError('Unknown template. Use "default_reply", "book_meetings" or leave it out.');
   if (trigger !== undefined && trigger !== null && trigger !== "inbox_mail" && trigger !== "plusvibe_reply") throw new WorkflowError('The trigger must be "inbox_mail" or "plusvibe_reply".');
   if (mode !== undefined && mode !== null && !["auto_send", "review", "agent_default"].includes(mode)) throw new WorkflowError('The reply mode must be "auto_send", "review" or "agent_default".');
@@ -190,8 +202,8 @@ async function create(workspaceId, userId, { name, description, template, trigge
     await quota.lock(client, workspaceId);
     await quota.check(workspaceId, "workflows", 1, client);
     const { rows } = await client.query(
-      `INSERT INTO workflows (workspace_id, name, description, graph, created_by) VALUES ($1, $2, $3, $4::jsonb, $5) RETURNING id`,
-      [workspaceId, cleanName(name), description ? String(description).slice(0, 2000) : null, JSON.stringify(graph), userId || null]
+      `INSERT INTO workflows (workspace_id, name, description, graph, created_by, priority) VALUES ($1, $2, $3, $4::jsonb, $5, $6) RETURNING id`,
+      [workspaceId, cleanName(name), description ? String(description).slice(0, 2000) : null, JSON.stringify(graph), userId || null, prio]
     );
     await client.query("COMMIT");
     id = rows[0].id;
@@ -212,7 +224,7 @@ async function update(workspaceId, id, body = {}, { draft = false } = {}) {
   const client = await db.getClient();
   try {
     await client.query("BEGIN");
-    // Serialise activation changes per workspace so two requests cannot both activate the same trigger type.
+    // Serialise workflow changes per workspace.
     await client.query(`SELECT pg_advisory_xact_lock(7001, $1)`, [workspaceId]);
     const { rows } = await client.query(`SELECT * FROM workflows WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE FOR UPDATE`, [id, workspaceId]);
     const current = rows[0];
@@ -221,6 +233,7 @@ async function update(workspaceId, id, body = {}, { draft = false } = {}) {
     const name = body.name !== undefined ? cleanName(body.name) : current.name;
     const description = body.description !== undefined ? (body.description ? String(body.description).slice(0, 2000) : null) : current.description;
     const isActive = body.is_active !== undefined ? Boolean(body.is_active) : current.is_active;
+    const priority = body.priority !== undefined ? cleanPriority(body.priority) : current.priority ?? DEFAULT_PRIORITY;
     let graph = current.graph;
 
     if (body.graph !== undefined) {
@@ -234,14 +247,9 @@ async function update(workspaceId, id, body = {}, { draft = false } = {}) {
       if (semantic.length) throw new WorkflowError("This workflow has problems. Fix them and save again.", 400, semantic);
     }
 
-    if (isActive) {
-      const clash = await findScopeClash(client, workspaceId, id, graph);
-      if (clash) throw new WorkflowError(clash, 409);
-    }
-
     await client.query(
-      `UPDATE workflows SET name = $3, description = $4, graph = $5::jsonb, is_active = $6, updated_at = NOW() WHERE id = $1 AND workspace_id = $2`,
-      [id, workspaceId, name, description, JSON.stringify(graph), isActive]
+      `UPDATE workflows SET name = $3, description = $4, graph = $5::jsonb, is_active = $6, priority = $7, updated_at = NOW() WHERE id = $1 AND workspace_id = $2`,
+      [id, workspaceId, name, description, JSON.stringify(graph), isActive, priority]
     );
     await client.query("COMMIT");
   } catch (error) {
@@ -251,46 +259,6 @@ async function update(workspaceId, id, body = {}, { draft = false } = {}) {
     client.release();
   }
   return get(workspaceId, id);
-}
-
-/**
- * Two active workflows of the same trigger type may coexist as long as their scopes do not overlap. Scope is "all" or a
- * list of ids; they overlap only when both are "all" or the lists share an id ("all" + specific is allowed: specific wins).
- * Returns a user-facing message for the first clash, or null.
- */
-async function findScopeClash(client, workspaceId, id, graph) {
-  const trigger = (graph.nodes || []).find((n) => isTrigger(n.type));
-  if (!trigger) return null;
-  const isCampaign = trigger.type === "trigger.plusvibe_reply";
-  const noun = isCampaign ? "campaigns" : "mailboxes";
-  const mine = scopeList(trigger.type, trigger.data);
-  const others = await client.query(`SELECT id, name, graph FROM workflows WHERE workspace_id = $1 AND is_active = TRUE AND is_deleted = FALSE AND id <> $2 ORDER BY id`, [workspaceId, id]);
-  for (const w of others.rows) {
-    const t = (w.graph?.nodes || []).find((n) => n.type === trigger.type);
-    if (!t) continue;
-    const theirs = scopeList(trigger.type, t.data);
-    if (mine === "all" && theirs === "all") {
-      return `"${w.name}" is already active and covers all ${noun} for this trigger. Turn it off, or limit one of the two workflows to specific ${noun}.`;
-    }
-    if (mine === "all" || theirs === "all") continue;
-    const shared = mine.filter((v) => theirs.includes(v));
-    if (shared.length) {
-      const label = await describeScopeItem(client, workspaceId, isCampaign, shared[0]);
-      const more = shared.length > 1 ? ` (and ${shared.length - 1} more)` : "";
-      return `"${w.name}" is already active for the same ${isCampaign ? "campaign" : "mailbox"} ${label}${more}. Remove it from one of the two workflows or turn "${w.name}" off first.`;
-    }
-  }
-  return null;
-}
-
-async function describeScopeItem(client, workspaceId, isCampaign, value) {
-  try {
-    const { rows } = isCampaign
-      ? await client.query(`SELECT name FROM plusvibe_campaigns WHERE plusvibe_campaign_id = $1 AND workspace_id = $2 AND is_deleted = FALSE LIMIT 1`, [String(value), workspaceId])
-      : await client.query(`SELECT email AS name FROM mailboxes WHERE id = $1 AND workspace_id = $2 LIMIT 1`, [Number(value), workspaceId]);
-    if (rows[0]?.name) return `"${rows[0].name}"`;
-  } catch (_) { /* fall through to the raw id */ }
-  return `"${value}"`;
 }
 
 async function remove(workspaceId, id) {
@@ -325,7 +293,15 @@ async function test(workspaceId, id, sample = {}) {
     [run.runId, workspaceId]
   );
   if (!rows[0]) throw new WorkflowError("The test run could not be recorded. Please try again.", 500);
-  return rows[0];
+  // Several workflows can be active for the same trigger; a test runs only this one, so say which others would also run.
+  let others = [];
+  try {
+    others = (await executor.findActiveWorkflows(workspaceId, trigger.type, event)).filter((w) => w.id !== workflow.id).map((w) => ({ id: w.id, name: w.name, priority: w.priority ?? DEFAULT_PRIORITY }));
+  } catch (_) { /* informational only */ }
+  const note = others.length
+    ? `Test of this workflow only. ${others.length} other active workflow${others.length === 1 ? "" : "s"} would also run on this trigger (${others.map((w) => `"${w.name}"`).join(", ")}). They run in order of their run order number; once one writes a reply, the others skip their reply steps.`
+    : null;
+  return { ...rows[0], ...(note ? { note } : {}), other_active_workflows: others };
 }
 
 // ---------------------------------------------------------------------------------------------------------------

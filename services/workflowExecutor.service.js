@@ -27,6 +27,8 @@ const emailService = require("./email.service");
  *   - dryRun                                  -> always { handled:true }, never falls back.
  */
 
+const DEFAULT_PRIORITY = 100;
+
 const TRIGGER_TYPES = {
   "trigger.inbox_mail": {
     label: "Reply lands in a mailbox",
@@ -87,9 +89,33 @@ function describeTriggerTypes() {
 async function maybeRun({ workspaceId, triggerType, event = {}, dryRun = false } = {}) {
   try {
     if (!workspaceId || !TRIGGER_TYPES[triggerType]) return { handled: false };
-    const workflow = await findActiveWorkflow(workspaceId, triggerType, normalizeEvent(triggerType, event));
-    if (!workflow) return { handled: false };
-    return await runWorkflow(workflow, { event, dryRun });
+    const workflows = await findActiveWorkflows(workspaceId, triggerType, normalizeEvent(triggerType, event));
+    if (workflows.length === 0) return { handled: false };
+
+    // Every matching workflow runs, one after the other (never in parallel: the shared reply marker below is what
+    // guarantees a single reply per event). The marker is set by the first run that produces the reply.
+    const shared = { replyOwner: null };
+    const results = [];
+    for (const workflow of workflows) {
+      const result = await runWorkflow(workflow, { event, dryRun, shared });
+      results.push({ workflow, result });
+    }
+    const runs = results.map(({ workflow, result }) => ({
+      runId: result.runId ?? null,
+      workflowId: workflow.id,
+      name: workflow.name,
+      priority: workflow.priority ?? DEFAULT_PRIORITY,
+      status: result.status ?? null,
+      handled: Boolean(result.handled),
+      fellBack: Boolean(result.fellBack),
+    }));
+    // Top-level fields stay as before: those of the first run that handled the event, else of the first run.
+    const primary = (results.find(({ result }) => result.handled) || results[0]).result;
+    const handled = results.some(({ result }) => result.handled);
+    const out = { ...primary, handled, runs };
+    if (handled) delete out.fellBack;
+    else if (results.every(({ result }) => result.fellBack)) out.fellBack = true;
+    return out;
   } catch (error) {
     console.error("Workflow lookup failed, falling back to built-in handling:", error.message);
     return { handled: false, status: "failed", error: error.message };
@@ -97,7 +123,7 @@ async function maybeRun({ workspaceId, triggerType, event = {}, dryRun = false }
 }
 
 /** Runs one specific workflow (used by maybeRun and by POST /workflows/:id/test). Never throws. */
-async function runWorkflow(workflow, { event = {}, dryRun = false } = {}) {
+async function runWorkflow(workflow, { event = {}, dryRun = false, shared = null } = {}) {
   const graph = workflow.graph || { nodes: [], edges: [] };
   const trigger = (graph.nodes || []).find((n) => String(n.type).startsWith("trigger."));
   const triggerType = trigger?.type || "unknown";
@@ -124,7 +150,7 @@ async function runWorkflow(workflow, { event = {}, dryRun = false } = {}) {
     if (!trigger || !order) throw new Error("The workflow graph is invalid (needs one trigger and no loops).");
     const nodesById = new Map(graph.nodes.map((n) => [n.id, n]));
     const activated = new Set([trigger.id]);
-    const ctx = { workspaceId: workflow.workspace_id, event: ev, dryRun, state, triggerType, hasMeetingNodes: graph.nodes.some((n) => MEETING_NODE_TYPES.includes(n.type)) };
+    const ctx = { workspaceId: workflow.workspace_id, event: ev, dryRun, state, triggerType, shared, workflow, hasMeetingNodes: graph.nodes.some((n) => MEETING_NODE_TYPES.includes(n.type)) };
     // The save step is optional in the graph, but the data is ALWAYS saved: without a "Save to database" node it runs
     // automatically right after the trigger. It never blocks a reply (a failed save is shown in the trace only).
     const hasSaveNode = graph.nodes.some((n) => n.type === "action.save_to_db");
@@ -195,23 +221,23 @@ async function runWorkflow(workflow, { event = {}, dryRun = false } = {}) {
 // ---------------------------------------------------------------------------------------------------------------
 
 /**
- * Among the active workflows of this trigger type whose scope matches the event, the MOST SPECIFIC wins: a list that
- * contains the event's campaign/mailbox beats "all"; ties go to the lowest workflow id.
+ * EVERY active workflow of this trigger type whose scope matches the event, in run order: priority ascending (lower runs
+ * first), then specificity (a list containing the event's campaign/mailbox before "all"), then id.
  */
-async function findActiveWorkflow(workspaceId, triggerType, event) {
+async function findActiveWorkflows(workspaceId, triggerType, event) {
   const { rows } = await db.query(
     `SELECT * FROM workflows WHERE workspace_id = $1 AND is_active = TRUE AND is_deleted = FALSE ORDER BY id`,
     [workspaceId]
   );
-  let best = null;
-  let bestRank = 0;
+  const matched = [];
   for (const workflow of rows) {
     const trigger = (workflow.graph?.nodes || []).find((n) => n.type === triggerType);
     if (!trigger) continue;
     const rank = triggerMatchRank(trigger, event);
-    if (rank > bestRank) { best = workflow; bestRank = rank; } // rows are id-ordered, so ties keep the lowest id
+    if (rank > 0) matched.push({ workflow, rank });
   }
-  return best;
+  matched.sort((x, y) => (x.workflow.priority ?? DEFAULT_PRIORITY) - (y.workflow.priority ?? DEFAULT_PRIORITY) || y.rank - x.rank || x.workflow.id - y.workflow.id);
+  return matched.map((m) => m.workflow);
 }
 
 /** 0 = no match, 1 = matches via "all", 2 = matches via an explicit list containing the event's id. */
@@ -266,7 +292,44 @@ function topologicalOrder(graph) {
 // Nodes
 // ---------------------------------------------------------------------------------------------------------------
 
+/** Nodes that produce the reply to the prospect. Only one workflow per event may run them. */
+const REPLY_NODE_TYPES = ["action.ai_agent", "action.send_reply", "action.offer_times", "action.book_meeting"];
+
+/** The workflow that already produced the reply to this event, if it is a different one from the running workflow. */
+function otherReplyOwner(ctx) {
+  const owner = ctx.shared?.replyOwner;
+  return owner && owner.workflowId !== ctx.workflow?.id ? owner : null;
+}
+
+/** Marks the running workflow as the owner of the reply once one of its reply nodes really produced something. */
+function claimReply(ctx, node, result) {
+  if (!ctx.shared || ctx.dryRun || ctx.shared.replyOwner || !ctx.workflow) return;
+  const state = ctx.state;
+  const produced =
+    (node.type === "action.ai_agent" && state.draftCreated) ||
+    (node.type === "action.send_reply" && state.sent) ||
+    (node.type === "action.offer_times" && state.meeting?.mode === "offer" && result?.status !== "skipped") ||
+    (node.type === "action.book_meeting" && state.meeting?.mode === "booked" && result?.status !== "skipped");
+  if (produced) ctx.shared.replyOwner = { workflowId: ctx.workflow.id, name: ctx.workflow.name };
+}
+
 async function executeNode(node, ctx) {
+  if (REPLY_NODE_TYPES.includes(node.type)) {
+    const owner = otherReplyOwner(ctx);
+    if (owner) {
+      const skipped = { status: "skipped", output: { reason: "reply_already_handled", detail: `Workflow "${owner.name}" already handled the reply to this message.` } };
+      // A skipped booking must not light up either of its outputs.
+      if (node.type === "action.book_meeting") skipped.branch = "__skipped__";
+      return skipped;
+    }
+    const result = await executeNodeInner(node, ctx);
+    claimReply(ctx, node, result);
+    return result;
+  }
+  return executeNodeInner(node, ctx);
+}
+
+async function executeNodeInner(node, ctx) {
   switch (node.type) {
     case "trigger.inbox_mail":
     case "trigger.plusvibe_reply":
@@ -892,4 +955,4 @@ async function sendReply(node, ctx) {
   return { output: { via: "mailbox", mailboxId, draftId: draft.id, messageId: sent.id } };
 }
 
-module.exports = { maybeRun, runWorkflow, describeTriggerTypes, NODE_TYPES, TRIGGER_TYPES, NODE_HANDLES, MEETING_NODE_TYPES };
+module.exports = { maybeRun, runWorkflow, findActiveWorkflows, describeTriggerTypes, NODE_TYPES, TRIGGER_TYPES, NODE_HANDLES, MEETING_NODE_TYPES };
