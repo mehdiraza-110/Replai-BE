@@ -25,9 +25,11 @@ const suppressionRoutes = require('./suppression.routes');
 const sesInboundRoutes = require('./ses-inbound.routes');
 const sesEventsRoutes = require('./ses-events.routes');
 const postalRoutes = require('./postal.routes');
+const workspaceRoutes = require('./workspace.routes');
 
 // User routes
 router.use('/users', userRoutes);
+router.use('/workspaces', workspaceRoutes);
 router.use('/ai-models', aiModelRoutes);
 router.use('/ai-agents', aiAgentRoutes);
 router.use('/plusvibe', plusVibeRoutes);

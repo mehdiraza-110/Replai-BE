@@ -1,12 +1,14 @@
 const userService = require('../services/user.service');
 const jwtUtil = require('../utils/jwt.util');
+const workspaceService = require('../services/workspace.service');
 const { uploadToS3, deleteFromS3 } = require('../utils/s3.util');
 
 class UserController {
   // Create a new user
   async createUser(req, res) {
     try {
-      const { first_name, last_name, email, phone, password, profile_image, is_verified, is_admin_user } = req.body;
+      // Public signup: privileged fields (is_verified, is_admin_user) are never taken from the request body.
+      const { first_name, last_name, email, phone, password, profile_image } = req.body;
       
       // Validation
       if (!email || !password) {
@@ -31,9 +33,7 @@ class UserController {
         email,
         phone,
         password,
-        profile_image,
-        is_verified,
-        is_admin_user
+        profile_image
       };
       
       const newUser = await userService.createUser(userData);
@@ -226,10 +226,13 @@ class UserController {
       const user = await userService.loginUser(email, password);
       
       // Create JWT token
+      // The user's active workspace rides in the session. null for a brand-new user, who must create one first.
+      const ctx = await workspaceService.resolveContext(user.id, null, null);
       const tokenData = {
         userId: user.id,
         email: user.email,
-        roles: user.roles
+        roles: user.roles,
+        workspaceId: ctx && ctx.workspace ? ctx.workspace.id : null
       };
       
       const token = await jwtUtil.createToken(tokenData);
@@ -246,7 +249,12 @@ class UserController {
         success: true,
         message: 'Login successful',
         data: {
-          user: user,
+          user: {
+            ...user,
+            is_super_admin: Boolean(ctx && ctx.isSuperAdmin),
+            workspaces: (ctx && ctx.memberships) || [],
+            active_workspace_id: ctx && ctx.workspace ? ctx.workspace.id : null
+          },
           token: token
         }
       });
@@ -262,8 +270,7 @@ class UserController {
       
       res.status(500).json({
         success: false,
-        message: 'Error logging in',
-        error: error.message
+        message: 'We could not sign you in right now. Please try again in a moment.'
       });
     }
   }
