@@ -2,7 +2,7 @@ const reviewService = require("../services/review.service");
 
 async function listReviews(req, res) {
   try {
-    const data = await reviewService.list(req.query);
+    const data = await reviewService.list(req.workspaceId, req.query);
 
     res.status(200).json({
       success: true,
@@ -16,7 +16,7 @@ async function listReviews(req, res) {
 
 async function countReviews(req, res) {
   try {
-    const data = await reviewService.count();
+    const data = await reviewService.count(req.workspaceId);
 
     res.status(200).json({
       success: true,

@@ -16,13 +16,13 @@ function withOptOutFooter(body) {
 }
 
 class CampaignService {
-  async listCampaigns({ page = 1, limit = 10, search = "" } = {}) {
+  async listCampaigns({ page = 1, limit = 10, search = "", workspaceId } = {}) {
     const pageNum = Math.max(1, Number.parseInt(page, 10) || 1);
     const limitNum = Math.min(Math.max(Number.parseInt(limit, 10) || 10, 1), 100);
     const offset = (pageNum - 1) * limitNum;
 
-    const conditions = ["is_deleted = FALSE"];
-    const params = [];
+    const conditions = ["is_deleted = FALSE", "workspace_id = $1"];
+    const params = [workspaceId];
 
     const searchTerm = String(search || "").trim();
     if (searchTerm) {
@@ -35,13 +35,13 @@ class CampaignService {
       db.query(
         `SELECT
            c.id, c.name, c.status, c.started_at, c.sent_today, c.sent_total, c.reply_count,
-           CASE WHEN c.mailbox_mode = 'all' THEN (SELECT COUNT(*)::int FROM mailboxes WHERE is_deleted = FALSE)
+           CASE WHEN c.mailbox_mode = 'all' THEN (SELECT COUNT(*)::int FROM mailboxes WHERE is_deleted = FALSE AND workspace_id = c.workspace_id)
                 ELSE COALESCE(array_length(c.mailbox_ids, 1), 0) END AS mailbox_count,
            CASE WHEN c.sent_total > 0 THEN ROUND((c.reply_count::numeric / c.sent_total) * 100, 1) ELSE 0 END AS reply_rate,
            CASE WHEN c.sent_total > 0 THEN ROUND((c.bounce_count::numeric / c.sent_total) * 100, 1) ELSE 0 END AS bounce_rate,
-           (SELECT COUNT(*)::int FROM campaign_leads cl WHERE cl.campaign_id = c.id) AS leads_count,
-           (SELECT COUNT(*)::int FROM campaign_leads cl WHERE cl.campaign_id = c.id AND cl.status != 'Pending') AS contacted_count,
-           (SELECT COUNT(*)::int FROM campaign_followups cf WHERE cf.campaign_id = c.id) AS followup_count
+           (SELECT COUNT(*)::int FROM campaign_leads cl WHERE cl.campaign_id = c.id AND cl.workspace_id = c.workspace_id) AS leads_count,
+           (SELECT COUNT(*)::int FROM campaign_leads cl WHERE cl.campaign_id = c.id AND cl.workspace_id = c.workspace_id AND cl.status != 'Pending') AS contacted_count,
+           (SELECT COUNT(*)::int FROM campaign_followups cf WHERE cf.campaign_id = c.id AND cf.workspace_id = c.workspace_id) AS followup_count
          FROM campaigns c
          ${whereClause}
          ORDER BY c.created_at DESC
@@ -79,6 +79,7 @@ class CampaignService {
     aiAgentId,
     humanReviewRequired,
     createdBy,
+    workspaceId,
   }) {
     const trimmedName = String(name || "").trim();
     if (!trimmedName) {
@@ -117,7 +118,7 @@ class CampaignService {
 
     // Drop anyone who has unsubscribed, complained, hard-bounced, or been manually
     // suppressed — even if they were re-uploaded in this list. See PlusVibe-Plan.md 12A.3.
-    const suppressedEmails = await suppressionService.filterSuppressed(normalizedLeads.map((lead) => lead.email));
+    const suppressedEmails = await suppressionService.filterSuppressed(normalizedLeads.map((lead) => lead.email), workspaceId);
     const suppressedCount = suppressedEmails.size;
     const sendableLeads = normalizedLeads.filter((lead) => !suppressedEmails.has(lead.email));
     if (sendableLeads.length === 0) {
@@ -132,6 +133,23 @@ class CampaignService {
       throw Object.assign(new Error("Select at least one sending mailbox"), { statusCode: 400 });
     }
 
+    // Every mailbox / AI agent a campaign references must belong to the caller's workspace.
+    if (mode === "specific") {
+      const { rows: ownedMailboxes } = await db.query(
+        `SELECT id FROM mailboxes WHERE id = ANY($1::bigint[]) AND workspace_id = $2 AND is_deleted = FALSE`,
+        [parsedMailboxIds, workspaceId]
+      );
+      if (ownedMailboxes.length !== parsedMailboxIds.length) {
+        throw Object.assign(new Error("One or more selected mailboxes were not found"), { statusCode: 404 });
+      }
+    }
+    if (aiAgentId) {
+      const { rows: ownedAgents } = await db.query(`SELECT id FROM ai_agents WHERE id = $1 AND workspace_id = $2`, [aiAgentId, workspaceId]);
+      if (!ownedAgents[0]) {
+        throw Object.assign(new Error("The selected AI agent was not found"), { statusCode: 404 });
+      }
+    }
+
     const client = await db.getClient();
     try {
       await client.query("BEGIN");
@@ -140,9 +158,9 @@ class CampaignService {
         `INSERT INTO campaigns (
            name, objective, subject, body, mailbox_mode, mailbox_ids, daily_limit_override,
            sending_days, window_start, window_end, timezone, ai_agent_id, human_review_required,
-           status, started_at, created_by, updated_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'Active',NOW(),$14,NOW())
-         RETURNING id, name, status, started_at, sent_today, sent_total, reply_count, bounce_count, mailbox_mode, mailbox_ids`,
+           status, started_at, created_by, workspace_id, updated_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'Active',NOW(),$14,$15,NOW())
+         RETURNING id, workspace_id, name, status, started_at, sent_today, sent_total, reply_count, bounce_count, mailbox_mode, mailbox_ids`,
         [
           trimmedName,
           objective || null,
@@ -158,13 +176,14 @@ class CampaignService {
           aiAgentId || null,
           humanReviewRequired !== false,
           createdBy || null,
+          workspaceId,
         ]
       );
       const campaign = rows[0];
 
       await client.query(
-        `INSERT INTO campaign_leads (campaign_id, email, full_name, first_name, last_name, company, role, phone, raw_data)
-         SELECT $1, * FROM unnest(
+        `INSERT INTO campaign_leads (campaign_id, workspace_id, email, full_name, first_name, last_name, company, role, phone, raw_data)
+         SELECT $1, $10::int, * FROM unnest(
            $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::jsonb[]
          )`,
         [
@@ -177,6 +196,7 @@ class CampaignService {
           sendableLeads.map((lead) => lead.role),
           sendableLeads.map((lead) => lead.phone),
           sendableLeads.map((lead) => JSON.stringify(lead.raw || {})),
+          campaign.workspace_id,
         ]
       );
 
@@ -185,16 +205,16 @@ class CampaignService {
         const followUp = followUpList[index];
         if (!followUp?.body || !String(followUp.body).trim()) continue;
         await client.query(
-          `INSERT INTO campaign_followups (campaign_id, step_order, delay_days, body)
-           VALUES ($1, $2, $3, $4)`,
-          [campaign.id, index + 1, Number(followUp.delayDays) > 0 ? Math.floor(Number(followUp.delayDays)) : 3, withOptOutFooter(followUp.body)]
+          `INSERT INTO campaign_followups (campaign_id, workspace_id, step_order, delay_days, body)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [campaign.id, campaign.workspace_id, index + 1, Number(followUp.delayDays) > 0 ? Math.floor(Number(followUp.delayDays)) : 3, withOptOutFooter(followUp.body)]
         );
       }
 
       await client.query("COMMIT");
 
       const mailboxCount = mode === "all"
-        ? (await db.query(`SELECT COUNT(*)::int AS count FROM mailboxes WHERE is_deleted = FALSE`)).rows[0].count
+        ? (await db.query(`SELECT COUNT(*)::int AS count FROM mailboxes WHERE is_deleted = FALSE AND workspace_id = $1`, [campaign.workspace_id])).rows[0].count
         : parsedMailboxIds.length;
       const followupCount = followUpList.filter((followUp) => followUp?.body && String(followUp.body).trim()).length;
 
@@ -228,13 +248,13 @@ class CampaignService {
     return parseLeadsFile(buffer, originalName);
   }
 
-  async listCampaignLeads(campaignId, { page = 1, limit = 20, search = "" } = {}) {
+  async listCampaignLeads(campaignId, { page = 1, limit = 20, search = "", workspaceId } = {}) {
     const pageNum = Math.max(1, Number.parseInt(page, 10) || 1);
     const limitNum = Math.min(Math.max(Number.parseInt(limit, 10) || 20, 1), 200);
     const offset = (pageNum - 1) * limitNum;
 
-    const conditions = ["campaign_id = $1"];
-    const params = [campaignId];
+    const conditions = ["campaign_id = $1", "workspace_id = $2"];
+    const params = [campaignId, workspaceId];
 
     const searchTerm = String(search || "").trim();
     if (searchTerm) {

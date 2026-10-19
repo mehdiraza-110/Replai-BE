@@ -7,6 +7,7 @@ async function listMailboxes(req, res) {
       limit: req.query.limit,
       search: req.query.search,
       domainId: req.query.domainId,
+      workspaceId: req.workspaceId,
     });
     res.status(200).json({ success: true, message: "Mailboxes fetched successfully", data });
   } catch (error) {
@@ -19,6 +20,7 @@ async function createMailboxes(req, res) {
     const data = await mailboxService.createMailboxes({
       ...req.body,
       createdBy: req.user?.id ?? null,
+      workspaceId: req.workspaceId,
     });
     res.status(200).json({ success: true, message: "Mailbox creation started", data });
   } catch (error) {
@@ -41,7 +43,7 @@ async function quoteMailboxes(req, res) {
 
 async function syncMaildoso(req, res) {
   try {
-    const data = await require("../services/maildoso.service").syncMailboxes();
+    const data = await require("../services/maildoso.service").syncMailboxes({ workspaceId: req.workspaceId });
     res.status(200).json({ success: true, message: "Maildoso mailboxes synced", data });
   } catch (error) {
     sendError(res, error, "Unable to sync Maildoso mailboxes");
@@ -50,7 +52,7 @@ async function syncMaildoso(req, res) {
 
 async function refreshMailbox(req, res) {
   try {
-    const data = await mailboxService.refreshMailbox(req.params.id);
+    const data = await mailboxService.refreshMailbox(req.params.id, req.workspaceId);
     res.status(200).json({ success: true, message: "Mailbox status refreshed", data });
   } catch (error) {
     sendError(res, error, "Unable to refresh mailbox status");
@@ -59,7 +61,7 @@ async function refreshMailbox(req, res) {
 
 async function refreshAllMailboxes(req, res) {
   try {
-    const data = await mailboxService.refreshAllMailboxes();
+    const data = await mailboxService.refreshAllMailboxes(req.workspaceId);
     res.status(200).json({ success: true, message: "Mailbox statuses refreshed", data });
   } catch (error) {
     sendError(res, error, "Unable to refresh mailbox statuses");
@@ -68,7 +70,7 @@ async function refreshAllMailboxes(req, res) {
 
 async function deleteMailbox(req, res) {
   try {
-    const data = await mailboxService.deleteMailbox(req.params.id);
+    const data = await mailboxService.deleteMailbox(req.params.id, req.workspaceId);
     res.status(200).json({ success: true, message: "Mailbox deleted successfully", data });
   } catch (error) {
     sendError(res, error, "Unable to delete mailbox");
@@ -80,6 +82,7 @@ async function listMailboxMessages(req, res) {
     const data = await mailboxService.listMailboxMessages(req.params.id, {
       page: req.query.page,
       limit: req.query.limit,
+      workspaceId: req.workspaceId,
     });
     res.status(200).json({ success: true, message: "Messages fetched successfully", data });
   } catch (error) {

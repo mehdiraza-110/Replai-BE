@@ -32,14 +32,16 @@ class SesBounceComplaintService {
     const recipients = event.bounce?.bouncedRecipients || [];
     const isHard = event.bounce?.bounceType === "Permanent";
     const campaignId = extractCampaignId(event);
+    const workspaceId = await resolveWorkspaceId({ campaignId, senderAddresses: [event.mail?.source, ...(event.mail?.commonHeaders?.from || [])] });
+    if (!workspaceId) return unresolved("Bounce", event);
 
     for (const recipient of recipients) {
       const email = recipient.emailAddress?.toLowerCase();
       if (!email) continue;
 
       if (isHard) {
-        await suppressionService.addSuppression({ email, reason: "hard_bounce", source: "ses_bounce", campaignId });
-        await db.query(`UPDATE campaign_leads SET status = 'Bounced' WHERE email = $1 AND campaign_id = $2 AND status != 'Bounced'`, [email, campaignId]).catch(() => {});
+        await suppressionService.addSuppression({ email, reason: "hard_bounce", source: "ses_bounce", campaignId, workspaceId });
+        await db.query(`UPDATE campaign_leads SET status = 'Bounced' WHERE email = $1 AND campaign_id = $2 AND workspace_id = $3 AND status != 'Bounced'`, [email, campaignId, workspaceId]).catch(() => {});
       }
 
       await eventLogService.record({
@@ -47,6 +49,7 @@ class SesBounceComplaintService {
         source: "ses",
         status: isHard ? "Success" : "Skipped",
         campaignId,
+        appWorkspaceId: workspaceId,
         leadEmail: email,
         messageId: event.mail?.messageId,
         metadata: { bounceType: event.bounce?.bounceType, bounceSubType: event.bounce?.bounceSubType, diagnosticCode: recipient.diagnosticCode },
@@ -60,18 +63,21 @@ class SesBounceComplaintService {
   async handleComplaint(event) {
     const recipients = event.complaint?.complainedRecipients || [];
     const campaignId = extractCampaignId(event);
+    const workspaceId = await resolveWorkspaceId({ campaignId, senderAddresses: [event.mail?.source, ...(event.mail?.commonHeaders?.from || [])] });
+    if (!workspaceId) return unresolved("Complaint", event);
 
     for (const recipient of recipients) {
       const email = recipient.emailAddress?.toLowerCase();
       if (!email) continue;
 
-      await suppressionService.addSuppression({ email, reason: "complained", source: "ses_complaint", campaignId });
+      await suppressionService.addSuppression({ email, reason: "complained", source: "ses_complaint", campaignId, workspaceId });
 
       await eventLogService.record({
         eventType: "ses.complaint",
         source: "ses",
         status: "Success",
         campaignId,
+        appWorkspaceId: workspaceId,
         leadEmail: email,
         messageId: event.mail?.messageId,
         metadata: { complaintFeedbackType: event.complaint?.complaintFeedbackType },
@@ -80,6 +86,52 @@ class SesBounceComplaintService {
 
     return { status: "Processed", eventType: "Complaint", recipientCount: recipients.length, suppressed: true };
   }
+}
+
+function unresolved(eventType, event) {
+  console.warn(`SES ${eventType} event ignored (message ${event.mail?.messageId || "unknown"}): could not resolve it to exactly one workspace from its campaign tag or sender.`);
+  return { status: "Ignored", reason: "Event could not be resolved to a workspace", eventType };
+}
+
+/**
+ * Resolves the single workspace an event belongs to: the campaign (from the id we tagged on the
+ * message) first, then the sending mailbox / domain. Returns null when nothing resolves, or when
+ * the sources resolve to different workspaces — callers must then not write anything.
+ */
+async function resolveWorkspaceId({ campaignId, senderAddresses = [] }) {
+  const found = new Set();
+
+  if (campaignId) {
+    const { rows } = await db.query(`SELECT workspace_id FROM campaigns WHERE id = $1`, [campaignId]);
+    if (rows.length === 1 && rows[0].workspace_id) found.add(rows[0].workspace_id);
+  }
+
+  if (found.size === 0) {
+    for (const raw of senderAddresses) {
+      const address = String(raw || "").toLowerCase().trim().replace(/^.*<|>.*$/g, "");
+      if (!address.includes("@")) continue;
+
+      const { rows: mailboxRows } = await db.query(
+        `SELECT workspace_id FROM mailboxes WHERE email = $1 AND is_deleted = FALSE LIMIT 2`,
+        [address]
+      );
+      if (mailboxRows.length === 1 && mailboxRows[0].workspace_id) {
+        found.add(mailboxRows[0].workspace_id);
+        break;
+      }
+
+      const { rows: domainRows } = await db.query(
+        `SELECT workspace_id FROM domains WHERE domain = $1 AND is_deleted = FALSE LIMIT 2`,
+        [address.split("@").pop()]
+      );
+      if (domainRows.length === 1 && domainRows[0].workspace_id) {
+        found.add(domainRows[0].workspace_id);
+        break;
+      }
+    }
+  }
+
+  return found.size === 1 ? [...found][0] : null;
 }
 
 /** campaign_leads.campaign_id (and therefore this) is scoped from the message tags we set at send time. */

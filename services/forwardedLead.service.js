@@ -5,7 +5,7 @@ const db = require("../config/db.config");
 const FORWARDED_LEAD_EVENT_TYPES = ["ghl.conversation.synced", "ghl.conversation.sync_failed"];
 
 class ForwardedLeadService {
-  async list(query = {}) {
+  async list(workspaceId, query = {}) {
     const page = Math.max(1, Number.parseInt(query.page, 10) || 1);
     const limit = Math.min(Math.max(Number.parseInt(query.limit, 10) || 10, 1), 50);
     const offset = (page - 1) * limit;
@@ -14,12 +14,12 @@ class ForwardedLeadService {
       db.query(
         `SELECT *
          FROM event_logs
-         WHERE event_type = ANY($1)
+         WHERE event_type = ANY($1) AND app_workspace_id = $2
          ORDER BY created_at DESC
-         LIMIT $2 OFFSET $3`,
-        [FORWARDED_LEAD_EVENT_TYPES, limit, offset]
+         LIMIT $3 OFFSET $4`,
+        [FORWARDED_LEAD_EVENT_TYPES, workspaceId, limit, offset]
       ),
-      db.query(`SELECT COUNT(*)::int AS count FROM event_logs WHERE event_type = ANY($1)`, [FORWARDED_LEAD_EVENT_TYPES]),
+      db.query(`SELECT COUNT(*)::int AS count FROM event_logs WHERE event_type = ANY($1) AND app_workspace_id = $2`, [FORWARDED_LEAD_EVENT_TYPES, workspaceId]),
     ]);
 
     const count = total.rows[0]?.count || 0;

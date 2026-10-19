@@ -2,7 +2,7 @@ const analyticsService = require("../services/analytics.service");
 
 async function getOverview(req, res) {
   try {
-    const data = await analyticsService.getOverview(req.query);
+    const data = await analyticsService.getOverview(req.workspaceId, req.query);
 
     res.status(200).json({
       success: true,

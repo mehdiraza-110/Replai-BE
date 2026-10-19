@@ -10,13 +10,13 @@ const { sendRawEmail } = require("./mailTransport.service");
  * IMAP/SMTP mailbox.
  */
 class InboxService {
-  async listThreads({ page = 1, limit = 25, search = "", mailboxId = null, unreadOnly = false } = {}) {
+  async listThreads({ page = 1, limit = 25, search = "", mailboxId = null, unreadOnly = false, workspaceId } = {}) {
     const pageNum = Math.max(1, Number.parseInt(page, 10) || 1);
     const limitNum = Math.min(Math.max(Number.parseInt(limit, 10) || 25, 1), 100);
     const offset = (pageNum - 1) * limitNum;
 
     const conditions = [];
-    const params = [];
+    const params = [workspaceId]; // $1 is always the workspace (used inside baseQuery too)
 
     if (mailboxId) {
       params.push(Number(mailboxId));
@@ -39,8 +39,9 @@ class InboxService {
         mb.email AS mailbox_email, mb.display_name AS mailbox_display_name,
         c.name AS campaign_name
       FROM messages m
-      JOIN mailboxes mb ON mb.id = m.mailbox_id
-      LEFT JOIN campaigns c ON c.id = m.campaign_id
+      JOIN mailboxes mb ON mb.id = m.mailbox_id AND mb.workspace_id = m.workspace_id
+      LEFT JOIN campaigns c ON c.id = m.campaign_id AND c.workspace_id = m.workspace_id
+      WHERE m.workspace_id = $1
       ORDER BY m.mailbox_id, m.thread_id, m.created_at DESC
     `;
 
@@ -48,7 +49,7 @@ class InboxService {
       db.query(
         `SELECT latest.*, (
            SELECT COUNT(*)::int FROM messages um
-           WHERE um.mailbox_id = latest.mailbox_id AND um.thread_id = latest.thread_id
+           WHERE um.workspace_id = $1 AND um.mailbox_id = latest.mailbox_id AND um.thread_id = latest.thread_id
              AND um.direction = 'inbound' AND um.is_read = FALSE
          ) AS unread_count
          FROM (${baseQuery}) latest
@@ -60,7 +61,8 @@ class InboxService {
       db.query(`SELECT COUNT(*)::int AS count FROM (${baseQuery}) latest ${whereClause}`, params),
       db.query(
         `SELECT COUNT(DISTINCT (mailbox_id, thread_id))::int AS count FROM messages
-         WHERE direction = 'inbound' AND is_read = FALSE`
+         WHERE workspace_id = $1 AND direction = 'inbound' AND is_read = FALSE`,
+        [workspaceId]
       ),
     ]);
 
@@ -75,12 +77,12 @@ class InboxService {
     };
   }
 
-  async getThread(mailboxId, threadId) {
+  async getThread(mailboxId, threadId, workspaceId) {
     const { rows: mailboxRows } = await db.query(
       `SELECT m.*, d.status AS domain_status, d.configuration_set_name
-       FROM mailboxes m JOIN domains d ON d.id = m.domain_id
-       WHERE m.id = $1 AND m.is_deleted = FALSE`,
-      [mailboxId]
+       FROM mailboxes m JOIN domains d ON d.id = m.domain_id AND d.workspace_id = m.workspace_id
+       WHERE m.id = $1 AND m.is_deleted = FALSE AND m.workspace_id = $2`,
+      [mailboxId, workspaceId]
     );
     const mailbox = mailboxRows[0];
     if (!mailbox) {
@@ -88,8 +90,8 @@ class InboxService {
     }
 
     const { rows: messageRows } = await db.query(
-      `SELECT * FROM messages WHERE mailbox_id = $1 AND thread_id = $2 ORDER BY created_at ASC`,
-      [mailboxId, threadId]
+      `SELECT * FROM messages WHERE mailbox_id = $1 AND thread_id = $2 AND workspace_id = $3 ORDER BY created_at ASC`,
+      [mailboxId, threadId, workspaceId]
     );
     if (messageRows.length === 0) {
       throw Object.assign(new Error("Thread not found"), { statusCode: 404 });
@@ -98,15 +100,15 @@ class InboxService {
     let leadName = null;
     const campaignLeadId = [...messageRows].reverse().find((row) => row.campaign_lead_id)?.campaign_lead_id;
     if (campaignLeadId) {
-      const { rows: leadRows } = await db.query(`SELECT full_name FROM campaign_leads WHERE id = $1`, [campaignLeadId]);
+      const { rows: leadRows } = await db.query(`SELECT full_name FROM campaign_leads WHERE id = $1 AND workspace_id = $2`, [campaignLeadId, workspaceId]);
       leadName = leadRows[0]?.full_name || null;
     }
 
     const { rows: draftRows } = await db.query(
       `SELECT * FROM ai_response_drafts
-       WHERE source = 'native' AND mailbox_id = $1 AND thread_id = $2 AND status = 'Pending' AND is_deleted = FALSE
+       WHERE source = 'native' AND mailbox_id = $1 AND thread_id = $2 AND status = 'Pending' AND is_deleted = FALSE AND workspace_id = $3
        ORDER BY created_at DESC LIMIT 1`,
-      [mailboxId, threadId]
+      [mailboxId, threadId, workspaceId]
     );
 
     return {
@@ -121,10 +123,10 @@ class InboxService {
     };
   }
 
-  async markThreadRead(mailboxId, threadId) {
+  async markThreadRead(mailboxId, threadId, workspaceId) {
     await db.query(
-      `UPDATE messages SET is_read = TRUE WHERE mailbox_id = $1 AND thread_id = $2 AND direction = 'inbound' AND is_read = FALSE`,
-      [mailboxId, threadId]
+      `UPDATE messages SET is_read = TRUE WHERE mailbox_id = $1 AND thread_id = $2 AND direction = 'inbound' AND is_read = FALSE AND workspace_id = $3`,
+      [mailboxId, threadId, workspaceId]
     );
     return { status: "Ok" };
   }
@@ -134,7 +136,9 @@ class InboxService {
    * thread (never a central address, per PlusVibe-Plan.md section 7's requirement) and
    * records it the same way a campaign send does, so it shows up in the thread immediately.
    */
-  async sendReply(mailboxId, threadId, { body }) {
+  // workspaceId is optional only for internal callers that already hold a trusted draft/mailbox (nativeAgentReply.service.js);
+  // every HTTP caller must pass it.
+  async sendReply(mailboxId, threadId, { body }, workspaceId = null) {
     const trimmedBody = String(body || "").trim();
     if (!trimmedBody) {
       throw Object.assign(new Error("Reply body is required"), { statusCode: 400 });
@@ -142,9 +146,9 @@ class InboxService {
 
     const { rows: mailboxRows } = await db.query(
       `SELECT m.*, d.status AS domain_status, d.configuration_set_name
-       FROM mailboxes m JOIN domains d ON d.id = m.domain_id
-       WHERE m.id = $1 AND m.is_deleted = FALSE`,
-      [mailboxId]
+       FROM mailboxes m JOIN domains d ON d.id = m.domain_id AND d.workspace_id = m.workspace_id
+       WHERE m.id = $1 AND m.is_deleted = FALSE AND ($2::int IS NULL OR m.workspace_id = $2)`,
+      [mailboxId, workspaceId]
     );
     const mailbox = mailboxRows[0];
     if (!mailbox) {
@@ -155,8 +159,8 @@ class InboxService {
     }
 
     const { rows: threadRows } = await db.query(
-      `SELECT * FROM messages WHERE mailbox_id = $1 AND thread_id = $2 ORDER BY created_at DESC LIMIT 1`,
-      [mailboxId, threadId]
+      `SELECT * FROM messages WHERE mailbox_id = $1 AND thread_id = $2 AND workspace_id = $3 ORDER BY created_at DESC LIMIT 1`,
+      [mailboxId, threadId, mailbox.workspace_id]
     );
     const latest = threadRows[0];
     if (!latest) {
@@ -164,7 +168,7 @@ class InboxService {
     }
 
     const leadEmail = latest.direction === "inbound" ? latest.from_address : latest.to_address;
-    if (await suppressionService.isSuppressed(leadEmail)) {
+    if (await suppressionService.isSuppressed(leadEmail, mailbox.workspace_id)) {
       throw Object.assign(new Error("This recipient has unsubscribed and cannot be emailed"), { statusCode: 409 });
     }
 
@@ -191,10 +195,10 @@ class InboxService {
     });
 
     const { rows: inserted } = await db.query(
-      `INSERT INTO messages (mailbox_id, direction, campaign_id, campaign_lead_id, thread_id, message_id, in_reply_to, from_address, to_address, subject, body_text)
-       VALUES ($1, 'outbound', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      `INSERT INTO messages (mailbox_id, direction, campaign_id, campaign_lead_id, thread_id, message_id, in_reply_to, from_address, to_address, subject, body_text, workspace_id)
+       VALUES ($1, 'outbound', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
-      [mailboxId, latest.campaign_id, latest.campaign_lead_id, threadIdFor(mailboxId, leadEmail), messageId, latest.message_id, mailbox.email, leadEmail, subject, trimmedBody]
+      [mailboxId, latest.campaign_id, latest.campaign_lead_id, threadIdFor(mailboxId, leadEmail), messageId, latest.message_id, mailbox.email, leadEmail, subject, trimmedBody, mailbox.workspace_id]
     );
 
     return mapMessageRow(inserted[0]);

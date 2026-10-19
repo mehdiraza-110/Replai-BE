@@ -41,7 +41,7 @@ class KnowledgeService {
     `);
   }
 
-  async list(query = {}) {
+  async list(workspaceId, query = {}) {
     await this.ensureSchema();
 
     const page = Math.max(1, Number.parseInt(query.page, 10) || 1);
@@ -50,8 +50,8 @@ class KnowledgeService {
     const search = cleanString(query.search);
     const status = normalizeStatus(query.status, { allowEmpty: true });
     const category = cleanString(query.category);
-    const values = [];
-    const filters = ["ks.is_deleted = FALSE"];
+    const values = [workspaceId];
+    const filters = ["ks.is_deleted = FALSE", "ks.workspace_id = $1"];
 
     if (search) {
       values.push(`%${search}%`);
@@ -81,7 +81,7 @@ class KnowledgeService {
                 ) AS agents
          FROM knowledge_sources ks
          LEFT JOIN ai_agent_knowledge_sources aks ON aks.knowledge_source_id = ks.id
-         LEFT JOIN ai_agents a ON a.id = aks.ai_agent_id AND a.is_deleted = FALSE
+         LEFT JOIN ai_agents a ON a.id = aks.ai_agent_id AND a.is_deleted = FALSE AND a.workspace_id = ks.workspace_id
          WHERE ${where}
          GROUP BY ks.id
          ORDER BY ks.updated_at DESC
@@ -100,16 +100,18 @@ class KnowledgeService {
     };
   }
 
-  async create(payload = {}, file, userId = null) {
+  async create(workspaceId, payload = {}, file, userId = null) {
     await this.ensureSchema();
 
     const startedAt = Date.now();
+    const agentIds = normalizeIds(payload.agentIds || payload.agent_ids);
+    await this.assertAgentsInWorkspace(workspaceId, agentIds);
+
     const extractedText = file ? await extractTextFromFile(file) : null;
     const filePath = file ? saveFileToDisk(file) : null;
     const sourceType = normalizeSourceType(payload.sourceType || payload.source_type || (file ? "Document" : "Text"));
     const contentText = cleanString(payload.contentText || payload.content_text) || extractedText;
     const chunksCount = chunkKnowledgeText(contentText).length;
-    const agentIds = normalizeIds(payload.agentIds || payload.agent_ids);
     const title = cleanString(payload.title) || file?.originalname;
 
     if (!title) {
@@ -134,9 +136,10 @@ class KnowledgeService {
         file_storage_path,
         chunks_count,
         last_indexed_at,
-        created_by
+        created_by,
+        workspace_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CASE WHEN $13 > 0 THEN NOW() ELSE NULL END, $14)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CASE WHEN $13 > 0 THEN NOW() ELSE NULL END, $14, $15)
       RETURNING *`,
       [
         title,
@@ -153,18 +156,20 @@ class KnowledgeService {
         filePath,
         chunksCount,
         userId,
+        workspaceId,
       ]
     );
 
-    await this.setSourceAgents(result.rows[0].id, agentIds);
+    await this.setSourceAgents(workspaceId, result.rows[0].id, agentIds);
 
-    const source = await this.getById(result.rows[0].id);
+    const source = await this.getById(workspaceId, result.rows[0].id);
     await eventLogService.record({
       eventType: "knowledge_source.created",
       source: "knowledge",
       status: "Success",
       durationMs: Date.now() - startedAt,
       createdBy: userId,
+      appWorkspaceId: workspaceId,
       metadata: {
         title: source.title,
         sourceType,
@@ -178,16 +183,16 @@ class KnowledgeService {
     return source;
   }
 
-  async delete(sourceId) {
+  async delete(workspaceId, sourceId) {
     await this.ensureSchema();
 
     const result = await db.query(
       `UPDATE knowledge_sources
        SET is_deleted = TRUE,
            updated_at = NOW()
-       WHERE id = $1 AND is_deleted = FALSE
+       WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE
        RETURNING id, title`,
-      [sourceId]
+      [sourceId, workspaceId]
     );
 
     if (result.rows.length === 0) {
@@ -200,49 +205,55 @@ class KnowledgeService {
       eventType: "knowledge_source.deleted",
       source: "knowledge",
       status: "Success",
+      appWorkspaceId: workspaceId,
       metadata: { id: result.rows[0].id, title: result.rows[0].title },
     });
 
     return { id: result.rows[0].id };
   }
 
-  async setAgentSources(agentId, sourceIds = []) {
+  async setAgentSources(workspaceId, agentId, sourceIds = []) {
     await this.ensureSchema();
 
-    await db.query("DELETE FROM ai_agent_knowledge_sources WHERE ai_agent_id = $1", [agentId]);
-
     const ids = normalizeIds(sourceIds);
+
+    // Both ends of every link must belong to the caller's workspace.
+    await this.assertAgentsInWorkspace(workspaceId, [agentId]);
+    await this.assertSourcesInWorkspace(workspaceId, ids);
+
+    await db.query("DELETE FROM ai_agent_knowledge_sources WHERE ai_agent_id = $1 AND workspace_id = $2", [agentId, workspaceId]);
+
     if (ids.length === 0) return;
 
     const values = [];
     const placeholders = ids.map((sourceId, index) => {
-      values.push(agentId, sourceId);
-      const offset = index * 2;
-      return `($${offset + 1}, $${offset + 2})`;
+      values.push(agentId, sourceId, workspaceId);
+      const offset = index * 3;
+      return `($${offset + 1}, $${offset + 2}, $${offset + 3})`;
     });
 
     await db.query(
-      `INSERT INTO ai_agent_knowledge_sources (ai_agent_id, knowledge_source_id)
+      `INSERT INTO ai_agent_knowledge_sources (ai_agent_id, knowledge_source_id, workspace_id)
        VALUES ${placeholders.join(", ")}
        ON CONFLICT DO NOTHING`,
       values
     );
   }
 
-  async getAgentSourceIds(agentId) {
+  async getAgentSourceIds(workspaceId, agentId) {
     await this.ensureSchema();
 
     const result = await db.query(
       `SELECT knowledge_source_id
        FROM ai_agent_knowledge_sources
-       WHERE ai_agent_id = $1`,
-      [agentId]
+       WHERE ai_agent_id = $1 AND workspace_id = $2`,
+      [agentId, workspaceId]
     );
 
     return result.rows.map((row) => row.knowledge_source_id);
   }
 
-  async getAgentKnowledgeContext(agentId) {
+  async getAgentKnowledgeContext(workspaceId, agentId) {
     await this.ensureSchema();
     if (!agentId) return [];
 
@@ -251,11 +262,13 @@ class KnowledgeService {
        FROM ai_agent_knowledge_sources aks
        JOIN knowledge_sources ks ON ks.id = aks.knowledge_source_id
        WHERE aks.ai_agent_id = $1
+         AND aks.workspace_id = $2
+         AND ks.workspace_id = $2
          AND ks.is_deleted = FALSE
          AND ks.status = 'Published'
        ORDER BY ks.updated_at DESC
        LIMIT 12`,
-      [agentId]
+      [agentId, workspaceId]
     );
 
     return result.rows.map((row) => ({
@@ -266,7 +279,7 @@ class KnowledgeService {
     }));
   }
 
-  async getById(sourceId) {
+  async getById(workspaceId, sourceId) {
     const result = await db.query(
       `SELECT ks.*,
               COALESCE(
@@ -278,33 +291,70 @@ class KnowledgeService {
               ) AS agents
        FROM knowledge_sources ks
        LEFT JOIN ai_agent_knowledge_sources aks ON aks.knowledge_source_id = ks.id
-       LEFT JOIN ai_agents a ON a.id = aks.ai_agent_id AND a.is_deleted = FALSE
-       WHERE ks.id = $1 AND ks.is_deleted = FALSE
+       LEFT JOIN ai_agents a ON a.id = aks.ai_agent_id AND a.is_deleted = FALSE AND a.workspace_id = ks.workspace_id
+       WHERE ks.id = $1 AND ks.workspace_id = $2 AND ks.is_deleted = FALSE
        GROUP BY ks.id`,
-      [sourceId]
+      [sourceId, workspaceId]
     );
 
     return result.rows[0] ? mapKnowledgeRow(result.rows[0]) : null;
   }
 
-  async setSourceAgents(sourceId, agentIds = []) {
+  async setSourceAgents(workspaceId, sourceId, agentIds = []) {
     const ids = normalizeIds(agentIds);
 
     if (ids.length === 0) return;
 
+    await this.assertAgentsInWorkspace(workspaceId, ids);
+    await this.assertSourcesInWorkspace(workspaceId, [sourceId]);
+
     const values = [];
     const placeholders = ids.map((agentId, index) => {
-      values.push(agentId, sourceId);
-      const offset = index * 2;
-      return `($${offset + 1}, $${offset + 2})`;
+      values.push(agentId, sourceId, workspaceId);
+      const offset = index * 3;
+      return `($${offset + 1}, $${offset + 2}, $${offset + 3})`;
     });
 
     await db.query(
-      `INSERT INTO ai_agent_knowledge_sources (ai_agent_id, knowledge_source_id)
+      `INSERT INTO ai_agent_knowledge_sources (ai_agent_id, knowledge_source_id, workspace_id)
        VALUES ${placeholders.join(", ")}
        ON CONFLICT DO NOTHING`,
       values
     );
+  }
+
+  // Throws a clear 400 unless every agent id exists in this workspace (soft-deleted agents still count as
+  // "in the workspace" so re-saving an existing link never fails).
+  async assertAgentsInWorkspace(workspaceId, agentIds = []) {
+    const ids = normalizeIds(agentIds);
+    if (ids.length === 0) return;
+
+    const result = await db.query(
+      `SELECT id FROM ai_agents WHERE id = ANY($1::int[]) AND workspace_id = $2`,
+      [ids, workspaceId]
+    );
+
+    if (result.rows.length !== ids.length) {
+      const error = new Error("One or more selected AI agents were not found in this workspace.");
+      error.statusCode = 400;
+      throw error;
+    }
+  }
+
+  async assertSourcesInWorkspace(workspaceId, sourceIds = []) {
+    const ids = normalizeIds(sourceIds);
+    if (ids.length === 0) return;
+
+    const result = await db.query(
+      `SELECT id FROM knowledge_sources WHERE id = ANY($1::int[]) AND workspace_id = $2`,
+      [ids, workspaceId]
+    );
+
+    if (result.rows.length !== ids.length) {
+      const error = new Error("One or more selected knowledge sources were not found in this workspace.");
+      error.statusCode = 400;
+      throw error;
+    }
   }
 }
 

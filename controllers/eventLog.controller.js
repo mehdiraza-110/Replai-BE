@@ -2,7 +2,7 @@ const eventLogService = require("../services/eventLog.service");
 
 async function listEventLogs(req, res) {
   try {
-    const data = await eventLogService.list(req.query);
+    const data = await eventLogService.list(req.workspaceId, req.query);
 
     res.status(200).json({
       success: true,

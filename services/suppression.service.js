@@ -21,27 +21,58 @@ class SuppressionService {
     return isOptOutText(text);
   }
 
-  async addSuppression({ email, reason, source, campaignId = null }) {
+  /**
+   * Workspace for a suppression the caller didn't name: the campaign it refers to, else the
+   * workspace of the most recent lead with that address. Returns null when neither exists.
+   */
+  async resolveWorkspaceId({ email, campaignId = null }) {
+    if (campaignId) {
+      const { rows } = await db.query(`SELECT workspace_id FROM campaigns WHERE id = $1`, [campaignId]);
+      if (rows[0]) return rows[0].workspace_id;
+    }
+    const { rows } = await db.query(
+      `SELECT workspace_id FROM campaign_leads WHERE email = $1 ORDER BY id DESC LIMIT 1`,
+      [email]
+    );
+    return rows[0]?.workspace_id ?? null;
+  }
+
+  /**
+   * Adds (or refreshes) a suppression for one workspace (unique per workspace + email, so another workspace's
+   * opt-out for the same address is independent). Callers without a workspaceId get it derived from
+   * campaignId / the lead.
+   */
+  async addSuppression({ email, reason, source, campaignId = null, workspaceId = null }) {
     const normalized = normalizeEmail(email);
     if (!normalized) return null;
 
+    const resolvedWorkspaceId = workspaceId || (await this.resolveWorkspaceId({ email: normalized, campaignId }));
+    if (!resolvedWorkspaceId) {
+      console.warn(`Suppression for ${normalized} (${reason}) not recorded: could not determine its workspace`);
+      return null;
+    }
+
     const { rows } = await db.query(
-      `INSERT INTO suppressions (email, reason, source, campaign_id)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (email) DO UPDATE SET
+      `INSERT INTO suppressions (email, reason, source, campaign_id, workspace_id)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (workspace_id, email) DO UPDATE SET
          reason = EXCLUDED.reason,
          source = EXCLUDED.source,
          campaign_id = COALESCE(EXCLUDED.campaign_id, suppressions.campaign_id)
        RETURNING id, email, reason, source, campaign_id, created_at`,
-      [normalized, reason, source, campaignId]
+      [normalized, reason, source, campaignId, resolvedWorkspaceId]
     );
     return mapSuppressionRow(rows[0]);
   }
 
-  async isSuppressed(email) {
+  // workspaceId omitted = check every workspace (conservative: used by callers that have no tenant context).
+  async isSuppressed(email, workspaceId = null) {
     const normalized = normalizeEmail(email);
     if (!normalized) return false;
-    const { rows } = await db.query(`SELECT 1 FROM suppressions WHERE email = $1 LIMIT 1`, [normalized]);
+    const { rows } = await db.query(
+      `SELECT 1 FROM suppressions WHERE email = $1 AND ($2::int IS NULL OR workspace_id = $2) LIMIT 1`,
+      [normalized, workspaceId]
+    );
     return rows.length > 0;
   }
 
@@ -49,20 +80,23 @@ class SuppressionService {
    * Given a list of emails, returns the subset that are currently suppressed
    * (normalized, lowercased). Used to filter lead lists at import and send time.
    */
-  async filterSuppressed(emails) {
+  async filterSuppressed(emails, workspaceId = null) {
     const normalized = Array.from(new Set((Array.isArray(emails) ? emails : []).map(normalizeEmail).filter(Boolean)));
     if (normalized.length === 0) return new Set();
-    const { rows } = await db.query(`SELECT email FROM suppressions WHERE email = ANY($1::text[])`, [normalized]);
+    const { rows } = await db.query(
+      `SELECT email FROM suppressions WHERE email = ANY($1::text[]) AND ($2::int IS NULL OR workspace_id = $2)`,
+      [normalized, workspaceId]
+    );
     return new Set(rows.map((row) => row.email));
   }
 
-  async listSuppressions({ page = 1, limit = 50, search = "" } = {}) {
+  async listSuppressions({ page = 1, limit = 50, search = "", workspaceId } = {}) {
     const pageNum = Math.max(1, Number.parseInt(page, 10) || 1);
     const limitNum = Math.min(Math.max(Number.parseInt(limit, 10) || 50, 1), 200);
     const offset = (pageNum - 1) * limitNum;
 
-    const conditions = [];
-    const params = [];
+    const conditions = ["workspace_id = $1"];
+    const params = [workspaceId];
     const searchTerm = String(search || "").trim();
     if (searchTerm) {
       params.push(`%${searchTerm}%`);
@@ -159,7 +193,19 @@ class SuppressionService {
 
   async unsubscribeByToken(token) {
     const { email, campaignId } = this.verifyUnsubscribeToken(token);
-    return this.addSuppression({ email, reason: "unsubscribed", source: "link_click", campaignId });
+    // The workspace comes from the campaign (or lead) the token refers to; the token itself carries no workspace.
+    const workspaceId = await this.resolveWorkspaceId({ email: email.trim().toLowerCase(), campaignId });
+    const suppression = await this.addSuppression({ email, reason: "unsubscribed", source: "link_click", campaignId, workspaceId });
+    if (!suppression && workspaceId) {
+      // The global suppression row for this address belongs to another workspace, so it can't hold this opt-out.
+      // Stop this workspace's own sends to the address instead.
+      await db.query(
+        `UPDATE campaign_leads SET status = 'Suppressed' WHERE email = $1 AND workspace_id = $2 AND status IN ('Pending', 'Sent')`,
+        [email.trim().toLowerCase(), workspaceId]
+      );
+      return { email: email.trim().toLowerCase() };
+    }
+    return suppression;
   }
 }
 

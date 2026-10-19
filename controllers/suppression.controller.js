@@ -6,6 +6,7 @@ async function listSuppressions(req, res) {
       page: req.query.page,
       limit: req.query.limit,
       search: req.query.search,
+      workspaceId: req.workspaceId,
     });
     res.status(200).json({ success: true, message: "Suppressions fetched successfully", data });
   } catch (error) {
@@ -19,7 +20,15 @@ async function createManualSuppression(req, res) {
     if (!email || !String(email).trim()) {
       return res.status(400).json({ success: false, message: "email is required", code: "EMAIL_REQUIRED", data: null });
     }
-    const data = await suppressionService.addSuppression({ email, reason: "manual", source: "manual" });
+    const data = await suppressionService.addSuppression({ email, reason: "manual", source: "manual", workspaceId: req.workspaceId });
+    if (!data) {
+      return res.status(409).json({
+        success: false,
+        message: "This address can't be added to your suppression list right now. Please contact support if this keeps happening.",
+        code: "SUPPRESSION_CONFLICT",
+        data: null,
+      });
+    }
     res.status(200).json({ success: true, message: "Address suppressed", data });
   } catch (error) {
     sendError(res, error, "Unable to add suppression");

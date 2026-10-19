@@ -1,6 +1,8 @@
 const db = require("../config/db.config");
 
 class LeadProfileService {
+  // `workspaceId` on a profile is the PLUSVIBE workspace id (plusvibe_lead_profiles.workspace_id);
+  // `appWorkspaceId` is the app tenant and is stored on the row explicitly.
   async upsert(profile = {}) {
     const leadEmail = cleanString(profile.leadEmail || profile.lead_email);
     if (!leadEmail) return null;
@@ -14,9 +16,10 @@ class LeadProfileService {
         role_title,
         last_thread_id,
         last_campaign_id,
-        last_seen_at
+        last_seen_at,
+        app_workspace_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::timestamp, NOW()))
+      VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::timestamp, NOW()), $9)
       ON CONFLICT (workspace_id, lead_email)
       DO UPDATE SET
         lead_name = COALESCE(EXCLUDED.lead_name, plusvibe_lead_profiles.lead_name),
@@ -36,13 +39,15 @@ class LeadProfileService {
         cleanString(profile.threadId || profile.thread_id),
         cleanString(profile.campaignId || profile.campaign_id),
         cleanString(profile.lastSeenAt || profile.last_seen_at),
+        profile.appWorkspaceId,
       ]
     );
 
     return mapProfile(result.rows[0]);
   }
 
-  async getByEmails(workspaceId, emails = []) {
+  // workspaceId = PlusVibe workspace id, appWorkspaceId = app tenant.
+  async getByEmails(workspaceId, emails = [], appWorkspaceId) {
     const values = [...new Set(emails.map(cleanString).filter(Boolean))];
     if (values.length === 0) return new Map();
 
@@ -50,8 +55,9 @@ class LeadProfileService {
       `SELECT *
        FROM plusvibe_lead_profiles
        WHERE workspace_id = $1
+         AND app_workspace_id = $3
          AND lead_email = ANY($2::varchar[])`,
-      [cleanString(workspaceId), values]
+      [cleanString(workspaceId), values, appWorkspaceId]
     );
 
     return new Map(result.rows.map((row) => [row.lead_email, mapProfile(row)]));

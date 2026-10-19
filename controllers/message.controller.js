@@ -2,7 +2,7 @@ const messageService = require("../services/message.service");
 
 async function listConversations(req, res) {
   try {
-    const data = await messageService.listConversations(req.query);
+    const data = await messageService.listConversations(req.workspaceId, req.query);
 
     res.status(200).json({
       success: true,
@@ -16,7 +16,7 @@ async function listConversations(req, res) {
 
 async function getConversation(req, res) {
   try {
-    const data = await messageService.getConversation(req.params.threadId);
+    const data = await messageService.getConversation(req.workspaceId, req.params.threadId);
 
     res.status(200).json({
       success: true,
@@ -30,7 +30,7 @@ async function getConversation(req, res) {
 
 async function sendManualReply(req, res) {
   try {
-    const data = await messageService.sendManualReply(req.params.threadId, req.body);
+    const data = await messageService.sendManualReply(req.workspaceId, req.params.threadId, req.body);
 
     res.status(200).json({
       success: true,
@@ -44,7 +44,7 @@ async function sendManualReply(req, res) {
 
 async function generateDraft(req, res) {
   try {
-    const data = await messageService.generateDraft(req.params.threadId, req.body);
+    const data = await messageService.generateDraft(req.workspaceId, req.params.threadId, req.body);
 
     res.status(200).json({
       success: true,
@@ -58,7 +58,7 @@ async function generateDraft(req, res) {
 
 async function approveDraft(req, res) {
   try {
-    const data = await messageService.approveDraft(req.params.draftId, req.body);
+    const data = await messageService.approveDraft(req.workspaceId, req.params.draftId, req.body);
 
     res.status(200).json({
       success: true,
@@ -72,7 +72,7 @@ async function approveDraft(req, res) {
 
 async function rejectDraft(req, res) {
   try {
-    const data = await messageService.rejectDraft(req.params.draftId);
+    const data = await messageService.rejectDraft(req.workspaceId, req.params.draftId);
 
     res.status(200).json({
       success: true,

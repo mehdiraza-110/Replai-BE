@@ -3,15 +3,15 @@ const db = require("../config/db.config");
 const LOCAL_PART_PATTERN = /^[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?$/i;
 
 class MailboxService {
-  async listMailboxes({ page = 1, limit = 10, search = "", domainId } = {}) {
+  async listMailboxes({ page = 1, limit = 10, search = "", domainId, workspaceId } = {}) {
     const pageNum = Math.max(1, Number.parseInt(page, 10) || 1);
     const limitNum = Math.min(Math.max(Number.parseInt(limit, 10) || 10, 1), 100);
     const offset = (pageNum - 1) * limitNum;
 
-    const conditions = ["m.is_deleted = FALSE"];
-    const params = [];
+    const conditions = ["m.is_deleted = FALSE", "m.workspace_id = $1"];
+    const params = [workspaceId];
 
-    const searchTerm = search.trim();
+    const searchTerm = String(search || "").trim();
     if (searchTerm) {
       params.push(`%${searchTerm}%`);
       conditions.push(`m.email ILIKE $${params.length}`);
@@ -30,23 +30,24 @@ class MailboxService {
                 COALESCE((
                   SELECT array_agg(c.name ORDER BY c.created_at DESC)
                   FROM campaigns c
-                  WHERE c.is_deleted = FALSE AND c.status = 'Active'
+                  WHERE c.is_deleted = FALSE AND c.status = 'Active' AND c.workspace_id = m.workspace_id
                     AND (c.mailbox_mode = 'all' OR m.id = ANY(c.mailbox_ids))
                 ), '{}') AS active_campaign_names
          FROM mailboxes m
-         JOIN domains d ON d.id = m.domain_id
-         LEFT JOIN warmup_strategies ws ON ws.id = m.warmup_strategy_id
+         JOIN domains d ON d.id = m.domain_id AND d.workspace_id = m.workspace_id
+         LEFT JOIN warmup_strategies ws ON ws.id = m.warmup_strategy_id AND ws.workspace_id = m.workspace_id
          ${whereClause}
          ORDER BY m.created_at DESC
          LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limitNum, offset]
       ),
       db.query(
-        `SELECT COUNT(*)::int AS count FROM mailboxes m JOIN domains d ON d.id = m.domain_id ${whereClause}`,
+        `SELECT COUNT(*)::int AS count FROM mailboxes m JOIN domains d ON d.id = m.domain_id AND d.workspace_id = m.workspace_id ${whereClause}`,
         params
       ),
       db.query(
-        `SELECT status, COUNT(*)::int AS count FROM mailboxes WHERE is_deleted = FALSE GROUP BY status`
+        `SELECT status, COUNT(*)::int AS count FROM mailboxes WHERE is_deleted = FALSE AND workspace_id = $1 GROUP BY status`,
+        [workspaceId]
       ),
     ]);
 
@@ -69,7 +70,7 @@ class MailboxService {
     };
   }
 
-  async createMailboxes({ domain, localParts, displayName, dailyLimit, createdBy, acceptedMonthlyIncreaseCents }) {
+  async createMailboxes({ domain, localParts, displayName, dailyLimit, createdBy, acceptedMonthlyIncreaseCents, workspaceId }) {
     const domainName = String(domain || "").trim().toLowerCase();
     if (!domainName) {
       throw Object.assign(new Error("domain is required"), { statusCode: 400 });
@@ -79,8 +80,8 @@ class MailboxService {
     }
 
     const { rows: domainRows } = await db.query(
-      `SELECT * FROM domains WHERE domain = $1 AND is_deleted = FALSE`,
-      [domainName]
+      `SELECT * FROM domains WHERE domain = $1 AND is_deleted = FALSE AND workspace_id = $2`,
+      [domainName, workspaceId]
     );
     const domainRow = domainRows[0];
     if (!domainRow) {
@@ -89,7 +90,7 @@ class MailboxService {
 
     // Maildoso-managed domains create real, billable mailboxes at Maildoso (cost-confirmed).
     if (domainRow.provider === "Maildoso") {
-      return this.createMaildosoMailboxes({ domainRow, localParts, displayName, acceptedMonthlyIncreaseCents });
+      return this.createMaildosoMailboxes({ domainRow, localParts, displayName, acceptedMonthlyIncreaseCents, workspaceId });
     }
 
     const limit = Number.isFinite(Number(dailyLimit)) && Number(dailyLimit) > 0 ? Math.floor(Number(dailyLimit)) : 20;
@@ -108,11 +109,11 @@ class MailboxService {
       try {
         const status = domainRow.status === "Verified" ? "Active" : "Paused";
         const { rows } = await db.query(
-          `INSERT INTO mailboxes (domain_id, email, local_part, display_name, status, daily_limit, created_by, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+          `INSERT INTO mailboxes (domain_id, email, local_part, display_name, status, daily_limit, created_by, workspace_id, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
            ON CONFLICT (email) DO NOTHING
            RETURNING *`,
-          [domainRow.id, email, localPart, displayName || null, status, limit, createdBy || null]
+          [domainRow.id, email, localPart, displayName || null, status, limit, createdBy || null, domainRow.workspace_id]
         );
         if (!rows[0]) {
           results.push({ email, status: "Failed", error: "A mailbox with this email already exists" });
@@ -137,7 +138,7 @@ class MailboxService {
     return results;
   }
 
-  async createMaildosoMailboxes({ domainRow, localParts, displayName, acceptedMonthlyIncreaseCents }) {
+  async createMaildosoMailboxes({ domainRow, localParts, displayName, acceptedMonthlyIncreaseCents, workspaceId }) {
     const maildosoService = require("./maildoso.service");
     const cleaned = Array.from(new Set(localParts.map((part) => String(part || "").trim().toLowerCase()).filter(Boolean)));
     const invalid = cleaned.filter((part) => !LOCAL_PART_PATTERN.test(part));
@@ -148,6 +149,7 @@ class MailboxService {
     const { rows: existing } = await db.query(`SELECT email FROM mailboxes WHERE email = ANY($1::text[]) AND is_deleted = FALSE`, [
       cleaned.map((part) => `${part}@${domainRow.domain}`),
     ]);
+    // (deliberately NOT workspace-filtered: mailboxes.email is globally unique, so an address held by any workspace is taken)
     const existingEmails = new Set(existing.map((row) => row.email));
     const toCreate = cleaned.filter((part) => !existingEmails.has(`${part}@${domainRow.domain}`));
 
@@ -158,12 +160,14 @@ class MailboxService {
       domain: domainRow.domain,
       mailboxes: toCreate.map((localPart) => ({ localPart, ...nameForMailbox(localPart, displayName) })),
       acceptedMonthlyIncreaseCents,
+      workspaceId: domainRow.workspace_id,
     });
 
     const { rows } = await db.query(
       `SELECT m.*, d.domain AS domain_name, d.status AS domain_status, d.bounce_rate AS domain_bounce_rate, d.complaint_rate AS domain_complaint_rate
-       FROM mailboxes m JOIN domains d ON d.id = m.domain_id WHERE m.email = ANY($1::text[]) AND m.is_deleted = FALSE`,
-      [results.map((result) => result.email)]
+       FROM mailboxes m JOIN domains d ON d.id = m.domain_id AND d.workspace_id = m.workspace_id
+       WHERE m.email = ANY($1::text[]) AND m.is_deleted = FALSE AND m.workspace_id = $2`,
+      [results.map((result) => result.email), domainRow.workspace_id]
     );
     const rowsByEmail = new Map(rows.map((row) => [row.email, row]));
     return [
@@ -172,14 +176,14 @@ class MailboxService {
     ];
   }
 
-  async refreshMailbox(id) {
+  async refreshMailbox(id, workspaceId) {
     const { rows } = await db.query(
       `SELECT m.*, d.domain AS domain_name, d.status AS domain_status,
               d.bounce_rate AS domain_bounce_rate, d.complaint_rate AS domain_complaint_rate
        FROM mailboxes m
-       JOIN domains d ON d.id = m.domain_id
-       WHERE m.id = $1 AND m.is_deleted = FALSE`,
-      [id]
+       JOIN domains d ON d.id = m.domain_id AND d.workspace_id = m.workspace_id
+       WHERE m.id = $1 AND m.is_deleted = FALSE AND m.workspace_id = $2`,
+      [id, workspaceId]
     );
     const mailbox = rows[0];
     if (!mailbox) {
@@ -192,9 +196,9 @@ class MailboxService {
 
     const { rows: updatedRows } = await db.query(
       `UPDATE mailboxes SET status = $2, last_checked_at = NOW(), updated_at = NOW()
-       WHERE id = $1
+       WHERE id = $1 AND workspace_id = $3
        RETURNING *`,
-      [id, nextStatus]
+      [id, nextStatus, workspaceId]
     );
 
     return mapMailboxRow({
@@ -206,14 +210,15 @@ class MailboxService {
     });
   }
 
-  async refreshAllMailboxes() {
+  async refreshAllMailboxes(workspaceId) {
     const { rows } = await db.query(
-      `SELECT id FROM mailboxes WHERE is_deleted = FALSE`
+      `SELECT id FROM mailboxes WHERE is_deleted = FALSE AND workspace_id = $1`,
+      [workspaceId]
     );
     const results = [];
     for (const row of rows) {
       try {
-        results.push(await this.refreshMailbox(row.id));
+        results.push(await this.refreshMailbox(row.id, workspaceId));
       } catch (error) {
         results.push({ id: row.id, status: "Failed", error: error.message });
       }
@@ -221,12 +226,12 @@ class MailboxService {
     return results;
   }
 
-  async deleteMailbox(id) {
+  async deleteMailbox(id, workspaceId) {
     const { rows } = await db.query(
       `UPDATE mailboxes SET is_deleted = TRUE, updated_at = NOW()
-       WHERE id = $1 AND is_deleted = FALSE
+       WHERE id = $1 AND is_deleted = FALSE AND workspace_id = $2
        RETURNING id, email`,
-      [id]
+      [id, workspaceId]
     );
     if (!rows[0]) {
       throw Object.assign(new Error("Mailbox not found"), { statusCode: 404 });
@@ -238,8 +243,8 @@ class MailboxService {
    * The app-native inbox for a mailbox (see `messages` table / sesInboundEmail.service.js,
    * campaignSend.service.js) — every outbound send and inbound reply, newest first.
    */
-  async listMailboxMessages(mailboxId, { page = 1, limit = 30 } = {}) {
-    const { rows: mailboxRows } = await db.query(`SELECT id, email FROM mailboxes WHERE id = $1 AND is_deleted = FALSE`, [mailboxId]);
+  async listMailboxMessages(mailboxId, { page = 1, limit = 30, workspaceId } = {}) {
+    const { rows: mailboxRows } = await db.query(`SELECT id, email FROM mailboxes WHERE id = $1 AND is_deleted = FALSE AND workspace_id = $2`, [mailboxId, workspaceId]);
     if (!mailboxRows[0]) {
       throw Object.assign(new Error("Mailbox not found"), { statusCode: 404 });
     }
@@ -250,10 +255,10 @@ class MailboxService {
 
     const [itemsResult, totalResult] = await Promise.all([
       db.query(
-        `SELECT * FROM messages WHERE mailbox_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-        [mailboxId, limitNum, offset]
+        `SELECT * FROM messages WHERE mailbox_id = $1 AND workspace_id = $4 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+        [mailboxId, limitNum, offset, workspaceId]
       ),
-      db.query(`SELECT COUNT(*)::int AS count FROM messages WHERE mailbox_id = $1`, [mailboxId]),
+      db.query(`SELECT COUNT(*)::int AS count FROM messages WHERE mailbox_id = $1 AND workspace_id = $2`, [mailboxId, workspaceId]),
     ]);
 
     const total = totalResult.rows[0]?.count || 0;

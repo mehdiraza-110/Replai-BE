@@ -2,7 +2,7 @@ const domainService = require("../services/domain.service");
 
 async function listAvailableHostedZones(req, res) {
   try {
-    const data = await domainService.listHostedZoneDomains();
+    const data = await domainService.listHostedZoneDomains(req.workspaceId);
     res.status(200).json({ success: true, message: "Hosted zones fetched successfully", data });
   } catch (error) {
     sendError(res, error, "Unable to fetch Route53 hosted zones");
@@ -15,6 +15,7 @@ async function listDomains(req, res) {
       page: req.query.page,
       limit: req.query.limit,
       search: req.query.search,
+      workspaceId: req.workspaceId,
     });
     res.status(200).json({ success: true, message: "Domains fetched successfully", data });
   } catch (error) {
@@ -34,7 +35,7 @@ async function onboardDomains(req, res) {
       });
     }
 
-    const data = await domainService.onboardDomains(domains, req.user?.id ?? null);
+    const data = await domainService.onboardDomains(domains, req.user?.id ?? null, req.workspaceId);
     res.status(200).json({ success: true, message: "Domain onboarding started", data });
   } catch (error) {
     sendError(res, error, "Unable to onboard domains");
@@ -53,7 +54,7 @@ async function onboardExternalDomain(req, res) {
       });
     }
 
-    const data = await domainService.onboardExternalDomain(domain, req.user?.id ?? null);
+    const data = await domainService.onboardExternalDomain(domain, req.user?.id ?? null, req.workspaceId);
     res.status(200).json({ success: true, message: "Domain onboarding started", data });
   } catch (error) {
     sendError(res, error, "Unable to onboard domain");
@@ -62,7 +63,7 @@ async function onboardExternalDomain(req, res) {
 
 async function refreshDomainStatus(req, res) {
   try {
-    const data = await domainService.refreshDomainStatus(req.params.domain);
+    const data = await domainService.refreshDomainStatus(req.params.domain, req.workspaceId);
     res.status(200).json({ success: true, message: "Domain status refreshed", data });
   } catch (error) {
     sendError(res, error, "Unable to refresh domain status");
@@ -71,7 +72,7 @@ async function refreshDomainStatus(req, res) {
 
 async function refreshAllDomains(req, res) {
   try {
-    const data = await domainService.refreshAllDomains();
+    const data = await domainService.refreshAllDomains(req.workspaceId);
     res.status(200).json({ success: true, message: "Domain statuses refreshed", data });
   } catch (error) {
     sendError(res, error, "Unable to refresh domain statuses");
@@ -80,7 +81,7 @@ async function refreshAllDomains(req, res) {
 
 async function getAccountStatus(req, res) {
   try {
-    const data = await domainService.getAccountStatus();
+    const data = await domainService.getAccountStatus(req.workspaceId);
     res.status(200).json({ success: true, message: "SES account status fetched successfully", data });
   } catch (error) {
     sendError(res, error, "Unable to fetch SES account status");
@@ -92,6 +93,7 @@ async function requestProductionAccess(req, res) {
     const data = await domainService.requestProductionAccess({
       ...req.body,
       createdBy: req.user?.id ?? null,
+      workspaceId: req.workspaceId,
     });
     res.status(200).json({ success: true, message: "Production access request submitted", data });
   } catch (error) {
@@ -101,7 +103,7 @@ async function requestProductionAccess(req, res) {
 
 async function deleteDomain(req, res) {
   try {
-    const data = await domainService.deleteDomain(req.params.id);
+    const data = await domainService.deleteDomain(req.params.id, req.workspaceId);
     res.status(200).json({ success: true, message: "Domain deleted successfully", data });
   } catch (error) {
     sendError(res, error, "Unable to delete domain");
@@ -110,7 +112,7 @@ async function deleteDomain(req, res) {
 
 async function getReputationTrend(req, res) {
   try {
-    const data = await domainService.getReputationTrend({ days: req.query.days });
+    const data = await domainService.getReputationTrend({ days: req.query.days, workspaceId: req.workspaceId });
     res.status(200).json({ success: true, message: "Reputation trend fetched successfully", data });
   } catch (error) {
     sendError(res, error, "Unable to fetch reputation trend");

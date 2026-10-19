@@ -2,7 +2,7 @@ const ghlService = require("../services/ghl.service");
 
 async function getConnection(req, res) {
   try {
-    const data = await ghlService.a ();
+    const data = await ghlService.getConnection(req.workspaceId);
 
     res.status(200).json({
       success: true,
@@ -16,7 +16,7 @@ async function getConnection(req, res) {
 
 async function saveConnection(req, res) {
   try {
-    const data = await ghlService.saveConnection({
+    const data = await ghlService.saveConnection(req.workspaceId, {
       ...req.body,
       createdBy: req.user?.id ?? null,
     });
@@ -33,7 +33,7 @@ async function saveConnection(req, res) {
 
 async function testConnection(req, res) {
   try {
-    const data = await ghlService.testConnection(req.body);
+    const data = await ghlService.testConnection(req.workspaceId, req.body);
 
     res.status(200).json({
       success: true,

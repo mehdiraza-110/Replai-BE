@@ -2,7 +2,7 @@ const knowledgeService = require("../services/knowledge.service");
 
 async function listKnowledgeSources(req, res) {
   try {
-    const data = await knowledgeService.list(req.query);
+    const data = await knowledgeService.list(req.workspaceId, req.query);
 
     res.status(200).json({
       success: true,
@@ -16,7 +16,7 @@ async function listKnowledgeSources(req, res) {
 
 async function createKnowledgeSource(req, res) {
   try {
-    const data = await knowledgeService.create(req.body, req.file, req.user?.id || null);
+    const data = await knowledgeService.create(req.workspaceId, req.body, req.file, req.user?.id || null);
 
     res.status(201).json({
       success: true,
@@ -30,7 +30,7 @@ async function createKnowledgeSource(req, res) {
 
 async function deleteKnowledgeSource(req, res) {
   try {
-    const data = await knowledgeService.delete(Number(req.params.id));
+    const data = await knowledgeService.delete(req.workspaceId, Number(req.params.id));
 
     res.status(200).json({
       success: true,

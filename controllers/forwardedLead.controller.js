@@ -2,7 +2,7 @@ const forwardedLeadService = require("../services/forwardedLead.service");
 
 async function listForwardedLeads(req, res) {
   try {
-    const data = await forwardedLeadService.list(req.query);
+    const data = await forwardedLeadService.list(req.workspaceId, req.query);
 
     res.status(200).json({
       success: true,

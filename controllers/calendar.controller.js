@@ -2,7 +2,7 @@ const googleCalendarService = require("../services/googleCalendar.service");
 
 async function listConnections(req, res) {
   try {
-    const data = await googleCalendarService.listConnections(req.query.agentId ?? req.query.agent_id);
+    const data = await googleCalendarService.listConnections(req.query.agentId ?? req.query.agent_id, req.workspaceId);
 
     res.status(200).json({
       success: true,
@@ -17,7 +17,11 @@ async function listConnections(req, res) {
 
 async function getGoogleAuthUrl(req, res) {
   try {
-    const url = googleCalendarService.getAuthUrl(req.query.agentId ?? req.query.agent_id);
+    const url = await googleCalendarService.getAuthUrl(
+      req.query.agentId ?? req.query.agent_id,
+      req.workspaceId,
+      req.user?.id ?? req.userId
+    );
 
     res.status(200).json({
       success: true,
@@ -49,7 +53,7 @@ async function handleGoogleCallback(req, res) {
 
 async function disconnectConnection(req, res) {
   try {
-    const data = await googleCalendarService.disconnectConnection(req.params.id);
+    const data = await googleCalendarService.disconnectConnection(req.params.id, req.workspaceId);
 
     res.status(200).json({
       success: true,

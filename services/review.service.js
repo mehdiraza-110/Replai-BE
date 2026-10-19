@@ -2,7 +2,7 @@ const db = require("../config/db.config");
 const eventLogService = require("./eventLog.service");
 
 class ReviewService {
-  async list(query = {}) {
+  async list(workspaceId, query = {}) {
     const page = Math.max(1, Number.parseInt(query.page, 10) || 1);
     const limit = Math.min(Math.max(Number.parseInt(query.limit, 10) || 10, 1), 50);
     const offset = (page - 1) * limit;
@@ -19,26 +19,31 @@ class ReviewService {
                 p.company_name,
                 p.role_title
          FROM ai_response_drafts d
-         LEFT JOIN plusvibe_integrations i ON i.id = d.integration_id
+         LEFT JOIN plusvibe_integrations i ON i.id = d.integration_id AND i.app_workspace_id = d.workspace_id
          LEFT JOIN plusvibe_campaigns c
            ON c.integration_id = d.integration_id
           AND c.plusvibe_campaign_id = d.plusvibe_campaign_id
+          AND c.workspace_id = d.workspace_id
           AND c.is_deleted = FALSE
-         LEFT JOIN ai_agents a ON a.id = d.ai_agent_id
+         LEFT JOIN ai_agents a ON a.id = d.ai_agent_id AND a.workspace_id = d.workspace_id
          LEFT JOIN plusvibe_lead_profiles p
            ON p.workspace_id = i.workspace_id
+          AND p.app_workspace_id = d.workspace_id
           AND p.lead_email = d.lead_email
          WHERE d.status = 'Pending'
+           AND d.workspace_id = $1
            AND d.is_deleted = FALSE
          ORDER BY d.updated_at DESC
-         LIMIT $1 OFFSET $2`,
-        [limit, offset]
+         LIMIT $2 OFFSET $3`,
+        [workspaceId, limit, offset]
       ),
       db.query(
         `SELECT COUNT(*)::int AS count
          FROM ai_response_drafts
          WHERE status = 'Pending'
-           AND is_deleted = FALSE`
+           AND workspace_id = $1
+           AND is_deleted = FALSE`,
+        [workspaceId]
       ),
     ]);
 
@@ -48,6 +53,7 @@ class ReviewService {
       eventType: "human_review.queue.listed",
       source: "human_review",
       status: "Success",
+      appWorkspaceId: workspaceId,
       metadata: { page, limit, count: items.rows.length },
     });
 
@@ -60,12 +66,14 @@ class ReviewService {
     };
   }
 
-  async count() {
+  async count(workspaceId) {
     const result = await db.query(
       `SELECT COUNT(*)::int AS count
        FROM ai_response_drafts
        WHERE status = 'Pending'
-         AND is_deleted = FALSE`
+         AND workspace_id = $1
+         AND is_deleted = FALSE`,
+      [workspaceId]
     );
 
     return { count: result.rows[0]?.count || 0 };

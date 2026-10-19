@@ -38,7 +38,9 @@ const cloudWatchClient = new CloudWatchClient({ region: AWS_REGION });
 let vdmEnsured = false;
 
 class DomainService {
-  async listHostedZoneDomains() {
+  // Route53 is our own AWS account, so it holds every tenant's zones. When a workspace is given, zones whose
+  // domain is already owned by ANOTHER workspace are hidden (they would otherwise leak that tenant's domains).
+  async listHostedZoneDomains(workspaceId = null) {
     const zones = [];
     let marker;
 
@@ -50,36 +52,47 @@ class DomainService {
       marker = page.IsTruncated ? page.NextMarker : undefined;
     } while (marker);
 
+    let ownedElsewhere = new Set();
+    if (workspaceId) {
+      const { rows } = await db.query(
+        `SELECT domain FROM domains WHERE is_deleted = FALSE AND workspace_id <> $1`,
+        [workspaceId]
+      );
+      ownedElsewhere = new Set(rows.map((row) => row.domain));
+    }
+
     return zones
       .filter((zone) => !zone.Config?.PrivateZone)
       .map((zone) => ({
         domain: zone.Name.replace(/\.$/, ""),
         hostedZoneId: zone.Id.replace("/hostedzone/", ""),
-      }));
+      }))
+      .filter((zone) => !ownedElsewhere.has(zone.domain));
   }
 
-  async listDomains({ page = 1, limit = 10, search = "" } = {}) {
+  async listDomains({ page = 1, limit = 10, search = "", workspaceId } = {}) {
     const pageNum = Math.max(1, Number.parseInt(page, 10) || 1);
     const limitNum = Math.min(Math.max(Number.parseInt(limit, 10) || 10, 1), 100);
     const offset = (pageNum - 1) * limitNum;
     const searchTerm = search.trim();
-    const searchParam = searchTerm ? [`%${searchTerm}%`] : [];
-    const whereClausePlain = searchTerm ? `WHERE is_deleted = FALSE AND domain ILIKE $1` : `WHERE is_deleted = FALSE`;
-    const whereClauseAliased = searchTerm ? `WHERE d.is_deleted = FALSE AND d.domain ILIKE $1` : `WHERE d.is_deleted = FALSE`;
+    // $1 is always the workspace; the optional search term is $2.
+    const searchParam = searchTerm ? [workspaceId, `%${searchTerm}%`] : [workspaceId];
+    const whereClausePlain = searchTerm ? `WHERE is_deleted = FALSE AND workspace_id = $1 AND domain ILIKE $2` : `WHERE is_deleted = FALSE AND workspace_id = $1`;
+    const whereClauseAliased = searchTerm ? `WHERE d.is_deleted = FALSE AND d.workspace_id = $1 AND d.domain ILIKE $2` : `WHERE d.is_deleted = FALSE AND d.workspace_id = $1`;
 
     const [itemsResult, totalResult, statusCountsResult] = await Promise.all([
       db.query(
         `SELECT d.*, COALESCE(mb.mailbox_count, 0)::int AS mailbox_count
          FROM domains d
          LEFT JOIN (
-           SELECT domain_id, COUNT(*) AS mailbox_count FROM mailboxes WHERE is_deleted = FALSE GROUP BY domain_id
+           SELECT domain_id, COUNT(*) AS mailbox_count FROM mailboxes WHERE is_deleted = FALSE AND workspace_id = $1 GROUP BY domain_id
          ) mb ON mb.domain_id = d.id
          ${whereClauseAliased}
          ORDER BY d.created_at DESC LIMIT $${searchParam.length + 1} OFFSET $${searchParam.length + 2}`,
         [...searchParam, limitNum, offset]
       ),
       db.query(`SELECT COUNT(*)::int AS count FROM domains ${whereClausePlain}`, searchParam),
-      db.query(`SELECT status, COUNT(*)::int AS count FROM domains WHERE is_deleted = FALSE GROUP BY status`),
+      db.query(`SELECT status, COUNT(*)::int AS count FROM domains WHERE is_deleted = FALSE AND workspace_id = $1 GROUP BY status`, [workspaceId]),
     ]);
 
     const total = totalResult.rows[0]?.count || 0;
@@ -101,8 +114,8 @@ class DomainService {
     };
   }
 
-  async onboardDomains(domainNames, createdBy) {
-    const hostedZones = await this.listHostedZoneDomains();
+  async onboardDomains(domainNames, createdBy, workspaceId) {
+    const hostedZones = await this.listHostedZoneDomains(workspaceId);
     const hostedZoneByName = new Map(hostedZones.map((z) => [z.domain, z.hostedZoneId]));
 
     const results = [];
@@ -112,7 +125,7 @@ class DomainService {
         if (!hostedZoneId) {
           throw new Error(`No Route53 hosted zone found for ${domainName}`);
         }
-        const result = await this.onboardDomain(domainName, hostedZoneId, createdBy);
+        const result = await this.onboardDomain(domainName, hostedZoneId, createdBy, workspaceId);
         results.push(result);
       } catch (error) {
         results.push({ domain: domainName, status: "Failed", error: error.message });
@@ -121,7 +134,8 @@ class DomainService {
     return results;
   }
 
-  async onboardDomain(domainName, hostedZoneId, createdBy) {
+  async onboardDomain(domainName, hostedZoneId, createdBy, workspaceId) {
+    await this.assertDomainAvailable(domainName, workspaceId);
     const { dkimTokens, mailFromDomain } = await this.createSesIdentity(domainName);
 
     // Write the DNS records SES needs into Route53: DKIM CNAMEs, MAIL FROM MX + SPF, root SPF, DMARC.
@@ -146,6 +160,7 @@ class DomainService {
       mailFromSubdomain: mailFromDomain,
       dkimTokens,
       createdBy,
+      workspaceId,
       registrar: "Route53",
       dnsProvider: "Route53",
     });
@@ -161,7 +176,8 @@ class DomainService {
   // For a domain that isn't hosted in this AWS account's Route53 — we still create the SES
   // identity, but hand back the DNS records for the caller to add at their own DNS provider
   // instead of writing them ourselves.
-  async onboardExternalDomain(domainName, createdBy) {
+  async onboardExternalDomain(domainName, createdBy, workspaceId) {
+    await this.assertDomainAvailable(domainName, workspaceId);
     const { dkimTokens, mailFromDomain } = await this.createSesIdentity(domainName);
 
     const record = await this.upsertDomainRecord({
@@ -170,6 +186,7 @@ class DomainService {
       mailFromSubdomain: mailFromDomain,
       dkimTokens,
       createdBy,
+      workspaceId,
       registrar: "External",
       dnsProvider: "External",
     });
@@ -180,6 +197,15 @@ class DomainService {
       record,
       dnsRecords: buildDnsRecordList({ domainName, mailFromDomain, dkimTokens }),
     };
+  }
+
+  // domains.domain is globally UNIQUE (and the SES identity is account-wide), so a domain already onboarded by
+  // another workspace can't be claimed here. Checked before any AWS/Route53 side effect.
+  async assertDomainAvailable(domainName, workspaceId) {
+    const { rows } = await db.query(`SELECT workspace_id FROM domains WHERE domain = $1`, [domainName]);
+    if (rows[0] && rows[0].workspace_id !== workspaceId) {
+      throw Object.assign(new Error(`${domainName} is already in use by another workspace`), { statusCode: 409, code: "DOMAIN_IN_USE" });
+    }
   }
 
   async createSesIdentity(domainName) {
@@ -364,10 +390,11 @@ class DomainService {
     return "Healthy";
   }
 
-  async refreshDomainReputation(domain) {
+  // workspaceId is omitted only by background jobs; HTTP callers always pass it.
+  async refreshDomainReputation(domain, workspaceId = null) {
     const { rows } = await db.query(
-      `SELECT id, configuration_set_name FROM domains WHERE domain = $1 AND is_deleted = FALSE`,
-      [domain]
+      `SELECT id, configuration_set_name FROM domains WHERE domain = $1 AND is_deleted = FALSE AND ($2::int IS NULL OR workspace_id = $2)`,
+      [domain, workspaceId]
     );
     const domainRow = rows[0];
     if (!domainRow) {
@@ -402,7 +429,7 @@ class DomainService {
          reputation = $10,
          reputation_checked_at = NOW(),
          updated_at = NOW()
-       WHERE domain = $1
+       WHERE domain = $1 AND ($11::int IS NULL OR workspace_id = $11)
        RETURNING *`,
       [
         domain,
@@ -415,13 +442,14 @@ class DomainService {
         metrics.complaintRate,
         metrics.deliveryRate,
         reputation,
+        workspaceId,
       ]
     );
 
     return mapDomainRow(updatedRows[0]);
   }
 
-  async getReputationTrend({ days = 7 } = {}) {
+  async getReputationTrend({ days = 7, workspaceId } = {}) {
     const daysNum = Math.min(Math.max(Number.parseInt(days, 10) || 7, 1), 30);
 
     const endTime = new Date();
@@ -436,7 +464,8 @@ class DomainService {
     }
 
     const { rows } = await db.query(
-      `SELECT DISTINCT configuration_set_name FROM domains WHERE is_deleted = FALSE AND configuration_set_name IS NOT NULL`
+      `SELECT DISTINCT configuration_set_name FROM domains WHERE is_deleted = FALSE AND configuration_set_name IS NOT NULL AND workspace_id = $1`,
+      [workspaceId]
     );
 
     const bucketKeyFor = { send: "sent", bounce: "bounced", complaint: "complained" };
@@ -485,16 +514,16 @@ class DomainService {
       }));
   }
 
-  async deleteDomain(id) {
+  async deleteDomain(id, workspaceId) {
     const client = await db.getClient();
     try {
       await client.query("BEGIN");
 
       const { rows: domainRows } = await client.query(
         `UPDATE domains SET is_deleted = TRUE, updated_at = NOW()
-         WHERE id = $1 AND is_deleted = FALSE
+         WHERE id = $1 AND is_deleted = FALSE AND workspace_id = $2
          RETURNING id, domain`,
-        [id]
+        [id, workspaceId]
       );
       if (!domainRows[0]) {
         throw Object.assign(new Error("Domain not found"), { statusCode: 404 });
@@ -502,9 +531,9 @@ class DomainService {
 
       const { rows: mailboxRows } = await client.query(
         `UPDATE mailboxes SET is_deleted = TRUE, updated_at = NOW()
-         WHERE domain_id = $1 AND is_deleted = FALSE
+         WHERE domain_id = $1 AND is_deleted = FALSE AND workspace_id = $2
          RETURNING id`,
-        [id]
+        [id, workspaceId]
       );
 
       await client.query("COMMIT");
@@ -518,16 +547,16 @@ class DomainService {
     }
   }
 
-  async upsertDomainRecord({ domain, hostedZoneId, mailFromSubdomain, dkimTokens, createdBy, registrar = "Route53", dnsProvider = "Route53" }) {
+  async upsertDomainRecord({ domain, hostedZoneId, mailFromSubdomain, dkimTokens, createdBy, workspaceId, registrar = "Route53", dnsProvider = "Route53" }) {
     const { rows } = await db.query(
       `INSERT INTO domains (
          domain, registrar, dns_provider, hosted_zone_id, aws_region,
          mail_from_subdomain, spf_status, dkim_status, dmarc_status, mx_status,
-         mail_from_status, provider, status, raw_dkim_tokens, created_by, updated_at
+         mail_from_status, provider, status, raw_dkim_tokens, created_by, workspace_id, updated_at
        ) VALUES (
          $1, $2, $3, $4, $5,
          $6, 'Pending', 'Pending', 'Pending', 'Pending',
-         'Pending', 'Amazon SES', 'Pending Verification', $7, $8, NOW()
+         'Pending', 'Amazon SES', 'Pending Verification', $7, $8, $9, NOW()
        )
        ON CONFLICT (domain) DO UPDATE SET
          registrar = EXCLUDED.registrar,
@@ -544,9 +573,13 @@ class DomainService {
          raw_dkim_tokens = EXCLUDED.raw_dkim_tokens,
          updated_at = NOW(),
          is_deleted = FALSE
+       WHERE domains.workspace_id = EXCLUDED.workspace_id
        RETURNING *`,
-      [domain, registrar, dnsProvider, hostedZoneId, AWS_REGION, mailFromSubdomain, JSON.stringify(dkimTokens), createdBy || null]
+      [domain, registrar, dnsProvider, hostedZoneId, AWS_REGION, mailFromSubdomain, JSON.stringify(dkimTokens), createdBy || null, workspaceId]
     );
+    if (!rows[0]) {
+      throw Object.assign(new Error(`${domain} is already in use by another workspace`), { statusCode: 409, code: "DOMAIN_IN_USE" });
+    }
     return mapDomainRow(rows[0]);
   }
 
@@ -578,12 +611,15 @@ class DomainService {
     return found;
   }
 
-  async refreshDomainStatus(domain) {
+  async refreshDomainStatus(domain, workspaceId = null) {
     // Maildoso-managed domains have no SES identity: their DNS/verification lives at Maildoso,
     // so only the reputation numbers (derived from our own sends/bounces) are refreshed here.
-    const { rows: providerRows } = await db.query(`SELECT provider FROM domains WHERE domain = $1 AND is_deleted = FALSE`, [domain]);
+    const { rows: providerRows } = await db.query(`SELECT provider FROM domains WHERE domain = $1 AND is_deleted = FALSE AND ($2::int IS NULL OR workspace_id = $2)`, [domain, workspaceId]);
+    if (workspaceId && !providerRows[0]) {
+      throw Object.assign(new Error(`Domain ${domain} is not onboarded yet`), { statusCode: 404 });
+    }
     if (providerRows[0]?.provider === "Maildoso") {
-      return mapDomainRow(await require("./maildoso.service").refreshDomainReputation(domain));
+      return mapDomainRow(await require("./maildoso.service").refreshDomainReputation(domain, workspaceId));
     }
 
     const [identity, spfStatus, dmarcStatus] = await Promise.all([
@@ -612,9 +648,9 @@ class DomainService {
          status = $6,
          last_checked_at = NOW(),
          updated_at = NOW()
-       WHERE domain = $1
+       WHERE domain = $1 AND ($7::int IS NULL OR workspace_id = $7)
        RETURNING *`,
-      [domain, dkimStatus, mailFromStatus, spfStatus, dmarcStatus, overallStatus]
+      [domain, dkimStatus, mailFromStatus, spfStatus, dmarcStatus, overallStatus, workspaceId]
     );
 
     if (!rows[0]) {
@@ -624,17 +660,18 @@ class DomainService {
     // Reputation (bounce/complaint/delivery) is pulled from CloudWatch in the same recheck pass
     // so one "Recheck status" action refreshes everything about the domain.
     try {
-      return await this.refreshDomainReputation(domain);
+      return await this.refreshDomainReputation(domain, workspaceId);
     } catch (error) {
       console.error(`Unable to refresh reputation metrics for ${domain}:`, error.message);
       return mapDomainRow(rows[0]);
     }
   }
 
-  async getAccountStatus() {
+  async getAccountStatus(workspaceId) {
     const account = await sesClient.send(new GetAccountCommand({}));
     const { rows } = await db.query(
-      `SELECT * FROM ses_account_requests ORDER BY requested_at DESC LIMIT 1`
+      `SELECT * FROM ses_account_requests WHERE workspace_id = $1 ORDER BY requested_at DESC LIMIT 1`,
+      [workspaceId]
     );
 
     return {
@@ -649,7 +686,7 @@ class DomainService {
     };
   }
 
-  async requestProductionAccess({ mailType, websiteUrl, useCaseDescription, additionalContactEmailAddresses, createdBy }) {
+  async requestProductionAccess({ mailType, websiteUrl, useCaseDescription, additionalContactEmailAddresses, createdBy, workspaceId }) {
     if (!mailType || !websiteUrl) {
       throw Object.assign(new Error("mailType and websiteUrl are required"), { statusCode: 400 });
     }
@@ -674,8 +711,8 @@ class DomainService {
     const { rows } = await db.query(
       `INSERT INTO ses_account_requests (
          aws_region, mail_type, website_url, use_case_description,
-         additional_contact_emails, status, error_message, requested_by
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         additional_contact_emails, status, error_message, requested_by, workspace_id
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
       [
         AWS_REGION,
@@ -686,6 +723,7 @@ class DomainService {
         status,
         errorMessage,
         createdBy || null,
+        workspaceId,
       ]
     );
 
@@ -696,16 +734,17 @@ class DomainService {
     return mapAccountRequestRow(rows[0]);
   }
 
-  async refreshAllDomains() {
+  async refreshAllDomains(workspaceId = null) {
     // Every domain is refreshed, not just unverified ones — reputation metrics (bounce/complaint/
     // delivery) need periodic refreshing for verified, actively-sending domains too.
     const { rows } = await db.query(
-      `SELECT domain FROM domains WHERE is_deleted = FALSE`
+      `SELECT domain FROM domains WHERE is_deleted = FALSE AND ($1::int IS NULL OR workspace_id = $1)`,
+      [workspaceId]
     );
     const results = [];
     for (const row of rows) {
       try {
-        results.push(await this.refreshDomainStatus(row.domain));
+        results.push(await this.refreshDomainStatus(row.domain, workspaceId));
       } catch (error) {
         results.push({ domain: row.domain, status: "Failed", error: error.message });
       }

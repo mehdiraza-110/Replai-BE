@@ -78,7 +78,7 @@ const NOTIFICATION_RULES = {
 const NOTIFICATION_EVENT_TYPES = Object.keys(NOTIFICATION_RULES);
 
 class NotificationService {
-  async list(query = {}) {
+  async list(workspaceId, query = {}) {
     const page = Math.max(1, Number.parseInt(query.page, 10) || 1);
     const limit = Math.min(Math.max(Number.parseInt(query.limit, 10) || 20, 1), 100);
     const offset = (page - 1) * limit;
@@ -87,12 +87,12 @@ class NotificationService {
       db.query(
         `SELECT *
          FROM event_logs
-         WHERE event_type = ANY($1)
+         WHERE event_type = ANY($1) AND app_workspace_id = $2
          ORDER BY created_at DESC
-         LIMIT $2 OFFSET $3`,
-        [NOTIFICATION_EVENT_TYPES, limit, offset]
+         LIMIT $3 OFFSET $4`,
+        [NOTIFICATION_EVENT_TYPES, workspaceId, limit, offset]
       ),
-      db.query(`SELECT COUNT(*)::int AS count FROM event_logs WHERE event_type = ANY($1)`, [NOTIFICATION_EVENT_TYPES]),
+      db.query(`SELECT COUNT(*)::int AS count FROM event_logs WHERE event_type = ANY($1) AND app_workspace_id = $2`, [NOTIFICATION_EVENT_TYPES, workspaceId]),
     ]);
 
     const count = total.rows[0]?.count || 0;

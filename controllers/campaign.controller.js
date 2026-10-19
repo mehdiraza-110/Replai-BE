@@ -8,6 +8,7 @@ async function listCampaigns(req, res) {
       page: req.query.page,
       limit: req.query.limit,
       search: req.query.search,
+      workspaceId: req.workspaceId,
     });
     res.status(200).json({ success: true, message: "Campaigns fetched successfully", data });
   } catch (error) {
@@ -20,6 +21,7 @@ async function createCampaign(req, res) {
     const data = await campaignService.createCampaign({
       ...req.body,
       createdBy: req.user?.id ?? null,
+      workspaceId: req.workspaceId,
     });
     res.status(200).json({ success: true, message: "Campaign created successfully", data });
   } catch (error) {
@@ -61,6 +63,7 @@ async function listCampaignLeads(req, res) {
       page: req.query.page,
       limit: req.query.limit,
       search: req.query.search,
+      workspaceId: req.workspaceId,
     });
     res.status(200).json({ success: true, message: "Campaign leads fetched successfully", data });
   } catch (error) {

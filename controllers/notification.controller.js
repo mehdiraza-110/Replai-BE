@@ -2,7 +2,7 @@ const notificationService = require("../services/notification.service");
 
 async function listNotifications(req, res) {
   try {
-    const data = await notificationService.list(req.query);
+    const data = await notificationService.list(req.workspaceId, req.query);
 
     res.status(200).json({
       success: true,

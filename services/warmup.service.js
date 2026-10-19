@@ -19,31 +19,34 @@ const DEFAULT_SAFETY_TIERS = [
 ];
 
 class WarmupService {
-  async listStrategies() {
+  async listStrategies(workspaceId) {
     const { rows } = await db.query(
       `SELECT ws.*, COUNT(m.id) FILTER (WHERE m.is_deleted = FALSE)::int AS assigned_mailbox_count
        FROM warmup_strategies ws
-       LEFT JOIN mailboxes m ON m.warmup_strategy_id = ws.id
-       WHERE ws.is_deleted = FALSE
+       LEFT JOIN mailboxes m ON m.warmup_strategy_id = ws.id AND m.workspace_id = ws.workspace_id
+       WHERE ws.is_deleted = FALSE AND ws.workspace_id = $1
        GROUP BY ws.id
-       ORDER BY ws.created_at DESC`
+       ORDER BY ws.created_at DESC`,
+      [workspaceId]
     );
     return rows.map(mapStrategyRow);
   }
 
-  async getSummary() {
+  async getSummary(workspaceId) {
     const [{ rows: mailboxRows }, { rows: strategyRows }] = await Promise.all([
       db.query(
         `SELECT m.warmup_stage, m.daily_limit, ws.steady_state_daily_limit
          FROM mailboxes m
-         JOIN warmup_strategies ws ON ws.id = m.warmup_strategy_id
-         WHERE m.is_deleted = FALSE AND m.warmup_strategy_id IS NOT NULL`
+         JOIN warmup_strategies ws ON ws.id = m.warmup_strategy_id AND ws.workspace_id = m.workspace_id
+         WHERE m.is_deleted = FALSE AND m.warmup_strategy_id IS NOT NULL AND m.workspace_id = $1`,
+        [workspaceId]
       ),
       db.query(
         `SELECT COUNT(DISTINCT ws.id)::int AS count
          FROM warmup_strategies ws
-         JOIN mailboxes m ON m.warmup_strategy_id = ws.id
-         WHERE ws.is_deleted = FALSE AND m.is_deleted = FALSE`
+         JOIN mailboxes m ON m.warmup_strategy_id = ws.id AND m.workspace_id = ws.workspace_id
+         WHERE ws.is_deleted = FALSE AND m.is_deleted = FALSE AND ws.workspace_id = $1`,
+        [workspaceId]
       ),
     ]);
 
@@ -66,14 +69,14 @@ class WarmupService {
     };
   }
 
-  async createStrategy({ name, description, startDailyLimit, steadyStateDailyLimit, incrementPerStage, stageDurationDays, safetyTiers, isAiGenerated, aiRationale, createdBy }) {
+  async createStrategy({ name, description, startDailyLimit, steadyStateDailyLimit, incrementPerStage, stageDurationDays, safetyTiers, isAiGenerated, aiRationale, createdBy, workspaceId }) {
     if (!name) throw Object.assign(new Error("name is required"), { statusCode: 400 });
 
     const { rows } = await db.query(
       `INSERT INTO warmup_strategies (
          name, description, start_daily_limit, steady_state_daily_limit,
-         increment_per_stage, stage_duration_days, safety_tiers, is_ai_generated, ai_rationale, created_by, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+         increment_per_stage, stage_duration_days, safety_tiers, is_ai_generated, ai_rationale, created_by, workspace_id, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
        RETURNING *, 0 AS assigned_mailbox_count`,
       [
         name,
@@ -86,25 +89,26 @@ class WarmupService {
         Boolean(isAiGenerated),
         aiRationale || null,
         createdBy || null,
+        workspaceId,
       ]
     );
     return mapStrategyRow(rows[0]);
   }
 
-  async assignStrategy(strategyId, target) {
-    const { rows: strategyRows } = await db.query(`SELECT * FROM warmup_strategies WHERE id = $1 AND is_deleted = FALSE`, [strategyId]);
+  async assignStrategy(strategyId, target, workspaceId) {
+    const { rows: strategyRows } = await db.query(`SELECT * FROM warmup_strategies WHERE id = $1 AND is_deleted = FALSE AND workspace_id = $2`, [strategyId, workspaceId]);
     const strategy = strategyRows[0];
     if (!strategy) throw Object.assign(new Error("Warmup strategy not found"), { statusCode: 404 });
 
-    const conditions = ["is_deleted = FALSE"];
-    const params = [];
+    const conditions = ["is_deleted = FALSE", "workspace_id = $1"];
+    const params = [workspaceId];
 
     if (target?.mailboxIds?.length) {
       params.push(target.mailboxIds);
       conditions.push(`id = ANY($${params.length})`);
     } else if (target?.domain) {
       params.push(target.domain);
-      conditions.push(`domain_id = (SELECT id FROM domains WHERE domain = $${params.length})`);
+      conditions.push(`domain_id = (SELECT id FROM domains WHERE domain = $${params.length} AND workspace_id = $1)`);
     } else if (!target?.all) {
       throw Object.assign(new Error("Provide mailboxIds, domain, or all:true"), { statusCode: 400 });
     }
@@ -127,12 +131,12 @@ class WarmupService {
     return { strategy: mapStrategyRow(strategy), assignedCount: rows.length };
   }
 
-  async generateAiSchedule({ domain, mailboxIds }) {
+  async generateAiSchedule({ domain, mailboxIds, workspaceId }) {
     if (!process.env.OPENAI_API_KEY) {
       throw Object.assign(new Error("OPENAI_API_KEY is not configured on the server"), { statusCode: 503, code: "OPENAI_NOT_CONFIGURED" });
     }
 
-    const context = await this.buildAiContext({ domain, mailboxIds });
+    const context = await this.buildAiContext({ domain, mailboxIds, workspaceId });
 
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -188,27 +192,28 @@ class WarmupService {
     };
   }
 
-  async buildAiContext({ domain, mailboxIds }) {
+  async buildAiContext({ domain, mailboxIds, workspaceId }) {
     let domainRows = [];
     if (domain) {
       const { rows } = await db.query(
         `SELECT domain, status, emails_sent_14d, emails_delivered_14d, emails_bounced_14d, emails_complained_14d, bounce_rate, complaint_rate, reputation
-         FROM domains WHERE domain = $1 AND is_deleted = FALSE`,
-        [domain]
+         FROM domains WHERE domain = $1 AND is_deleted = FALSE AND workspace_id = $2`,
+        [domain, workspaceId]
       );
       domainRows = rows;
     } else if (mailboxIds?.length) {
       const { rows } = await db.query(
         `SELECT DISTINCT d.domain, d.status, d.emails_sent_14d, d.emails_delivered_14d, d.emails_bounced_14d, d.emails_complained_14d, d.bounce_rate, d.complaint_rate, d.reputation
-         FROM mailboxes m JOIN domains d ON d.id = m.domain_id
-         WHERE m.id = ANY($1) AND m.is_deleted = FALSE`,
-        [mailboxIds]
+         FROM mailboxes m JOIN domains d ON d.id = m.domain_id AND d.workspace_id = m.workspace_id
+         WHERE m.id = ANY($1) AND m.is_deleted = FALSE AND m.workspace_id = $2`,
+        [mailboxIds, workspaceId]
       );
       domainRows = rows;
     } else {
       const { rows } = await db.query(
         `SELECT domain, status, emails_sent_14d, emails_delivered_14d, emails_bounced_14d, emails_complained_14d, bounce_rate, complaint_rate, reputation
-         FROM domains WHERE is_deleted = FALSE ORDER BY created_at DESC LIMIT 20`
+         FROM domains WHERE is_deleted = FALSE AND workspace_id = $1 ORDER BY created_at DESC LIMIT 20`,
+        [workspaceId]
       );
       domainRows = rows;
     }
@@ -234,14 +239,17 @@ class WarmupService {
   // The engine. Advances every mailbox with an assigned strategy according to its ramp curve,
   // and enforces the strategy's safety tiers against its parent domain's real bounce/complaint
   // rate (mailboxes share a domain's SES configuration set, so reputation is tracked at that level).
-  async runTick() {
+  // Called by the cron with no argument (all workspaces); the manual endpoint passes the caller's workspaceId.
+  async runTick(workspaceId = null) {
     const { rows } = await db.query(
       `SELECT m.*, d.domain AS domain_name, d.status AS domain_status, d.bounce_rate AS domain_bounce_rate, d.complaint_rate AS domain_complaint_rate,
               ws.name AS warmup_strategy_name, ws.start_daily_limit, ws.steady_state_daily_limit, ws.steady_state_market_daily_limit, ws.increment_per_stage, ws.stage_duration_days, ws.safety_tiers
        FROM mailboxes m
-       JOIN warmup_strategies ws ON ws.id = m.warmup_strategy_id AND ws.is_deleted = FALSE
-       JOIN domains d ON d.id = m.domain_id
-       WHERE m.is_deleted = FALSE AND m.warmup_stage != 'Paused'`
+       JOIN warmup_strategies ws ON ws.id = m.warmup_strategy_id AND ws.is_deleted = FALSE AND ws.workspace_id = m.workspace_id
+       JOIN domains d ON d.id = m.domain_id AND d.workspace_id = m.workspace_id
+       WHERE m.is_deleted = FALSE AND m.warmup_stage != 'Paused'
+         AND ($1::int IS NULL OR m.workspace_id = $1)`,
+      [workspaceId]
     );
 
     const results = [];

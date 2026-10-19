@@ -2,7 +2,7 @@ const aiAgentService = require("../services/aiAgent.service");
 
 async function listAgents(req, res) {
   try {
-    const agents = await aiAgentService.listAgents();
+    const agents = await aiAgentService.listAgents(req.workspaceId);
 
     res.status(200).json({
       success: true,
@@ -17,7 +17,7 @@ async function listAgents(req, res) {
 
 async function getAgent(req, res) {
   try {
-    const agent = await aiAgentService.getAgentById(req.params.id);
+    const agent = await aiAgentService.getAgentById(req.workspaceId, req.params.id);
 
     if (!agent) {
       return res.status(404).json({
@@ -39,7 +39,7 @@ async function getAgent(req, res) {
 
 async function createAgent(req, res) {
   try {
-    const agent = await aiAgentService.createAgent({
+    const agent = await aiAgentService.createAgent(req.workspaceId, {
       ...req.body,
       createdBy: req.user?.id ?? req.body.createdBy ?? null,
     });
@@ -56,7 +56,7 @@ async function createAgent(req, res) {
 
 async function updateAgent(req, res) {
   try {
-    const agent = await aiAgentService.updateAgent(req.params.id, req.body);
+    const agent = await aiAgentService.updateAgent(req.workspaceId, req.params.id, req.body);
 
     res.status(200).json({
       success: true,
@@ -70,7 +70,7 @@ async function updateAgent(req, res) {
 
 async function deleteAgent(req, res) {
   try {
-    const deleted = await aiAgentService.deleteAgent(req.params.id);
+    const deleted = await aiAgentService.deleteAgent(req.workspaceId, req.params.id);
 
     res.status(200).json({
       success: true,

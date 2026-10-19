@@ -23,8 +23,10 @@ class GoogleCalendarService {
    * both required for Google to hand back a refresh_token every time — that
    * refresh_token is what keeps the connection alive indefinitely.
    */
-  getAuthUrl(agentId) {
+  async getAuthUrl(agentId, workspaceId, userId) {
     const id = normalizeAgentId(agentId);
+    const wsId = normalizeWorkspaceId(workspaceId);
+    await assertAgentInWorkspace(id, wsId);
     const params = new URLSearchParams({
       client_id: requireEnv("GOOGLE_CALENDAR_CLIENT_ID"),
       redirect_uri: requireEnv("GOOGLE_CALENDAR_REDIRECT_URI"),
@@ -33,7 +35,7 @@ class GoogleCalendarService {
       access_type: "offline",
       prompt: "consent",
       include_granted_scopes: "true",
-      state: signState(id),
+      state: signState(id, wsId, userId),
     });
 
     return `${GOOGLE_AUTH_URL}?${params.toString()}`;
@@ -71,7 +73,9 @@ class GoogleCalendarService {
   }
 
   async handleCallback(code, state) {
-    const agentId = verifyState(state);
+    // The workspace comes ONLY from the signed state: this endpoint has no session.
+    const { agentId, workspaceId } = verifyState(state);
+    await assertAgentInWorkspace(agentId, workspaceId);
     const tokens = await this.exchangeCodeForTokens(code);
     const accessToken = cleanString(tokens.access_token);
     const refreshToken = cleanString(tokens.refresh_token);
@@ -98,6 +102,7 @@ class GoogleCalendarService {
 
     const result = await db.query(
       `INSERT INTO calendar_connections (
+        workspace_id,
         ai_agent_id,
         provider,
         google_email,
@@ -111,7 +116,7 @@ class GoogleCalendarService {
         calendar_id,
         status
       )
-      VALUES ($1, 'google', $2, $3, $4, $5, $6, $7, $8, $9, 'primary', 'connected')
+      VALUES ($10, $1, 'google', $2, $3, $4, $5, $6, $7, $8, $9, 'primary', 'connected')
       ON CONFLICT (ai_agent_id, provider)
       DO UPDATE SET google_email = EXCLUDED.google_email,
                     access_token_encrypted = EXCLUDED.access_token_encrypted,
@@ -123,6 +128,7 @@ class GoogleCalendarService {
                     token_expiry = EXCLUDED.token_expiry,
                     status = 'connected',
                     updated_at = now()
+      WHERE calendar_connections.workspace_id = EXCLUDED.workspace_id
       RETURNING id, ai_agent_id, provider, google_email, status, created_at`,
       [
         agentId,
@@ -134,8 +140,15 @@ class GoogleCalendarService {
         encryptedRefresh.iv,
         encryptedRefresh.tag,
         expiry,
+        workspaceId,
       ]
     );
+
+    if (!result.rows[0]) {
+      const error = new Error("This agent already has a calendar connection that belongs to a different workspace.");
+      error.statusCode = 409;
+      throw error;
+    }
 
     return mapConnectionRow(result.rows[0]);
   }
@@ -162,7 +175,7 @@ class GoogleCalendarService {
     if (stillValid && storedAccessToken) return storedAccessToken;
 
     if (!connection.refresh_token_encrypted) {
-      await markRevoked(connection.id);
+      await markRevoked(connection.id, connection.workspace_id);
       throw buildRevokedError("This calendar connection has no refresh token. Reconnect the Google account.");
     }
 
@@ -178,7 +191,7 @@ class GoogleCalendarService {
       });
     } catch (error) {
       if (error.statusCode === 400 || error.googleError === "invalid_grant") {
-        await markRevoked(connection.id);
+        await markRevoked(connection.id, connection.workspace_id);
         throw buildRevokedError(
           "Google revoked access to this calendar. Reconnect the Google account to resume automatic booking."
         );
@@ -202,8 +215,8 @@ class GoogleCalendarService {
            token_expiry = $4,
            status = 'connected',
            updated_at = now()
-       WHERE id = $5`,
-      [encryptedAccess.encrypted, encryptedAccess.iv, encryptedAccess.tag, expiry, connection.id]
+       WHERE id = $5 AND workspace_id = $6`,
+      [encryptedAccess.encrypted, encryptedAccess.iv, encryptedAccess.tag, expiry, connection.id, connection.workspace_id]
     );
 
     // Keep the in-memory row in sync so a caller reusing it does not refresh twice.
@@ -215,14 +228,15 @@ class GoogleCalendarService {
     return accessToken;
   }
 
-  async listConnections(agentId) {
+  async listConnections(agentId, workspaceId) {
     const id = normalizeAgentId(agentId);
+    const wsId = normalizeWorkspaceId(workspaceId);
     const result = await db.query(
       `SELECT id, provider, google_email, status, created_at
        FROM calendar_connections
-       WHERE ai_agent_id = $1
+       WHERE ai_agent_id = $1 AND workspace_id = $2
        ORDER BY created_at DESC`,
-      [id]
+      [id, wsId]
     );
 
     return result.rows.map(mapConnectionRow);
@@ -232,15 +246,18 @@ class GoogleCalendarService {
    * Fetches the full (token-bearing) row for internal use. Never expose this
    * over HTTP — it carries the encrypted credential columns.
    */
-  async getConnectedForAgent(agentId) {
+  async getConnectedForAgent(agentId, workspaceId = null) {
+    // workspaceId is optional only for legacy callers: an agent belongs to exactly one workspace, so the
+    // agent-id lookup is already tenant-safe; when given, it is enforced as well.
     const result = await db.query(
       `SELECT *
        FROM calendar_connections
        WHERE ai_agent_id = $1
          AND provider = 'google'
          AND status = 'connected'
+         AND ($2::int IS NULL OR workspace_id = $2)
        LIMIT 1`,
-      [agentId]
+      [agentId, workspaceId]
     );
 
     return result.rows[0] || null;
@@ -251,8 +268,15 @@ class GoogleCalendarService {
    * revoke (already-revoked token, network blip) must not leave a dangling
    * connection the user cannot get rid of.
    */
-  async disconnectConnection(connectionId) {
-    const result = await db.query(`SELECT * FROM calendar_connections WHERE id = $1`, [connectionId]);
+  async disconnectConnection(connectionId, workspaceId) {
+    const wsId = normalizeWorkspaceId(workspaceId);
+    const id = Number(connectionId);
+    if (!Number.isInteger(id) || id <= 0) {
+      const error = new Error("A valid calendar connection id is required");
+      error.statusCode = 400;
+      throw error;
+    }
+    const result = await db.query(`SELECT * FROM calendar_connections WHERE id = $1 AND workspace_id = $2`, [id, wsId]);
     const connection = result.rows[0];
 
     if (!connection) {
@@ -279,7 +303,7 @@ class GoogleCalendarService {
       console.warn("Google token revoke failed, deleting the local connection anyway:", error.message);
     }
 
-    await db.query(`DELETE FROM calendar_connections WHERE id = $1`, [connectionId]);
+    await db.query(`DELETE FROM calendar_connections WHERE id = $1 AND workspace_id = $2`, [id, wsId]);
 
     return { id: connection.id, aiAgentId: connection.ai_agent_id, provider: connection.provider };
   }
@@ -305,12 +329,12 @@ async function googleTokenRequest(form) {
   return payload;
 }
 
-async function markRevoked(connectionId) {
+async function markRevoked(connectionId, workspaceId) {
   await db.query(
     `UPDATE calendar_connections
      SET status = 'revoked', updated_at = now()
-     WHERE id = $1`,
-    [connectionId]
+     WHERE id = $1 AND workspace_id = $2`,
+    [connectionId, workspaceId]
   );
 }
 
@@ -351,12 +375,41 @@ function normalizeAgentId(agentId) {
   return id;
 }
 
+function normalizeWorkspaceId(workspaceId) {
+  const id = Number(workspaceId);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    const error = new Error("No active workspace was found for this request. Select a workspace and try again.");
+    error.statusCode = 400;
+    error.code = "WORKSPACE_REQUIRED";
+    throw error;
+  }
+
+  return id;
+}
+
+async function assertAgentInWorkspace(agentId, workspaceId) {
+  const result = await db.query(
+    `SELECT 1 FROM ai_agents WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE`,
+    [agentId, workspaceId]
+  );
+
+  if (result.rowCount === 0) {
+    const error = new Error("This AI agent was not found in your workspace.");
+    error.statusCode = 404;
+    error.code = "AGENT_NOT_FOUND";
+    throw error;
+  }
+}
+
 /**
- * OAuth state is HMAC-signed so a caller cannot swap in another agent's id and
- * attach their Google account to an agent they do not control.
+ * OAuth state is HMAC-signed so a caller cannot swap in another agent's or
+ * workspace's id and attach their Google account somewhere they do not control.
+ * Format: agentId.workspaceId.userId.issuedAt.signature (userId is 0 when unknown).
  */
-function signState(agentId) {
-  const payload = `${agentId}.${Date.now()}`;
+function signState(agentId, workspaceId, userId) {
+  const uid = Number.isInteger(Number(userId)) && Number(userId) > 0 ? Number(userId) : 0;
+  const payload = `${agentId}.${workspaceId}.${uid}.${Date.now()}`;
   const signature = crypto.createHmac("sha256", getEncryptionKey()).update(payload).digest("hex");
   return Buffer.from(`${payload}.${signature}`, "utf8").toString("base64url");
 }
@@ -373,12 +426,12 @@ function verifyState(state) {
   }
 
   const parts = decoded.split(".");
-  if (parts.length !== 3) throw buildStateError();
+  if (parts.length !== 5) throw buildStateError();
 
-  const [agentId, issuedAt, signature] = parts;
+  const [agentId, workspaceId, userId, issuedAt, signature] = parts;
   const expected = crypto
     .createHmac("sha256", getEncryptionKey())
-    .update(`${agentId}.${issuedAt}`)
+    .update(`${agentId}.${workspaceId}.${userId}.${issuedAt}`)
     .digest("hex");
 
   const provided = Buffer.from(signature, "utf8");
@@ -392,7 +445,7 @@ function verifyState(state) {
     throw buildStateError("This Google Calendar connection link has expired. Start the connection again.");
   }
 
-  return normalizeAgentId(agentId);
+  return { agentId: normalizeAgentId(agentId), workspaceId: normalizeWorkspaceId(workspaceId), userId: Number(userId) || null };
 }
 
 function buildStateError(message) {

@@ -5,8 +5,8 @@ const eventLogService = require("./eventLog.service");
 const PLUSVIBE_API_BASE_URL = process.env.PLUSVIBE_API_BASE_URL || "https://api.plusvibe.ai";
 
 class PlusVibeService {
-  async getConnection() {
-    const integration = await getActiveIntegration();
+  async getConnection(workspaceId) {
+    const integration = await getActiveIntegration(workspaceId);
 
     if (!integration) {
       return buildDisconnectedState();
@@ -15,18 +15,20 @@ class PlusVibeService {
     return mapIntegrationRow(integration);
   }
 
-  async saveConnection(data) {
+  async saveConnection(workspaceId, data) {
     const startedAt = Date.now();
     const apiKey = cleanString(data.apiKey);
-    const workspaceId = cleanString(data.workspaceId);
+    const pvWorkspaceId = cleanString(data.workspaceId);
 
-    if (!workspaceId) {
+    if (!pvWorkspaceId) {
       const error = new Error("PlusVibe workspace ID is required");
       error.statusCode = 400;
       throw error;
     }
 
-    const existing = await getActiveIntegration();
+    await assertPlusVibeWorkspaceAvailable(pvWorkspaceId, workspaceId);
+
+    const existing = await getActiveIntegration(workspaceId);
     const encryptedKey = apiKey ? encrypt(apiKey) : null;
 
     if (!existing && !encryptedKey) {
@@ -36,7 +38,7 @@ class PlusVibeService {
     }
 
     const values = [
-      workspaceId,
+      pvWorkspaceId,
       cleanString(data.workspaceName),
       cleanString(data.apiKeyScope) || "workspace",
       cleanString(data.webhookEventType) || "ALL_EMAIL_REPLIES",
@@ -63,15 +65,16 @@ class PlusVibeService {
              webhook_status = CASE WHEN ($5)::varchar IS NULL THEN 'Not configured' ELSE webhook_status END,
              last_error = NULL,
              updated_at = NOW()
-         WHERE id = $${6 + keyValues.length} AND is_deleted = FALSE
+         WHERE id = $${6 + keyValues.length} AND app_workspace_id = $${7 + keyValues.length} AND is_deleted = FALSE
          RETURNING *`,
-        [...values.slice(0, 5), ...keyValues, existing.id]
+        [...values.slice(0, 5), ...keyValues, existing.id, workspaceId]
       );
 
       const mapped = mapIntegrationRow(result.rows[0]);
       await eventLogService.record({
         eventType: "plusvibe.connection.updated",
         source: "plusvibe",
+      appWorkspaceId: workspaceId,
         status: "Success",
         workspaceId: mapped.workspaceId,
         workspaceName: mapped.workspaceName,
@@ -100,17 +103,19 @@ class PlusVibeService {
         api_key_iv,
         api_key_tag,
         connection_status,
-        api_status
+        api_status,
+        app_workspace_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Configured', 'Not tested')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Configured', 'Not tested', $10)
       RETURNING *`,
-      [...values, encryptedKey.encrypted, encryptedKey.iv, encryptedKey.tag]
+      [...values, encryptedKey.encrypted, encryptedKey.iv, encryptedKey.tag, workspaceId]
     );
 
     const mapped = mapIntegrationRow(result.rows[0]);
     await eventLogService.record({
       eventType: "plusvibe.connection.created",
       source: "plusvibe",
+      appWorkspaceId: workspaceId,
       status: "Success",
       workspaceId: mapped.workspaceId,
       workspaceName: mapped.workspaceName,
@@ -126,14 +131,14 @@ class PlusVibeService {
     return mapped;
   }
 
-  async testConnection(data = {}) {
+  async testConnection(workspaceId, data = {}) {
     const startedAt = Date.now();
-    const integration = await getIntegrationOrThrow();
+    const integration = await getIntegrationOrThrow(workspaceId);
     const apiKey = cleanString(data.apiKey) || decrypt(integration);
     const workspace = await resolveWorkspace(apiKey, {
       workspaceId: cleanString(data.workspaceId) || integration.workspace_id,
       workspaceName: cleanString(data.workspaceName) || integration.workspace_name,
-    });
+    }, workspaceId);
 
     try {
       const [hooks, accounts] = await Promise.all([
@@ -155,9 +160,9 @@ class PlusVibeService {
              last_api_request = NOW(),
              last_error = NULL,
              updated_at = NOW()
-         WHERE id = $5
+         WHERE id = $5 AND app_workspace_id = $6
          RETURNING *`,
-        [workspace.id, workspace.name, webhookStatus, inboxes.length, integration.id]
+        [workspace.id, workspace.name, webhookStatus, inboxes.length, integration.id, workspaceId]
       );
 
       const mapped = {
@@ -167,6 +172,7 @@ class PlusVibeService {
       await eventLogService.record({
         eventType: "plusvibe.connection.tested",
         source: "plusvibe",
+      appWorkspaceId: workspaceId,
         status: "Success",
         workspaceId: mapped.workspaceId,
         workspaceName: mapped.workspaceName,
@@ -176,10 +182,11 @@ class PlusVibeService {
 
       return mapped;
     } catch (error) {
-      await markIntegrationFailure(integration.id, error.message);
+      await markIntegrationFailure(integration.id, error.message, workspaceId);
       await eventLogService.record({
         eventType: "plusvibe.connection.test_failed",
         source: "plusvibe",
+      appWorkspaceId: workspaceId,
         status: "Failed",
         workspaceId: integration.workspace_id,
         workspaceName: integration.workspace_name,
@@ -190,11 +197,11 @@ class PlusVibeService {
     }
   }
 
-  async refreshConnection() {
+  async refreshConnection(workspaceId) {
     const startedAt = Date.now();
-    const integration = await getIntegrationOrThrow();
+    const integration = await getIntegrationOrThrow(workspaceId);
     const apiKey = decrypt(integration);
-    const workspace = await resolveWorkspace(apiKey, integration);
+    const workspace = await resolveWorkspace(apiKey, integration, workspaceId);
 
     try {
       const [hooks, summary, accounts] = await Promise.all([
@@ -218,7 +225,7 @@ class PlusVibeService {
              last_sync_at = NOW(),
              last_error = NULL,
              updated_at = NOW()
-         WHERE id = $6
+         WHERE id = $6 AND app_workspace_id = $7
          RETURNING *`,
         [
           workspace.id,
@@ -227,6 +234,7 @@ class PlusVibeService {
           summary.total_campaigns ?? null,
           inboxes.length,
           integration.id,
+          workspaceId,
         ]
       );
 
@@ -242,6 +250,7 @@ class PlusVibeService {
       await eventLogService.record({
         eventType: "plusvibe.connection.refreshed",
         source: "plusvibe",
+      appWorkspaceId: workspaceId,
         status: "Success",
         workspaceId: mapped.workspaceId,
         workspaceName: mapped.workspaceName,
@@ -256,10 +265,11 @@ class PlusVibeService {
 
       return mapped;
     } catch (error) {
-      await markIntegrationFailure(integration.id, error.message);
+      await markIntegrationFailure(integration.id, error.message, workspaceId);
       await eventLogService.record({
         eventType: "plusvibe.connection.refresh_failed",
         source: "plusvibe",
+      appWorkspaceId: workspaceId,
         status: "Failed",
         workspaceId: integration.workspace_id,
         workspaceName: integration.workspace_name,
@@ -270,11 +280,11 @@ class PlusVibeService {
     }
   }
 
-  async listInboxes() {
+  async listInboxes(workspaceId) {
     const startedAt = Date.now();
-    const integration = await getIntegrationOrThrow();
+    const integration = await getIntegrationOrThrow(workspaceId);
     const apiKey = decrypt(integration);
-    const workspace = await resolveWorkspace(apiKey, integration);
+    const workspace = await resolveWorkspace(apiKey, integration, workspaceId);
 
     const accounts = await plusVibeRequest(`/api/v1/account/list?workspace_id=${encodeURIComponent(workspace.id)}`, apiKey);
     const inboxes = normalizeAccounts(accounts);
@@ -286,13 +296,14 @@ class PlusVibeService {
            connected_inboxes = $3,
            last_api_request = NOW(),
            updated_at = NOW()
-       WHERE id = $4`,
-      [workspace.id, workspace.name, inboxes.length, integration.id]
+       WHERE id = $4 AND app_workspace_id = $5`,
+      [workspace.id, workspace.name, inboxes.length, integration.id, workspaceId]
     );
 
     await eventLogService.record({
       eventType: "plusvibe.inboxes.listed",
       source: "plusvibe",
+      appWorkspaceId: workspaceId,
       status: "Success",
       workspaceId: workspace.id,
       workspaceName: workspace.name || integration.workspace_name,
@@ -303,25 +314,26 @@ class PlusVibeService {
     return inboxes;
   }
 
-  async listCampaigns() {
+  async listCampaigns(workspaceId) {
     const result = await db.query(
       `SELECT c.*,
               a.name AS assigned_agent_name,
               a.status AS assigned_agent_status
        FROM plusvibe_campaigns c
-       LEFT JOIN ai_agents a ON a.id = c.assigned_ai_agent_id
-       WHERE c.is_deleted = FALSE
-       ORDER BY c.last_lead_replied DESC NULLS LAST, c.updated_at DESC`
+       LEFT JOIN ai_agents a ON a.id = c.assigned_ai_agent_id AND a.workspace_id = c.workspace_id
+       WHERE c.workspace_id = $1 AND c.is_deleted = FALSE
+       ORDER BY c.last_lead_replied DESC NULLS LAST, c.updated_at DESC`,
+      [workspaceId]
     );
 
     return result.rows.map(mapCampaignRow);
   }
 
-  async syncCampaigns() {
+  async syncCampaigns(workspaceId) {
     const startedAt = Date.now();
-    const integration = await getIntegrationOrThrow();
+    const integration = await getIntegrationOrThrow(workspaceId);
     const apiKey = decrypt(integration);
-    const workspace = await resolveWorkspace(apiKey, integration);
+    const workspace = await resolveWorkspace(apiKey, integration, workspaceId);
     const payload = await plusVibeRequest(
       `/api/v1/campaign/list-all?workspace_id=${encodeURIComponent(workspace.id)}&skip=0&limit=100`,
       apiKey
@@ -343,9 +355,10 @@ class PlusVibeService {
             last_lead_sent,
             last_lead_replied,
             raw_payload,
-            last_synced_at
+            last_synced_at,
+            workspace_id
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9)
           ON CONFLICT (integration_id, plusvibe_campaign_id)
           DO UPDATE SET
             name = EXCLUDED.name,
@@ -366,6 +379,7 @@ class PlusVibeService {
             campaign.lastLeadSent,
             campaign.lastLeadReplied,
             campaign.raw,
+            workspaceId,
           ]
         );
       }
@@ -379,8 +393,8 @@ class PlusVibeService {
              last_sync_at = NOW(),
              last_error = NULL,
              updated_at = NOW()
-         WHERE id = $4`,
-        [workspace.id, workspace.name, campaigns.length, integration.id]
+         WHERE id = $4 AND app_workspace_id = $5`,
+        [workspace.id, workspace.name, campaigns.length, integration.id, workspaceId]
       );
 
       await client.query(
@@ -388,9 +402,10 @@ class PlusVibeService {
          SET is_deleted = TRUE,
              updated_at = NOW()
          WHERE integration_id = $1
+           AND workspace_id = $3
            AND is_deleted = FALSE
            AND NOT (plusvibe_campaign_id = ANY($2::varchar[]))`,
-        [integration.id, campaigns.map((campaign) => campaign.plusvibeCampaignId)]
+        [integration.id, campaigns.map((campaign) => campaign.plusvibeCampaignId), workspaceId]
       );
 
       await client.query("COMMIT");
@@ -404,6 +419,7 @@ class PlusVibeService {
     await eventLogService.record({
       eventType: "plusvibe.campaigns.synced",
       source: "plusvibe",
+      appWorkspaceId: workspaceId,
       status: "Success",
       workspaceId: workspace.id,
       workspaceName: workspace.name || integration.workspace_name,
@@ -411,14 +427,14 @@ class PlusVibeService {
       metadata: { syncedCampaigns: campaigns.length },
     });
 
-    return this.listCampaigns();
+    return this.listCampaigns(workspaceId);
   }
 
-  async assignCampaignAgent(campaignId, agentId) {
+  async assignCampaignAgent(workspaceId, campaignId, agentId) {
     if (agentId) {
       const agent = await db.query(
-        `SELECT id FROM ai_agents WHERE id = $1 AND is_deleted = FALSE`,
-        [agentId]
+        `SELECT id FROM ai_agents WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE`,
+        [agentId, workspaceId]
       );
 
       if (agent.rows.length === 0) {
@@ -432,9 +448,9 @@ class PlusVibeService {
       `UPDATE plusvibe_campaigns
        SET assigned_ai_agent_id = $1,
            updated_at = NOW()
-       WHERE id = $2 AND is_deleted = FALSE
+       WHERE id = $2 AND workspace_id = $3 AND is_deleted = FALSE
        RETURNING *`,
-      [agentId || null, campaignId]
+      [agentId || null, campaignId, workspaceId]
     );
 
     if (result.rows.length === 0) {
@@ -443,12 +459,13 @@ class PlusVibeService {
       throw error;
     }
 
-    const campaigns = await this.listCampaigns();
+    const campaigns = await this.listCampaigns(workspaceId);
     const campaign = campaigns.find((item) => item.id === Number(campaignId));
 
     await eventLogService.record({
       eventType: agentId ? "plusvibe.campaign.agent_assigned" : "plusvibe.campaign.agent_unassigned",
       source: "plusvibe",
+      appWorkspaceId: workspaceId,
       status: "Success",
       campaignId: campaign?.plusVibeCampaignId,
       campaignName: campaign?.name,
@@ -460,12 +477,13 @@ class PlusVibeService {
     return campaign;
   }
 
-  async getAuthorizedWorkspace() {
-    const integration = await getIntegrationOrThrow();
+  // workspaceId = the app tenant. The returned `workspace` is the PlusVibe workspace {id, name}.
+  async getAuthorizedWorkspace(workspaceId) {
+    const integration = await getIntegrationOrThrow(workspaceId);
     const apiKey = decrypt(integration);
-    const workspace = await resolveWorkspace(apiKey, integration);
+    const workspace = await resolveWorkspace(apiKey, integration, workspaceId);
 
-    return { integration, apiKey, workspace };
+    return { integration, apiKey, workspace, appWorkspaceId: integration.app_workspace_id };
   }
 
   async request(path, apiKey, options = {}) {
@@ -475,7 +493,10 @@ class PlusVibeService {
   async recordWebhook(payload) {
     const startedAt = Date.now();
     const workspaceId = cleanString(payload.workspace_id);
-    const integration = workspaceId ? await getIntegrationByWorkspace(workspaceId) : await getActiveIntegration();
+
+    // No session here: the tenant is whoever owns the integration for this PlusVibe workspace id.
+    const integration = await resolveWebhookIntegration(workspaceId);
+    const appWorkspaceId = integration.app_workspace_id;
 
     const result = await db.query(
       `INSERT INTO plusvibe_webhook_events (
@@ -488,12 +509,13 @@ class PlusVibeService {
         lead_email,
         thread_id,
         source_message_id,
-        payload
+        payload,
+        app_workspace_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING id, received_at`,
       [
-        integration?.id ?? null,
+        integration.id,
         cleanString(payload.webhook_id),
         cleanString(payload.webhook_event),
         workspaceId,
@@ -503,19 +525,18 @@ class PlusVibeService {
         cleanString(payload.thread_id ?? payload.source_thread_id),
         cleanString(payload.source_message_id),
         payload,
+        appWorkspaceId,
       ]
     );
 
-    if (integration) {
-      await db.query(
-        `UPDATE plusvibe_integrations
-         SET webhook_status = 'Receiving',
-             last_webhook_at = NOW(),
-             updated_at = NOW()
-         WHERE id = $1`,
-        [integration.id]
-      );
-    }
+    await db.query(
+      `UPDATE plusvibe_integrations
+       SET webhook_status = 'Receiving',
+           last_webhook_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1 AND app_workspace_id = $2`,
+      [integration.id, appWorkspaceId]
+    );
 
     const row = result.rows[0];
     await eventLogService.record({
@@ -523,7 +544,8 @@ class PlusVibeService {
       source: "plusvibe",
       status: "Success",
       workspaceId,
-      workspaceName: integration?.workspace_name,
+      appWorkspaceId,
+      workspaceName: integration.workspace_name,
       campaignId: cleanString(payload.campaign_id ?? payload.camp_id),
       leadEmail: cleanString(payload.email ?? payload.lead_email),
       threadId: cleanString(payload.thread_id ?? payload.source_thread_id),
@@ -536,27 +558,16 @@ class PlusVibeService {
       },
     });
 
-    return row;
+    return { ...row, appWorkspaceId };
   }
 }
 
-async function getActiveIntegration() {
+// The caller's own PlusVibe connection (app tenant = workspaceId).
+async function getActiveIntegration(workspaceId) {
   const result = await db.query(
     `SELECT *
      FROM plusvibe_integrations
-     WHERE is_deleted = FALSE
-     ORDER BY updated_at DESC
-     LIMIT 1`
-  );
-
-  return result.rows[0] || null;
-}
-
-async function getIntegrationByWorkspace(workspaceId) {
-  const result = await db.query(
-    `SELECT *
-     FROM plusvibe_integrations
-     WHERE workspace_id = $1 AND is_deleted = FALSE
+     WHERE app_workspace_id = $1 AND is_deleted = FALSE
      ORDER BY updated_at DESC
      LIMIT 1`,
     [workspaceId]
@@ -565,8 +576,63 @@ async function getIntegrationByWorkspace(workspaceId) {
   return result.rows[0] || null;
 }
 
-async function getIntegrationOrThrow() {
-  const integration = await getActiveIntegration();
+// Webhook side: match the PlusVibe workspace id from the payload against plusvibe_integrations.workspace_id.
+// (There is no webhook secret/token in this codebase to check.) A payload with no workspace id is only accepted
+// while a single integration exists in the whole system (the legacy single-tenant setup); otherwise it is
+// ambiguous and rejected. Throws without writing anything when nothing matches.
+async function resolveWebhookIntegration(pvWorkspaceId) {
+  let integration = null;
+
+  if (pvWorkspaceId) {
+    const result = await db.query(
+      `SELECT *
+       FROM plusvibe_integrations
+       WHERE workspace_id = $1 AND is_deleted = FALSE
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      [pvWorkspaceId]
+    );
+    integration = result.rows[0] || null;
+  } else {
+    const result = await db.query(`SELECT * FROM plusvibe_integrations WHERE is_deleted = FALSE LIMIT 2`);
+    integration = result.rows.length === 1 ? result.rows[0] : null;
+  }
+
+  if (!integration) {
+    const error = new Error(
+      pvWorkspaceId
+        ? "This PlusVibe workspace is not connected to any account, so the webhook was ignored."
+        : "The webhook did not include a PlusVibe workspace ID, so it could not be matched to an account."
+    );
+    error.statusCode = pvWorkspaceId ? 404 : 400;
+    throw error;
+  }
+
+  return integration;
+}
+
+// One PlusVibe workspace can only be connected by one app workspace, otherwise webhooks could not be routed
+// and one tenant could read another's replies.
+async function assertPlusVibeWorkspaceAvailable(pvWorkspaceId, appWorkspaceId) {
+  if (!pvWorkspaceId) return;
+
+  const result = await db.query(
+    `SELECT 1
+     FROM plusvibe_integrations
+     WHERE workspace_id = $1 AND app_workspace_id <> $2 AND is_deleted = FALSE
+     LIMIT 1`,
+    [pvWorkspaceId, appWorkspaceId]
+  );
+
+  if (result.rows.length > 0) {
+    const error = new Error("This PlusVibe workspace is already connected to another account.");
+    error.statusCode = 409;
+    throw error;
+  }
+}
+
+async function getIntegrationOrThrow(workspaceId) {
+  const integration = await getActiveIntegration(workspaceId);
 
   if (!integration) {
     const error = new Error("Configure PlusVibe before testing the connection");
@@ -577,7 +643,7 @@ async function getIntegrationOrThrow() {
   return integration;
 }
 
-async function resolveWorkspace(apiKey, input = {}) {
+async function resolveWorkspace(apiKey, input = {}, appWorkspaceId) {
   const requestedId = cleanString(input.workspaceId || input.workspace_id);
   const requestedName = cleanString(input.workspaceName || input.workspace_name);
   const payload = await plusVibeRequest("/api/v1/authenticate", apiKey);
@@ -604,10 +670,14 @@ async function resolveWorkspace(apiKey, input = {}) {
     throw error;
   }
 
-  return {
+  const resolved = {
     id: cleanString(workspace._id || workspace.id),
     name: cleanString(workspace.name),
   };
+
+  if (appWorkspaceId) await assertPlusVibeWorkspaceAvailable(resolved.id, appWorkspaceId);
+
+  return resolved;
 }
 
 async function plusVibeRequest(path, apiKey, options = {}) {
@@ -639,7 +709,7 @@ async function plusVibeRequest(path, apiKey, options = {}) {
   }
 }
 
-async function markIntegrationFailure(integrationId, message) {
+async function markIntegrationFailure(integrationId, message, appWorkspaceId) {
   await db.query(
     `UPDATE plusvibe_integrations
      SET connection_status = 'Error',
@@ -647,8 +717,8 @@ async function markIntegrationFailure(integrationId, message) {
          last_api_request = NOW(),
          last_error = $1,
          updated_at = NOW()
-     WHERE id = $2`,
-    [message, integrationId]
+     WHERE id = $2 AND app_workspace_id = $3`,
+    [message, integrationId, appWorkspaceId]
   );
 }
 

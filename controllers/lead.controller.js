@@ -2,7 +2,7 @@ const leadService = require("../services/lead.service");
 
 async function listPositiveLeads(req, res) {
   try {
-    const data = await leadService.listPositiveLeads(req.query);
+    const data = await leadService.listPositiveLeads(req.workspaceId);
 
     res.status(200).json({
       success: true,

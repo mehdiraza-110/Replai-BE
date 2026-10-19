@@ -60,41 +60,59 @@ class SesInboundEmailService {
     const bodyText = String(parsed.text || "").trim();
     const isOptOut = fromAddress ? suppressionService.isOptOutText(bodyText) : false;
 
+    // The tenant is the workspace of the mailbox the message was addressed to. Without exactly one
+    // matching mailbox there is no workspace to attribute it to, so nothing is written (the provider
+    // still gets a success response and does not retry).
+    const mailbox = toAddress ? await this.findMailboxByEmail(toAddress) : null;
+    if (!mailbox) {
+      console.warn(`Inbound email to "${toAddress || "unknown"}" ignored: the recipient is not an onboarded mailbox, so it cannot be assigned to a workspace.`);
+      return { status: "Ignored", reason: "Recipient does not match a mailbox in any workspace", fromAddress, toAddress, isOptOut };
+    }
+
     if (isOptOut) {
       await suppressionService.addSuppression({
         email: fromAddress,
         reason: "unsubscribed",
         source: "reply_keyword",
+        workspaceId: mailbox.workspace_id,
       });
     }
 
     await db.query(
-      `INSERT INTO inbound_messages (message_id, from_address, to_address, subject, body_text, s3_bucket, s3_key, is_opt_out)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [parsed.messageId || null, fromAddress, toAddress, parsed.subject || null, bodyText, bucket, key, isOptOut]
+      `INSERT INTO inbound_messages (workspace_id, message_id, from_address, to_address, subject, body_text, s3_bucket, s3_key, is_opt_out)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [mailbox.workspace_id, parsed.messageId || null, fromAddress, toAddress, parsed.subject || null, bodyText, bucket, key, isOptOut]
     );
 
-    if (toAddress && fromAddress) {
-      await this.recordInboxMessage({ fromAddress, toAddress, parsed, bodyText });
+    if (fromAddress) {
+      await this.recordInboxMessage({ mailbox, fromAddress, toAddress, parsed, bodyText });
     }
 
     return { status: "Processed", fromAddress, toAddress, isOptOut };
   }
 
-  async recordInboxMessage({ fromAddress, toAddress, parsed, bodyText }) {
-    const { rows: mailboxRows } = await db.query(`SELECT id FROM mailboxes WHERE email = $1 AND is_deleted = FALSE`, [toAddress]);
-    const mailbox = mailboxRows[0];
-    if (!mailbox) return; // Not one of our mailboxes (e.g. a bounce-routing address) — nothing to show in an inbox.
+  /** Mailbox emails are UNIQUE, so this is the single mailbox (and workspace) owning the address, or null. */
+  async findMailboxByEmail(email) {
+    const { rows } = await db.query(
+      `SELECT id, workspace_id FROM mailboxes WHERE email = $1 AND is_deleted = FALSE LIMIT 2`,
+      [email]
+    );
+    if (rows.length !== 1 || !rows[0].workspace_id) return null;
+    return rows[0];
+  }
+
+  async recordInboxMessage({ mailbox, fromAddress, toAddress, parsed, bodyText }) {
+    const workspaceId = mailbox.workspace_id;
 
     const { rows: leadRows } = await db.query(
-      `SELECT id, campaign_id, status FROM campaign_leads WHERE mailbox_id = $1 AND email = $2 ORDER BY sent_at DESC NULLS LAST LIMIT 1`,
-      [mailbox.id, fromAddress]
+      `SELECT id, campaign_id, status FROM campaign_leads WHERE mailbox_id = $1 AND email = $2 AND workspace_id = $3 ORDER BY sent_at DESC NULLS LAST LIMIT 1`,
+      [mailbox.id, fromAddress, workspaceId]
     );
     const lead = leadRows[0] || null;
 
     const { rows: insertedRows } = await db.query(
-      `INSERT INTO messages (mailbox_id, direction, campaign_id, campaign_lead_id, thread_id, message_id, in_reply_to, from_address, to_address, subject, body_text, body_html)
-       VALUES ($1, 'inbound', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      `INSERT INTO messages (workspace_id, mailbox_id, direction, campaign_id, campaign_lead_id, thread_id, message_id, in_reply_to, from_address, to_address, subject, body_text, body_html)
+       VALUES ($12, $1, 'inbound', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING id`,
       [
         mailbox.id,
@@ -108,12 +126,13 @@ class SesInboundEmailService {
         parsed.subject || null,
         bodyText,
         parsed.html || null,
+        workspaceId,
       ]
     );
 
     if (lead && lead.status !== "Replied") {
-      await db.query(`UPDATE campaign_leads SET status = 'Replied' WHERE id = $1`, [lead.id]);
-      await db.query(`UPDATE campaigns SET reply_count = reply_count + 1, updated_at = NOW() WHERE id = $1`, [lead.campaign_id]);
+      await db.query(`UPDATE campaign_leads SET status = 'Replied' WHERE id = $1 AND workspace_id = $2`, [lead.id, workspaceId]);
+      await db.query(`UPDATE campaigns SET reply_count = reply_count + 1, updated_at = NOW() WHERE id = $1 AND workspace_id = $2`, [lead.campaign_id, workspaceId]);
     }
 
     // Let the campaign's AI agent (if any) draft — or send — a reply. Fire-and-forget: a model

@@ -2,10 +2,15 @@ const db = require("../config/db.config");
 const realtimeService = require("./realtime.service");
 
 class EventLogService {
+  // NOTE: `workspaceId` / `workspace_id` on an event is the PLUSVIBE workspace id (event_logs.workspace_id).
+  // The app tenant is `appWorkspaceId` (event_logs.app_workspace_id). When it is omitted the column default applies,
+  // so callers outside the auto-responder (cold mailer) should pass it explicitly.
   async record(event = {}) {
     try {
+      const appWorkspaceId = event.appWorkspaceId ?? event.app_workspace_id ?? null;
       const result = await db.query(
         `INSERT INTO event_logs (
+          ${appWorkspaceId !== null ? "app_workspace_id," : ""}
           event_type,
           source,
           status,
@@ -24,7 +29,7 @@ class EventLogService {
           metadata,
           created_by
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        VALUES (${appWorkspaceId !== null ? "$18, " : ""}$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         RETURNING *`,
         [
           cleanString(event.eventType || event.event_type) || "system.event",
@@ -44,6 +49,7 @@ class EventLogService {
           cleanString(event.errorMessage || event.error_message),
           JSON.stringify(event.metadata || {}),
           event.createdBy || event.created_by || null,
+          ...(appWorkspaceId !== null ? [appWorkspaceId] : []),
         ]
       );
 
@@ -62,7 +68,7 @@ class EventLogService {
     }
   }
 
-  async list(query = {}) {
+  async list(workspaceId, query = {}) {
     const page = Math.max(1, Number.parseInt(query.page, 10) || 1);
     const limit = Math.min(Math.max(Number.parseInt(query.limit, 10) || 10, 1), 50);
     const offset = (page - 1) * limit;
@@ -71,11 +77,12 @@ class EventLogService {
       db.query(
         `SELECT *
          FROM event_logs
+         WHERE app_workspace_id = $1
          ORDER BY created_at DESC
-         LIMIT $1 OFFSET $2`,
-        [limit, offset]
+         LIMIT $2 OFFSET $3`,
+        [workspaceId, limit, offset]
       ),
-      db.query(`SELECT COUNT(*)::int AS count FROM event_logs`),
+      db.query(`SELECT COUNT(*)::int AS count FROM event_logs WHERE app_workspace_id = $1`, [workspaceId]),
     ]);
 
     const count = total.rows[0]?.count || 0;

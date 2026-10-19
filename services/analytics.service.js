@@ -4,11 +4,11 @@ const eventLogService = require("./eventLog.service");
 const DEFAULT_DAYS = 30;
 
 class AnalyticsService {
-  async getOverview(query = {}) {
+  async getOverview(workspaceId, query = {}) {
     const startedAt = Date.now();
     const range = normalizeRange(query);
-    const rangeParams = [range.startDate, range.endDate];
-    const comparisonParams = [range.startDate, range.endDate, range.previousStartDate];
+    const rangeParams = [range.startDate, range.endDate, workspaceId];
+    const comparisonParams = [range.startDate, range.endDate, range.previousStartDate, workspaceId];
 
     const [
       summary,
@@ -45,6 +45,7 @@ class AnalyticsService {
       eventType: "analytics.viewed",
       source: "analytics",
       status: "Success",
+      appWorkspaceId: workspaceId,
       durationMs: Date.now() - startedAt,
       metadata: { preset: range.preset, startDate: range.startDate, endDate: range.endDate },
     });
@@ -65,27 +66,28 @@ async function getSummary(params) {
          COUNT(*) FILTER (WHERE received_at >= (SELECT current_start FROM bounds) AND received_at < (SELECT current_end FROM bounds))::int AS current_count,
          COUNT(*) FILTER (WHERE received_at >= (SELECT previous_start FROM bounds) AND received_at < (SELECT current_start FROM bounds))::int AS previous_count
        FROM plusvibe_webhook_events
+       WHERE app_workspace_id = $4
      ),
      ai_sent AS (
        SELECT
          COUNT(*) FILTER (WHERE status = 'Sent' AND updated_at >= (SELECT current_start FROM bounds) AND updated_at < (SELECT current_end FROM bounds))::int AS current_count,
          COUNT(*) FILTER (WHERE status = 'Sent' AND updated_at >= (SELECT previous_start FROM bounds) AND updated_at < (SELECT current_start FROM bounds))::int AS previous_count
        FROM ai_response_drafts
-       WHERE is_deleted = FALSE
+       WHERE is_deleted = FALSE AND workspace_id = $4
      ),
      reviewed AS (
        SELECT
          COUNT(*) FILTER (WHERE created_at >= (SELECT current_start FROM bounds) AND created_at < (SELECT current_end FROM bounds))::int AS current_count,
          COUNT(*) FILTER (WHERE created_at >= (SELECT previous_start FROM bounds) AND created_at < (SELECT current_start FROM bounds))::int AS previous_count
        FROM event_logs
-       WHERE event_type IN ('ai.draft.approved_sent', 'ai.draft.rejected', 'plusvibe.reply.manual_sent')
+       WHERE app_workspace_id = $4 AND event_type IN ('ai.draft.approved_sent', 'ai.draft.rejected', 'plusvibe.reply.manual_sent')
      ),
      meetings AS (
        SELECT
          COUNT(*) FILTER (WHERE received_at >= (SELECT current_start FROM bounds) AND received_at < (SELECT current_end FROM bounds))::int AS current_count,
          COUNT(*) FILTER (WHERE received_at >= (SELECT previous_start FROM bounds) AND received_at < (SELECT current_start FROM bounds))::int AS previous_count
        FROM plusvibe_webhook_events
-       WHERE UPPER(REPLACE(REPLACE(COALESCE(payload->>'label', payload->>'event_type', payload->>'eventType', webhook_event, ''), '-', '_'), ' ', '_')) = 'MEETING_REQUEST'
+       WHERE app_workspace_id = $4 AND UPPER(REPLACE(REPLACE(COALESCE(payload->>'label', payload->>'event_type', payload->>'eventType', webhook_event, ''), '-', '_'), ' ', '_')) = 'MEETING_REQUEST'
      )
      SELECT json_build_array(
        json_build_object(
@@ -136,13 +138,14 @@ async function getWeeklyLoop(params) {
      incoming AS (
        SELECT date_trunc('day', received_at) AS day_start, COUNT(*)::int AS count
        FROM plusvibe_webhook_events
-       WHERE received_at >= $1::timestamptz AND received_at < $2::timestamptz
+       WHERE app_workspace_id = $3 AND received_at >= $1::timestamptz AND received_at < $2::timestamptz
        GROUP BY 1
      ),
      sent AS (
        SELECT date_trunc('day', updated_at) AS day_start, COUNT(*)::int AS count
        FROM ai_response_drafts
        WHERE status = 'Sent'
+         AND workspace_id = $3
          AND is_deleted = FALSE
          AND updated_at >= $1::timestamptz AND updated_at < $2::timestamptz
        GROUP BY 1
@@ -150,6 +153,7 @@ async function getWeeklyLoop(params) {
        SELECT date_trunc('day', created_at) AS day_start, COUNT(*)::int AS count
        FROM event_logs
        WHERE event_type = 'plusvibe.reply.manual_sent'
+         AND app_workspace_id = $3
          AND created_at >= $1::timestamptz AND created_at < $2::timestamptz
        GROUP BY 1
      ),
@@ -160,6 +164,7 @@ async function getWeeklyLoop(params) {
        SELECT date_trunc('day', created_at) AS day_start, COUNT(*)::int AS count
        FROM ai_response_drafts
        WHERE status IN ('Pending', 'Rejected')
+         AND workspace_id = $3
          AND is_deleted = FALSE
          AND created_at >= $1::timestamptz AND created_at < $2::timestamptz
        GROUP BY 1
@@ -192,7 +197,7 @@ async function getIntentMix(params) {
        SELECT UPPER(REPLACE(REPLACE(COALESCE(payload->>'label', payload->>'event_type', payload->>'eventType', webhook_event, ''), '-', '_'), ' ', '_')) AS label,
               COUNT(*)::int AS count
        FROM plusvibe_webhook_events
-       WHERE received_at >= $1::timestamptz AND received_at < $2::timestamptz
+       WHERE app_workspace_id = $3 AND received_at >= $1::timestamptz AND received_at < $2::timestamptz
        GROUP BY 1
      ),
      mapped AS (
@@ -235,22 +240,26 @@ async function getReviewTriggers(params) {
        WHERE confidence < 80
          AND created_at >= $1::timestamptz AND created_at < $2::timestamptz
          AND is_deleted = FALSE
+         AND workspace_id = $3
        UNION ALL
        SELECT 'AI provider fallback' AS label, COUNT(*)::int AS count
        FROM ai_response_drafts
        WHERE generation_error IS NOT NULL
          AND created_at >= $1::timestamptz AND created_at < $2::timestamptz
          AND is_deleted = FALSE
+         AND workspace_id = $3
        UNION ALL
        SELECT 'Rejected by reviewer' AS label, COUNT(*)::int AS count
        FROM ai_response_drafts
        WHERE status = 'Rejected'
          AND updated_at >= $1::timestamptz AND updated_at < $2::timestamptz
          AND is_deleted = FALSE
+         AND workspace_id = $3
        UNION ALL
        SELECT 'Manual reply used' AS label, COUNT(*)::int AS count
        FROM event_logs
        WHERE event_type = 'plusvibe.reply.manual_sent'
+         AND app_workspace_id = $3
          AND created_at >= $1::timestamptz AND created_at < $2::timestamptz
        UNION ALL
        SELECT 'Approval required' AS label, COUNT(*)::int AS count
@@ -258,6 +267,7 @@ async function getReviewTriggers(params) {
        WHERE status = 'Pending'
          AND created_at >= $1::timestamptz AND created_at < $2::timestamptz
          AND is_deleted = FALSE
+         AND workspace_id = $3
      ),
      totals AS (SELECT GREATEST(SUM(count), 1)::int AS total FROM triggers)
      SELECT label,
@@ -284,11 +294,13 @@ async function getTrainingImpact(params) {
        FROM ai_response_drafts
        WHERE created_at >= $1::timestamptz AND created_at < $2::timestamptz
          AND is_deleted = FALSE
+         AND workspace_id = $3
      ),
      draft_events AS (
        SELECT duration_ms
        FROM event_logs
        WHERE event_type IN ('ai.draft.generated', 'ai.draft.regenerated')
+         AND app_workspace_id = $3
          AND duration_ms IS NOT NULL
          AND created_at >= $1::timestamptz AND created_at < $2::timestamptz
      )
@@ -337,7 +349,7 @@ async function getAgentPerformance(params) {
             COUNT(d.id) FILTER (WHERE d.plusvibe_campaign_id IN (
               SELECT campaign_id
               FROM plusvibe_webhook_events
-              WHERE UPPER(REPLACE(REPLACE(COALESCE(payload->>'label', payload->>'event_type', payload->>'eventType', webhook_event, ''), '-', '_'), ' ', '_')) = 'MEETING_REQUEST'
+              WHERE app_workspace_id = $3 AND UPPER(REPLACE(REPLACE(COALESCE(payload->>'label', payload->>'event_type', payload->>'eventType', webhook_event, ''), '-', '_'), ' ', '_')) = 'MEETING_REQUEST'
                 AND received_at >= $1::timestamptz AND received_at < $2::timestamptz
             ))::int AS meetings,
             CASE
@@ -347,8 +359,8 @@ async function getAgentPerformance(params) {
               ELSE 'None'
             END AS review
      FROM ai_response_drafts d
-     LEFT JOIN ai_agents a ON a.id = d.ai_agent_id
-     WHERE d.created_at >= $1::timestamptz AND d.created_at < $2::timestamptz
+     LEFT JOIN ai_agents a ON a.id = d.ai_agent_id AND a.workspace_id = d.workspace_id
+     WHERE d.workspace_id = $3 AND d.created_at >= $1::timestamptz AND d.created_at < $2::timestamptz
        AND d.is_deleted = FALSE
      GROUP BY a.id, a.name, a.assigned_inbox_name
      ORDER BY replies DESC

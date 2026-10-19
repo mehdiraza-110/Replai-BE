@@ -7,14 +7,14 @@ const POSITIVE_LABELS = new Set(["INTERESTED", "MEETING_REQUEST", "QUESTION"]);
 const MAX_THREAD_SCAN = 250;
 
 class LeadService {
-  async listPositiveLeads() {
+  async listPositiveLeads(appWorkspaceId) {
     const startedAt = Date.now();
-    const { integration, apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace();
+    const { integration, apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace(appWorkspaceId);
     const threads = await fetchThreads(apiKey, workspace.id);
     const positiveThreads = threads.filter(isPositiveThread);
-    const campaignMap = await getCampaignMap(integration.id);
-    const profileMap = await leadProfileService.getByEmails(workspace.id, positiveThreads.map(getThreadLeadEmail));
-    const replyMap = await getReplyMap(positiveThreads.map((thread) => cleanString(thread.thread_id)));
+    const campaignMap = await getCampaignMap(integration.id, appWorkspaceId);
+    const profileMap = await leadProfileService.getByEmails(workspace.id, positiveThreads.map(getThreadLeadEmail), appWorkspaceId);
+    const replyMap = await getReplyMap(appWorkspaceId, positiveThreads.map((thread) => cleanString(thread.thread_id)));
 
     const items = positiveThreads
       .map((thread) => mapLead(thread, campaignMap, replyMap, profileMap))
@@ -36,6 +36,7 @@ class LeadService {
       source: "leads",
       status: "Success",
       workspaceId: workspace.id,
+      appWorkspaceId,
       workspaceName: integration.workspace_name,
       durationMs: Date.now() - startedAt,
       metadata: { count: items.length, scannedThreads: threads.length, positiveThreads: positiveThreads.length },
@@ -65,21 +66,21 @@ async function fetchThreads(apiKey, workspaceId) {
   return threads;
 }
 
-async function getCampaignMap(integrationId) {
+async function getCampaignMap(integrationId, appWorkspaceId) {
   const result = await db.query(
     `SELECT c.*,
             a.name AS assigned_agent_name,
             a.status AS assigned_agent_status
      FROM plusvibe_campaigns c
-     LEFT JOIN ai_agents a ON a.id = c.assigned_ai_agent_id
-     WHERE c.integration_id = $1 AND c.is_deleted = FALSE`,
-    [integrationId]
+     LEFT JOIN ai_agents a ON a.id = c.assigned_ai_agent_id AND a.workspace_id = c.workspace_id
+     WHERE c.integration_id = $1 AND c.workspace_id = $2 AND c.is_deleted = FALSE`,
+    [integrationId, appWorkspaceId]
   );
 
   return new Map(result.rows.map((row) => [row.plusvibe_campaign_id, row]));
 }
 
-async function getReplyMap(threadIds) {
+async function getReplyMap(appWorkspaceId, threadIds) {
   const ids = [...new Set(threadIds.filter(Boolean))];
   if (ids.length === 0) return new Map();
 
@@ -91,11 +92,12 @@ async function getReplyMap(threadIds) {
               d.updated_at,
               COALESCE(a.name, 'AI Agent') AS owner
        FROM ai_response_drafts d
-       LEFT JOIN ai_agents a ON a.id = d.ai_agent_id
+       LEFT JOIN ai_agents a ON a.id = d.ai_agent_id AND a.workspace_id = d.workspace_id
        WHERE d.thread_id = ANY($1::varchar[])
+         AND d.workspace_id = $2
          AND d.status = 'Sent'
          AND d.is_deleted = FALSE`,
-      [ids]
+      [ids, appWorkspaceId]
     ),
     db.query(
       `SELECT thread_id,
@@ -106,8 +108,9 @@ async function getReplyMap(threadIds) {
        FROM event_logs
        WHERE thread_id = ANY($1::varchar[])
          AND event_type = 'plusvibe.reply.manual_sent'
-         AND status = 'Success'`,
-      [ids]
+         AND status = 'Success'
+         AND app_workspace_id = $2`,
+      [ids, appWorkspaceId]
     ),
   ]);
 

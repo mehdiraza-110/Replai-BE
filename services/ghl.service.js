@@ -6,8 +6,8 @@ const GHL_API_BASE_URL = process.env.GHL_API_BASE_URL || "https://services.leadc
 const GHL_API_VERSION = process.env.GHL_API_VERSION || "2021-07-28";
 
 class GhlService {
-  async getConnection() {
-    const integration = await getActiveIntegration();
+  async getConnection(workspaceId) {
+    const integration = await getActiveIntegration(workspaceId);
 
     if (!integration) {
       return buildDisconnectedState();
@@ -16,7 +16,7 @@ class GhlService {
     return mapIntegrationRow(integration);
   }
 
-  async saveConnection(data) {
+  async saveConnection(workspaceId, data) {
     const startedAt = Date.now();
     const apiKey = cleanString(data.apiKey);
     const locationId = cleanString(data.locationId);
@@ -27,7 +27,7 @@ class GhlService {
       throw error;
     }
 
-    const existing = await getActiveIntegration();
+    const existing = await getActiveIntegration(workspaceId);
     const encryptedKey = apiKey ? encrypt(apiKey) : null;
 
     if (!existing && !encryptedKey) {
@@ -51,15 +51,16 @@ class GhlService {
              api_status = 'Not tested',
              last_error = NULL,
              updated_at = NOW()
-         WHERE id = $${4 + keyValues.length} AND is_deleted = FALSE
+         WHERE id = $${4 + keyValues.length} AND workspace_id = $${5 + keyValues.length} AND is_deleted = FALSE
          RETURNING *`,
-        [...values.slice(0, 2), ...keyValues, existing.id]
+        [...values.slice(0, 2), ...keyValues, existing.id, workspaceId]
       );
 
       const mapped = mapIntegrationRow(result.rows[0]);
       await eventLogService.record({
         eventType: "ghl.connection.updated",
         source: "ghl",
+        appWorkspaceId: workspaceId,
         status: "Success",
         workspaceId: mapped.locationId,
         workspaceName: mapped.locationName,
@@ -80,17 +81,19 @@ class GhlService {
         api_key_iv,
         api_key_tag,
         connection_status,
-        api_status
+        api_status,
+        workspace_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, 'Configured', 'Not tested')
+      VALUES ($1, $2, $3, $4, $5, $6, 'Configured', 'Not tested', $7)
       RETURNING *`,
-      [...values, encryptedKey.encrypted, encryptedKey.iv, encryptedKey.tag]
+      [...values, encryptedKey.encrypted, encryptedKey.iv, encryptedKey.tag, workspaceId]
     );
 
     const mapped = mapIntegrationRow(result.rows[0]);
     await eventLogService.record({
       eventType: "ghl.connection.created",
       source: "ghl",
+      appWorkspaceId: workspaceId,
       status: "Success",
       workspaceId: mapped.locationId,
       workspaceName: mapped.locationName,
@@ -102,9 +105,9 @@ class GhlService {
     return mapped;
   }
 
-  async testConnection(data = {}) {
+  async testConnection(workspaceId, data = {}) {
     const startedAt = Date.now();
-    const integration = await getIntegrationOrThrow();
+    const integration = await getIntegrationOrThrow(workspaceId);
     const apiKey = cleanString(data.apiKey) || decrypt(integration);
     const locationId = cleanString(data.locationId) || integration.location_id;
 
@@ -121,15 +124,16 @@ class GhlService {
              last_api_request = NOW(),
              last_error = NULL,
              updated_at = NOW()
-         WHERE id = $3
+         WHERE id = $3 AND workspace_id = $4
          RETURNING *`,
-        [locationId, locationName, integration.id]
+        [locationId, locationName, integration.id, workspaceId]
       );
 
       const mapped = mapIntegrationRow(result.rows[0]);
       await eventLogService.record({
         eventType: "ghl.connection.tested",
         source: "ghl",
+        appWorkspaceId: workspaceId,
         status: "Success",
         workspaceId: mapped.locationId,
         workspaceName: mapped.locationName,
@@ -139,10 +143,11 @@ class GhlService {
 
       return mapped;
     } catch (error) {
-      await markIntegrationFailure(integration.id, error.message);
+      await markIntegrationFailure(integration.id, error.message, workspaceId);
       await eventLogService.record({
         eventType: "ghl.connection.test_failed",
         source: "ghl",
+        appWorkspaceId: workspaceId,
         status: "Failed",
         workspaceId: integration.location_id,
         workspaceName: integration.location_name,
@@ -159,13 +164,15 @@ class GhlService {
    * Never throws — a misconfigured or unreachable GHL connection should not block
    * the reply from being sent to the lead through the primary channel.
    */
-  async syncLeadConversation({ leadEmail, leadName, subject, body, direction = "outbound" }) {
+  async syncLeadConversation({ workspaceId, leadEmail, leadName, subject, body, direction = "outbound" }) {
     const startedAt = Date.now();
     const email = cleanString(leadEmail);
 
     if (!email) return { synced: false, reason: "missing_lead_email" };
 
-    const integration = await getActiveIntegration();
+    if (!workspaceId) return { synced: false, reason: "missing_workspace" };
+
+    const integration = await getActiveIntegration(workspaceId);
     if (!integration || integration.connection_status !== "Connected") {
       return { synced: false, reason: "not_connected" };
     }
@@ -204,13 +211,14 @@ class GhlService {
              last_sync_at = NOW(),
              last_error = NULL,
              updated_at = NOW()
-         WHERE id = $1`,
-        [integration.id]
+         WHERE id = $1 AND workspace_id = $2`,
+        [integration.id, workspaceId]
       );
 
       await eventLogService.record({
         eventType: "ghl.conversation.synced",
         source: "ghl",
+        appWorkspaceId: workspaceId,
         status: "Success",
         workspaceId: integration.location_id,
         workspaceName: integration.location_name,
@@ -221,10 +229,11 @@ class GhlService {
 
       return { synced: true, contactId };
     } catch (error) {
-      await markIntegrationFailure(integration.id, error.message);
+      await markIntegrationFailure(integration.id, error.message, workspaceId);
       await eventLogService.record({
         eventType: "ghl.conversation.sync_failed",
         source: "ghl",
+        appWorkspaceId: workspaceId,
         status: "Failed",
         workspaceId: integration.location_id,
         workspaceName: integration.location_name,
@@ -238,20 +247,21 @@ class GhlService {
   }
 }
 
-async function getActiveIntegration() {
+async function getActiveIntegration(workspaceId) {
   const result = await db.query(
     `SELECT *
      FROM ghl_integrations
-     WHERE is_deleted = FALSE
+     WHERE workspace_id = $1 AND is_deleted = FALSE
      ORDER BY updated_at DESC
-     LIMIT 1`
+     LIMIT 1`,
+    [workspaceId]
   );
 
   return result.rows[0] || null;
 }
 
-async function getIntegrationOrThrow() {
-  const integration = await getActiveIntegration();
+async function getIntegrationOrThrow(workspaceId) {
+  const integration = await getActiveIntegration(workspaceId);
 
   if (!integration) {
     const error = new Error("Configure GHL before testing the connection");
@@ -292,7 +302,7 @@ async function ghlRequest(path, apiKey, options = {}) {
   }
 }
 
-async function markIntegrationFailure(integrationId, message) {
+async function markIntegrationFailure(integrationId, message, workspaceId) {
   await db.query(
     `UPDATE ghl_integrations
      SET connection_status = 'Error',
@@ -300,8 +310,8 @@ async function markIntegrationFailure(integrationId, message) {
          last_api_request = NOW(),
          last_error = $1,
          updated_at = NOW()
-     WHERE id = $2`,
-    [message, integrationId]
+     WHERE id = $2 AND workspace_id = $3`,
+    [message, integrationId, workspaceId]
   );
 }
 

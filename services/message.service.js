@@ -10,9 +10,9 @@ const meetingBookingService = require("./meetingBooking.service");
 const MEETING_OBJECTIVE = "schedule a meeting";
 
 class MessageService {
-  async listConversations(query = {}) {
+  async listConversations(workspaceId, query = {}) {
     const startedAt = Date.now();
-    const { integration, apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace();
+    const { integration, apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace(workspaceId);
     const limit = clampLimit(query.limit, 20);
     const pageTrail = cleanString(query.pageTrail) || "";
     const params = new URLSearchParams({
@@ -32,8 +32,8 @@ class MessageService {
 
     const payload = await plusVibeService.request(`/api/v1/unibox/threads?${params.toString()}`, apiKey);
     const threads = Array.isArray(payload.data) ? payload.data : [];
-    const campaignMap = await getCampaignMap(integration.id);
-    const profileMap = await getProfileMap(workspace.id, threads);
+    const campaignMap = await getCampaignMap(integration.id, workspaceId);
+    const profileMap = await getProfileMap(workspace.id, threads, workspaceId);
 
     const data = {
       items: threads.map((thread) => mapThread(thread, campaignMap, profileMap)),
@@ -44,6 +44,7 @@ class MessageService {
     await eventLogService.record({
       eventType: "messages.conversations.listed",
       source: "messages",
+      appWorkspaceId: workspaceId,
       status: "Success",
       workspaceId: workspace.id,
       workspaceName: integration.workspace_name,
@@ -54,9 +55,9 @@ class MessageService {
     return data;
   }
 
-  async getConversation(threadId) {
+  async getConversation(workspaceId, threadId) {
     const startedAt = Date.now();
-    const { integration, apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace();
+    const { integration, apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace(workspaceId);
     const params = new URLSearchParams({
       workspace_id: workspace.id,
       thread_id: threadId,
@@ -76,14 +77,15 @@ class MessageService {
       .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
     const latestInboundMessage = latestInbound ? mapMessage(latestInbound, { connectedInbox, leadEmail }) : null;
     const campaignId = cleanString(latestInbound?.campaign_id || remoteMessages[0]?.campaign_id);
-    const campaign = await getCampaignWithAgent(integration.id, campaignId);
+    const campaign = await getCampaignWithAgent(integration.id, campaignId, workspaceId);
     const draft = latestInbound && campaign?.assigned_ai_agent_id
-      ? await getExistingDraft(latestInbound.thread_id, latestInbound.id || latestInbound.message_id)
+      ? await getExistingDraft(workspaceId, latestInbound.thread_id, latestInbound.id || latestInbound.message_id)
       : null;
     const leadName = latestInboundMessage?.sender || nameFromEmail(leadEmail);
 
     await leadProfileService.upsert({
       workspaceId: workspace.id,
+      appWorkspaceId: workspaceId,
       leadEmail,
       leadName,
       threadId,
@@ -112,6 +114,7 @@ class MessageService {
     await eventLogService.record({
       eventType: "messages.conversation.opened",
       source: "messages",
+      appWorkspaceId: workspaceId,
       status: "Success",
       workspaceId: workspace.id,
       workspaceName: integration.workspace_name,
@@ -130,9 +133,9 @@ class MessageService {
     return data;
   }
 
-  async generateDraft(threadId, options = {}) {
+  async generateDraft(workspaceId, threadId, options = {}) {
     const startedAt = Date.now();
-    const { integration, apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace();
+    const { integration, apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace(workspaceId);
     const params = new URLSearchParams({
       workspace_id: workspace.id,
       thread_id: threadId,
@@ -149,7 +152,7 @@ class MessageService {
     }
 
     const campaignId = cleanString(latestInbound.campaign_id || remoteMessages[0]?.campaign_id);
-    const campaign = await getCampaignWithAgent(integration.id, campaignId);
+    const campaign = await getCampaignWithAgent(integration.id, campaignId, workspaceId);
 
     if (!campaign?.assigned_ai_agent_id) {
       const error = new Error("Assign an AI agent to this campaign before generating a draft");
@@ -157,13 +160,14 @@ class MessageService {
       throw error;
     }
 
-    const draft = await ensureDraft(integration.id, campaign, latestInbound, remoteMessages, {
+    const draft = await ensureDraft(workspaceId, integration.id, campaign, latestInbound, remoteMessages, {
       force: Boolean(options.regenerate),
     });
 
     await eventLogService.record({
       eventType: options.regenerate ? "ai.draft.regenerated" : "ai.draft.generated",
       source: "ai",
+      appWorkspaceId: workspaceId,
       status: "Success",
       workspaceId: workspace.id,
       workspaceName: integration.workspace_name,
@@ -182,7 +186,7 @@ class MessageService {
     return draft;
   }
 
-  async generateDraftFromWebhook(payload = {}) {
+  async generateDraftFromWebhook(workspaceId, payload = {}) {
     const startedAt = Date.now();
     const threadId = getWebhookThreadId(payload);
     const webhookLabel = normalizeWebhookLabel(payload.label || payload.reply_label || payload.intent || payload.webhook_event || payload.event_type || payload.eventType);
@@ -191,6 +195,7 @@ class MessageService {
       await eventLogService.record({
         eventType: "ai.draft.webhook_skipped",
         source: "webhook",
+        appWorkspaceId: workspaceId,
         status: "Skipped",
         durationMs: Date.now() - startedAt,
         metadata: { reason: "missing_thread_id", webhookLabel },
@@ -203,6 +208,7 @@ class MessageService {
       await eventLogService.record({
         eventType: "ai.draft.webhook_skipped",
         source: "webhook",
+        appWorkspaceId: workspaceId,
         status: "Skipped",
         threadId,
         durationMs: Date.now() - startedAt,
@@ -212,7 +218,7 @@ class MessageService {
       return { status: "Skipped", reason: "The webhook reply was not marked as positive" };
     }
 
-    const { integration, apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace();
+    const { integration, apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace(workspaceId);
     const params = new URLSearchParams({
       workspace_id: workspace.id,
       thread_id: threadId,
@@ -227,6 +233,7 @@ class MessageService {
       await eventLogService.record({
         eventType: "ai.draft.webhook_skipped",
         source: "webhook",
+        appWorkspaceId: workspaceId,
         status: "Skipped",
         workspaceId: workspace.id,
         workspaceName: integration.workspace_name,
@@ -239,12 +246,13 @@ class MessageService {
     }
 
     const campaignId = cleanString(latestInbound.campaign_id || payload.campaign_id || payload.campaignId || remoteMessages[0]?.campaign_id);
-    const campaign = await getCampaignWithAgent(integration.id, campaignId);
+    const campaign = await getCampaignWithAgent(integration.id, campaignId, workspaceId);
     const mappedInbound = mapMessage(latestInbound);
     const leadEmail = extractEmailAddress(latestInbound.lead || latestInbound.from_address_email || mappedInbound.fromEmail);
 
     await leadProfileService.upsert({
       workspaceId: workspace.id,
+      appWorkspaceId: workspaceId,
       leadEmail,
       leadName: mappedInbound.sender || nameFromEmail(leadEmail),
       threadId,
@@ -256,6 +264,7 @@ class MessageService {
       await eventLogService.record({
         eventType: "ai.draft.webhook_skipped",
         source: "webhook",
+        appWorkspaceId: workspaceId,
         status: "Skipped",
         workspaceId: workspace.id,
         workspaceName: integration.workspace_name,
@@ -271,11 +280,12 @@ class MessageService {
       return { status: "Skipped", reason: "No AI agent is assigned to this campaign" };
     }
 
-    const draft = await ensureDraft(integration.id, campaign, latestInbound, remoteMessages, { force: false });
+    const draft = await ensureDraft(workspaceId, integration.id, campaign, latestInbound, remoteMessages, { force: false });
 
     await eventLogService.record({
       eventType: "ai.draft.webhook_generated",
       source: "webhook",
+      appWorkspaceId: workspaceId,
       status: "Success",
       workspaceId: workspace.id,
       workspaceName: integration.workspace_name,
@@ -294,7 +304,7 @@ class MessageService {
     return { status: "Generated", draft };
   }
 
-  async rejectDraft(draftId) {
+  async rejectDraft(workspaceId, draftId) {
     // Atomic, race-safe: the WHERE status = 'Pending' guard means concurrent
     // approve/reject calls on the same draft serialize on Postgres's row lock —
     // whichever statement commits first wins, and the loser matches 0 rows here
@@ -303,19 +313,20 @@ class MessageService {
       `UPDATE ai_response_drafts
        SET status = 'Rejected',
            updated_at = NOW()
-       WHERE id = $1 AND is_deleted = FALSE AND status = 'Pending'
+       WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE AND status = 'Pending'
        RETURNING *`,
-      [draftId]
+      [draftId, workspaceId]
     );
 
     if (result.rows.length === 0) {
-      throw await buildAlreadyHandledError(draftId);
+      throw await buildAlreadyHandledError(workspaceId, draftId);
     }
 
     const draft = mapDraft(result.rows[0]);
     await eventLogService.record({
       eventType: "ai.draft.rejected",
       source: "ai",
+      appWorkspaceId: workspaceId,
       status: "Success",
       threadId: draft.threadId,
       draftId: draft.id,
@@ -328,9 +339,9 @@ class MessageService {
     return draft;
   }
 
-  async sendManualReply(threadId, payload) {
+  async sendManualReply(workspaceId, threadId, payload) {
     const startedAt = Date.now();
-    const conversation = await this.getConversation(threadId);
+    const conversation = await this.getConversation(workspaceId, threadId);
     const lastMessage = [...conversation.messages].reverse().find((message) => message.from === "prospect" && message.replyToId);
     const replyToId = cleanString(payload.replyToId) || lastMessage?.replyToId;
     const fallbackFrom = lastMessage?.toEmail || conversation.aiDraft?.from || [...conversation.messages].reverse().find((message) => message.from === "human" && message.fromEmail)?.fromEmail;
@@ -342,6 +353,7 @@ class MessageService {
     }
 
     const sent = await sendReply({
+      workspaceId,
       replyToId,
       subject: cleanString(payload.subject) || buildReplySubject(lastMessage?.subject),
       from: cleanString(payload.from) || fallbackFrom,
@@ -352,6 +364,7 @@ class MessageService {
     await eventLogService.record({
       eventType: "plusvibe.reply.manual_sent",
       source: "plusvibe",
+      appWorkspaceId: workspaceId,
       status: "Success",
       campaignId: conversation.campaign?.plusVibeCampaignId,
       campaignName: conversation.campaign?.name,
@@ -367,7 +380,7 @@ class MessageService {
     return { status: "Sent", remoteMessageId: sent.id || null };
   }
 
-  async approveDraft(draftId, override = {}) {
+  async approveDraft(workspaceId, draftId, override = {}) {
     const startedAt = Date.now();
 
     // Race-safe against a concurrent approve/reject on the same draft: SELECT ...
@@ -386,9 +399,9 @@ class MessageService {
       const result = await client.query(
         `SELECT *
          FROM ai_response_drafts
-         WHERE id = $1 AND is_deleted = FALSE
+         WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE
          FOR UPDATE`,
-        [draftId]
+        [draftId, workspaceId]
       );
 
       if (result.rows.length === 0) {
@@ -400,7 +413,7 @@ class MessageService {
       draft = result.rows[0];
 
       if (draft.status !== "Pending") {
-        throw await buildAlreadyHandledError(draftId, draft.status);
+        throw await buildAlreadyHandledError(workspaceId, draftId, draft.status);
       }
 
       // Drafts for native (Maildoso) inboxes are sent from the owning mailbox over SMTP,
@@ -408,6 +421,7 @@ class MessageService {
       sent = draft.source === "native"
         ? await require("./nativeAgentReply.service").sendDraft(draft, { body: cleanString(override.body) })
         : await sendReply({
+            workspaceId,
             replyToId: draft.reply_to_message_id,
             subject: cleanString(override.subject) || draft.subject,
             from: cleanString(override.from) || draft.from_email,
@@ -421,9 +435,9 @@ class MessageService {
              body = $1,
              sent_message_id = $2,
              updated_at = NOW()
-         WHERE id = $3
+         WHERE id = $3 AND workspace_id = $4
          RETURNING *`,
-        [cleanString(override.body) || draft.body, sent.id || null, draftId]
+        [cleanString(override.body) || draft.body, sent.id || null, draftId, workspaceId]
       );
 
       await client.query("COMMIT");
@@ -438,6 +452,7 @@ class MessageService {
     await eventLogService.record({
       eventType: "ai.draft.approved_sent",
       source: "plusvibe",
+      appWorkspaceId: workspaceId,
       status: "Success",
       campaignId: mapped.campaignId,
       aiAgentId: mapped.aiAgentId,
@@ -453,6 +468,7 @@ class MessageService {
     // ghlService swallows its own failures and never throws, so this never
     // blocks or fails the approval flow.
     ghlService.syncLeadConversation({
+      workspaceId,
       leadEmail: mapped.leadEmail,
       subject: mapped.subject,
       body: mapped.body,
@@ -463,32 +479,34 @@ class MessageService {
   }
 }
 
-async function getExistingDraft(threadId, replyToMessageId) {
+async function getExistingDraft(workspaceId, threadId, replyToMessageId) {
   const existing = await db.query(
     `SELECT *
      FROM ai_response_drafts
      WHERE thread_id = $1
        AND reply_to_message_id = $2
+       AND workspace_id = $3
        AND is_deleted = FALSE
      ORDER BY updated_at DESC
      LIMIT 1`,
-    [threadId, cleanString(replyToMessageId)]
+    [threadId, cleanString(replyToMessageId), workspaceId]
   );
 
   return existing.rows[0] ? mapDraft(existing.rows[0]) : null;
 }
 
-async function ensureDraft(integrationId, campaign, latestInbound, remoteMessages, options = {}) {
+async function ensureDraft(workspaceId, integrationId, campaign, latestInbound, remoteMessages, options = {}) {
   const replyToMessageId = cleanString(latestInbound.id || latestInbound.message_id);
   const existing = await db.query(
     `SELECT *
      FROM ai_response_drafts
      WHERE thread_id = $1
        AND reply_to_message_id = $2
+       AND workspace_id = $3
        AND is_deleted = FALSE
      ORDER BY updated_at DESC
      LIMIT 1`,
-    [latestInbound.thread_id, replyToMessageId]
+    [latestInbound.thread_id, replyToMessageId, workspaceId]
   );
 
   if (existing.rows[0] && !options.force) return mapDraft(existing.rows[0]);
@@ -500,9 +518,9 @@ async function ensureDraft(integrationId, campaign, latestInbound, remoteMessage
   }
 
   const agent = campaign;
-  const promptContext = await buildPromptContext(agent, latestInbound, remoteMessages);
+  const promptContext = await buildPromptContext(workspaceId, agent, latestInbound, remoteMessages);
   const meetingOffer = isMeetingObjective(agent)
-    ? await meetingBookingService.getActiveOffer(latestInbound.thread_id).catch(() => null)
+    ? await meetingBookingService.getActiveOffer(latestInbound.thread_id, workspaceId).catch(() => null)
     : null;
 
   // Tell the model which slots the lead was offered so it can spot their pick.
@@ -546,9 +564,10 @@ async function ensureDraft(integrationId, campaign, latestInbound, remoteMessage
       confidence,
       generated_by,
       generation_error,
-      raw_context
+      raw_context,
+      workspace_id
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
     ON CONFLICT (thread_id, reply_to_message_id)
     DO UPDATE SET body = EXCLUDED.body,
                   confidence = EXCLUDED.confidence,
@@ -557,6 +576,7 @@ async function ensureDraft(integrationId, campaign, latestInbound, remoteMessage
                   generation_error = EXCLUDED.generation_error,
                   raw_context = EXCLUDED.raw_context,
                   updated_at = NOW()
+    WHERE ai_response_drafts.workspace_id = EXCLUDED.workspace_id
     RETURNING *`,
     [
       integrationId,
@@ -573,8 +593,16 @@ async function ensureDraft(integrationId, campaign, latestInbound, remoteMessage
       generation.generatedBy,
       generation.error,
       promptContext,
+      workspaceId,
     ]
   );
+
+  if (result.rows.length === 0) {
+    // The conflicting (thread, message) draft belongs to another workspace; never touch it.
+    const error = new Error("A draft for this message could not be created. Please try again.");
+    error.statusCode = 409;
+    throw error;
+  }
 
   return mapDraft(result.rows[0]);
 }
@@ -735,13 +763,15 @@ function describePersona(agent) {
  */
 async function applyMeetingBooking(agent, draftReply, { threadId, leadEmail, leadName, offer, selectedSlot }) {
   const timezone = agent.agent_timezone || "UTC";
+  // The agent row is a campaign+agent row (or the native equivalent) and carries the owning workspace.
+  const workspaceId = agent.workspace_id;
   let slotTaken = false;
 
   try {
     // One meeting per thread: a later "thanks!" must not trigger another offer.
-    if (await meetingBookingService.hasBooking(threadId)) return draftReply;
+    if (await meetingBookingService.hasBooking(threadId, workspaceId)) return draftReply;
 
-    const connection = await googleCalendarService.getConnectedForAgent(agent.assigned_ai_agent_id);
+    const connection = await googleCalendarService.getConnectedForAgent(agent.assigned_ai_agent_id, workspaceId);
 
     if (connection) {
       const chosen = offer && selectedSlot ? offer.slots[selectedSlot - 1] : null;
@@ -757,7 +787,7 @@ async function applyMeetingBooking(agent, draftReply, { threadId, leadEmail, lea
           );
 
           if (booking.success) {
-            await meetingBookingService.markOfferAccepted(offer.id);
+            await meetingBookingService.markOfferAccepted(offer.id, workspaceId);
 
             const when = describeSlot(booking.startTime, timezone);
             const instruction = [
@@ -780,7 +810,7 @@ async function applyMeetingBooking(agent, draftReply, { threadId, leadEmail, lea
       }
 
       const slots = await meetingBookingService.findFreeSlots(agent, connection, {
-        excludeStarts: await meetingBookingService.getOfferedStarts(threadId),
+        excludeStarts: await meetingBookingService.getOfferedStarts(threadId, workspaceId),
       });
 
       if (slots.length > 0) {
@@ -789,6 +819,7 @@ async function applyMeetingBooking(agent, draftReply, { threadId, leadEmail, lea
           threadId,
           leadEmail,
           slots,
+          workspaceId,
         });
 
         const labels = slots.map((slot) => describeSlot(slot.startTime, timezone));
@@ -855,14 +886,14 @@ function formatMeetingTime(startTime, timezone) {
   }
 }
 
-async function sendReply({ replyToId, subject, from, to, body }) {
+async function sendReply({ workspaceId, replyToId, subject, from, to, body }) {
   if (!body) {
     const error = new Error("Reply body is required");
     error.statusCode = 400;
     throw error;
   }
 
-  const { apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace();
+  const { apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace(workspaceId);
   const params = new URLSearchParams({ workspace_id: workspace.id });
 
   return plusVibeService.request(`/api/v1/unibox/emails/reply?${params.toString()}`, apiKey, {
@@ -877,29 +908,29 @@ async function sendReply({ replyToId, subject, from, to, body }) {
   });
 }
 
-async function getCampaignMap(integrationId) {
+async function getCampaignMap(integrationId, workspaceId) {
   const result = await db.query(
     `SELECT c.*,
             a.name AS agent_name,
             a.status AS agent_status
      FROM plusvibe_campaigns c
-     LEFT JOIN ai_agents a ON a.id = c.assigned_ai_agent_id
-     WHERE c.integration_id = $1 AND c.is_deleted = FALSE`,
-    [integrationId]
+     LEFT JOIN ai_agents a ON a.id = c.assigned_ai_agent_id AND a.workspace_id = c.workspace_id
+     WHERE c.integration_id = $1 AND c.workspace_id = $2 AND c.is_deleted = FALSE`,
+    [integrationId, workspaceId]
   );
 
   return new Map(result.rows.map((row) => [row.plusvibe_campaign_id, row]));
 }
 
-async function getProfileMap(workspaceId, threads) {
+async function getProfileMap(pvWorkspaceId, threads, workspaceId) {
   const emails = threads
     .map((thread) => getThreadLeadEmail(thread))
     .filter(Boolean);
 
-  return leadProfileService.getByEmails(workspaceId, emails);
+  return leadProfileService.getByEmails(pvWorkspaceId, emails, workspaceId);
 }
 
-async function getCampaignWithAgent(integrationId, campaignId) {
+async function getCampaignWithAgent(integrationId, campaignId, workspaceId) {
   if (!campaignId) return null;
 
   const result = await db.query(
@@ -924,12 +955,13 @@ async function getCampaignWithAgent(integrationId, campaignId) {
             a.working_hours_end AS agent_working_hours_end,
             a.timezone AS agent_timezone
      FROM plusvibe_campaigns c
-     LEFT JOIN ai_agents a ON a.id = c.assigned_ai_agent_id
+     LEFT JOIN ai_agents a ON a.id = c.assigned_ai_agent_id AND a.workspace_id = c.workspace_id
      WHERE c.integration_id = $1
        AND c.plusvibe_campaign_id = $2
+       AND c.workspace_id = $3
        AND c.is_deleted = FALSE
      LIMIT 1`,
-    [integrationId, campaignId]
+    [integrationId, campaignId, workspaceId]
   );
 
   return result.rows[0] || null;
@@ -1132,8 +1164,8 @@ function isNegativeWebhookLabel(label) {
   ].some((negativeLabel) => label.includes(negativeLabel));
 }
 
-async function buildPromptContext(agent, latestInbound, remoteMessages) {
-  const knowledge = await knowledgeService.getAgentKnowledgeContext(agent.assigned_ai_agent_id);
+async function buildPromptContext(workspaceId, agent, latestInbound, remoteMessages) {
+  const knowledge = await knowledgeService.getAgentKnowledgeContext(workspaceId, agent.assigned_ai_agent_id);
 
   return {
     campaign: agent.name,
@@ -1325,13 +1357,13 @@ function cleanString(value) {
 // Builds the error thrown when an approve/reject request loses the race against
 // another reviewer who already handled the same draft. Pass `knownStatus` when
 // the caller already has the row in hand (avoids an extra query).
-async function buildAlreadyHandledError(draftId, knownStatus) {
+async function buildAlreadyHandledError(workspaceId, draftId, knownStatus) {
   let status = knownStatus;
 
   if (!status) {
     const existing = await db.query(
-      `SELECT status FROM ai_response_drafts WHERE id = $1 AND is_deleted = FALSE`,
-      [draftId]
+      `SELECT status FROM ai_response_drafts WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE`,
+      [draftId, workspaceId]
     );
 
     if (existing.rows.length === 0) {

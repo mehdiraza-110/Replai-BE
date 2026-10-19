@@ -17,9 +17,10 @@ const DEFAULT_BODY = "Hi {{firstName}},\n\nJust reaching out to say hello and se
  * warmup-lane counters — see warmup.service.js tickMailbox).
  */
 class WarmupPoolService {
-  async getOrCreateWarmupCampaign() {
+  async getOrCreateWarmupCampaign(workspaceId) {
     const { rows } = await db.query(
-      `SELECT * FROM campaigns WHERE is_warmup = TRUE AND is_deleted = FALSE ORDER BY id ASC LIMIT 1`
+      `SELECT * FROM campaigns WHERE is_warmup = TRUE AND is_deleted = FALSE AND workspace_id = $1 ORDER BY id ASC LIMIT 1`,
+      [workspaceId]
     );
     if (rows[0]) return rows[0];
 
@@ -27,10 +28,10 @@ class WarmupPoolService {
     const { rows: created } = await db.query(
       `INSERT INTO campaigns (
          name, objective, subject, body, mailbox_mode, mailbox_ids, sending_days,
-         window_start, window_end, timezone, status, is_warmup, started_at, updated_at
-       ) VALUES ($1, $2, $3, $4, 'all', '{}', '[]'::jsonb, '00:00', '23:59', 'UTC', 'Active', TRUE, NOW(), NOW())
+         window_start, window_end, timezone, status, is_warmup, started_at, workspace_id, updated_at
+       ) VALUES ($1, $2, $3, $4, 'all', '{}', '[]'::jsonb, '00:00', '23:59', 'UTC', 'Active', TRUE, NOW(), $5, NOW())
        RETURNING *`,
-      [WARMUP_CAMPAIGN_NAME, "Permanent warmup-lane sending, not a customer campaign", DEFAULT_SUBJECT, body]
+      [WARMUP_CAMPAIGN_NAME, "Permanent warmup-lane sending, not a customer campaign", DEFAULT_SUBJECT, body, workspaceId]
     );
     return created[0];
   }
@@ -39,8 +40,8 @@ class WarmupPoolService {
    * Adds leads to the shared pool. Skips anything already in the pool (any status — a lead
    * that's already been used stays retired, never re-added) and anything suppressed.
    */
-  async addLeads(leads) {
-    const campaign = await this.getOrCreateWarmupCampaign();
+  async addLeads(leads, workspaceId) {
+    const campaign = await this.getOrCreateWarmupCampaign(workspaceId);
 
     const normalized = [];
     const seen = new Set();
@@ -63,10 +64,11 @@ class WarmupPoolService {
     }
 
     const [suppressed, existingRows] = await Promise.all([
-      suppressionService.filterSuppressed(normalized.map((lead) => lead.email)),
-      db.query(`SELECT email FROM campaign_leads WHERE campaign_id = $1 AND email = ANY($2::text[])`, [
+      suppressionService.filterSuppressed(normalized.map((lead) => lead.email), workspaceId),
+      db.query(`SELECT email FROM campaign_leads WHERE campaign_id = $1 AND workspace_id = $3 AND email = ANY($2::text[])`, [
         campaign.id,
         normalized.map((lead) => lead.email),
+        workspaceId,
       ]),
     ]);
     const alreadyInPool = new Set(existingRows.rows.map((row) => row.email));
@@ -74,8 +76,8 @@ class WarmupPoolService {
     const toInsert = normalized.filter((lead) => !suppressed.has(lead.email) && !alreadyInPool.has(lead.email));
     if (toInsert.length > 0) {
       await db.query(
-        `INSERT INTO campaign_leads (campaign_id, email, full_name, first_name, last_name, company, role, raw_data)
-         SELECT $1, * FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::jsonb[])`,
+        `INSERT INTO campaign_leads (campaign_id, workspace_id, email, full_name, first_name, last_name, company, role, raw_data)
+         SELECT $1, $9::int, * FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::jsonb[])`,
         [
           campaign.id,
           toInsert.map((lead) => lead.email),
@@ -85,6 +87,7 @@ class WarmupPoolService {
           toInsert.map((lead) => lead.company),
           toInsert.map((lead) => lead.role),
           toInsert.map(() => JSON.stringify({})),
+          campaign.workspace_id,
         ]
       );
     }
@@ -96,17 +99,17 @@ class WarmupPoolService {
     };
   }
 
-  async addLeadsFromFile(buffer, originalName) {
+  async addLeadsFromFile(buffer, originalName, workspaceId) {
     const parsed = parseLeadsFile(buffer, originalName);
-    const result = await this.addLeads(parsed.leads);
+    const result = await this.addLeads(parsed.leads, workspaceId);
     return { ...result, totalRows: parsed.totalRows, invalidCount: parsed.invalidCount };
   }
 
-  async getStats() {
-    const campaign = await this.getOrCreateWarmupCampaign();
+  async getStats(workspaceId) {
+    const campaign = await this.getOrCreateWarmupCampaign(workspaceId);
     const { rows } = await db.query(
-      `SELECT status, COUNT(*)::int AS count FROM campaign_leads WHERE campaign_id = $1 GROUP BY status`,
-      [campaign.id]
+      `SELECT status, COUNT(*)::int AS count FROM campaign_leads WHERE campaign_id = $1 AND workspace_id = $2 GROUP BY status`,
+      [campaign.id, campaign.workspace_id]
     );
     const counts = Object.fromEntries(rows.map((row) => [row.status, row.count]));
     return {

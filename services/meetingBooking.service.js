@@ -87,53 +87,70 @@ class MeetingBookingService {
   }
 
   /** The offer awaiting the lead's answer on this thread, or null. */
-  async getActiveOffer(threadId) {
+  async getActiveOffer(threadId, workspaceId = null) {
     if (!threadId) return null;
 
     const result = await db.query(
       `SELECT * FROM meeting_slot_offers
-       WHERE thread_id = $1 AND status = 'offered'
+       WHERE thread_id = $1 AND status = 'offered' AND ($2::int IS NULL OR workspace_id = $2)
        ORDER BY created_at DESC
        LIMIT 1`,
-      [threadId]
+      [threadId, workspaceId]
     );
 
     return result.rows[0] || null;
   }
 
   /** Records a new offer, superseding any outstanding one on the thread. */
-  async createOffer({ agentId, threadId, leadEmail, slots }) {
+  async createOffer({ agentId, threadId, leadEmail, slots, workspaceId = null }) {
+    // workspace_id comes from the caller, or is copied from the parent agent row. If neither resolves
+    // (NOT NULL violation) the insert fails rather than falling into another workspace.
     await db.query(
       `UPDATE meeting_slot_offers SET status = 'superseded', updated_at = NOW()
-       WHERE thread_id = $1 AND status = 'offered'`,
-      [threadId]
+       WHERE thread_id = $1 AND status = 'offered' AND ($2::int IS NULL OR workspace_id = $2)`,
+      [threadId, workspaceId]
     );
     const result = await db.query(
-      `INSERT INTO meeting_slot_offers (ai_agent_id, thread_id, lead_email, slots)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO meeting_slot_offers (workspace_id, ai_agent_id, thread_id, lead_email, slots)
+       SELECT COALESCE($5::int, a.workspace_id), a.id, $2, $3, $4
+       FROM ai_agents a
+       WHERE a.id = $1 AND ($5::int IS NULL OR a.workspace_id = $5)
        RETURNING *`,
-      [agentId, threadId, leadEmail || null, JSON.stringify(slots)]
+      [agentId, threadId, leadEmail || null, JSON.stringify(slots), workspaceId]
     );
+
+    if (!result.rows[0]) {
+      throw new Error("Cannot record a meeting offer: the AI agent was not found in this workspace.");
+    }
 
     return result.rows[0];
   }
 
-  async markOfferAccepted(offerId) {
-    await db.query(`UPDATE meeting_slot_offers SET status = 'accepted', updated_at = NOW() WHERE id = $1`, [offerId]);
+  async markOfferAccepted(offerId, workspaceId = null) {
+    await db.query(
+      `UPDATE meeting_slot_offers SET status = 'accepted', updated_at = NOW()
+       WHERE id = $1 AND ($2::int IS NULL OR workspace_id = $2)`,
+      [offerId, workspaceId]
+    );
   }
 
   /** Starts of every slot already proposed on the thread, so new offers differ. */
-  async getOfferedStarts(threadId) {
-    const result = await db.query(`SELECT slots FROM meeting_slot_offers WHERE thread_id = $1`, [threadId]);
+  async getOfferedStarts(threadId, workspaceId = null) {
+    const result = await db.query(
+      `SELECT slots FROM meeting_slot_offers WHERE thread_id = $1 AND ($2::int IS NULL OR workspace_id = $2)`,
+      [threadId, workspaceId]
+    );
     return result.rows.flatMap((row) => (row.slots || []).map((slot) => slot.startTime));
   }
 
-  async hasBooking(threadId) {
+  async hasBooking(threadId, workspaceId = null) {
     if (!threadId) return false;
 
     const result = await db.query(
-      `SELECT 1 FROM meeting_bookings WHERE thread_id = $1 AND status = 'booked' LIMIT 1`,
-      [threadId]
+      `SELECT 1 FROM meeting_bookings
+       WHERE thread_id = $1 AND status = 'booked' AND ($2::int IS NULL OR workspace_id = $2)
+       LIMIT 1`,
+      [threadId, workspaceId]
     );
 
     return result.rowCount > 0;
@@ -189,6 +206,7 @@ class MeetingBookingService {
 
       await db.query(
         `INSERT INTO meeting_bookings (
+          workspace_id,
           ai_agent_id,
           thread_id,
           lead_email,
@@ -198,7 +216,7 @@ class MeetingBookingService {
           scheduled_end,
           status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'booked')`,
+        VALUES ($8, $1, $2, $3, $4, $5, $6, $7, 'booked')`,
         [
           connection.ai_agent_id,
           slot.threadId || null,
@@ -207,6 +225,8 @@ class MeetingBookingService {
           meetLink,
           slot.startTime,
           slot.endTime,
+          // Copied from the parent connection row (SELECT * from getConnectedForAgent).
+          connection.workspace_id,
         ]
       );
 

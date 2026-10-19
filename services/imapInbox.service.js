@@ -101,16 +101,17 @@ class ImapInboxService {
       return;
     }
     if (isAutoReply(parsed)) return; // out-of-office etc: neither a real reply nor a bounce
-    await sesInboundEmailService.processParsedEmail({ parsed });
+    // workspaceId lets the inbound pipeline attribute the reply to this mailbox's tenant (ignored by older signatures).
+    await sesInboundEmailService.processParsedEmail({ parsed, workspaceId: mailbox.workspace_id });
   }
 
   /** Only a permanent (5.x.x) failure suppresses, mirroring the SES bounce handler. */
   async handleBounce(mailbox, { recipient, isHard }) {
     if (!recipient || !isHard) return;
-    await suppressionService.addSuppression({ email: recipient, reason: "hard_bounce", source: "imap_bounce" });
+    await suppressionService.addSuppression({ email: recipient, reason: "hard_bounce", source: "imap_bounce", workspaceId: mailbox.workspace_id });
     await db.query(
-      `UPDATE campaign_leads SET status = 'Bounced' WHERE mailbox_id = $1 AND email = $2 AND status != 'Bounced'`,
-      [mailbox.id, recipient]
+      `UPDATE campaign_leads SET status = 'Bounced' WHERE mailbox_id = $1 AND email = $2 AND workspace_id = $3 AND status != 'Bounced'`,
+      [mailbox.id, recipient, mailbox.workspace_id]
     );
   }
 }

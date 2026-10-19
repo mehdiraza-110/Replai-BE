@@ -50,45 +50,70 @@ class MaildosoService {
    * Only ACTIVE domains and active mailboxes are made sendable; anything else is mirrored
    * as Paused/Error so it can never be picked by the send engine.
    */
-  async syncMailboxes() {
+  /**
+   * Workspace that owns Maildoso domains Replai has never seen before. The Maildoso API token is a single
+   * account-wide credential (MAILDOSO_API_TOKEN), so unknown domains belong to whichever workspace holds
+   * that account: MAILDOSO_WORKSPACE_ID, else the "koval-group" workspace. Domains already in the DB keep
+   * their existing workspace; this is only used for first-time inserts.
+   */
+  async resolveNewDomainWorkspaceId() {
+    const fromEnv = Number.parseInt(process.env.MAILDOSO_WORKSPACE_ID, 10);
+    if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+    const { rows } = await db.query(`SELECT id FROM workspaces WHERE slug = 'koval-group' AND is_deleted = FALSE`);
+    return rows[0]?.id ?? null;
+  }
+
+  // Sync is account-wide and keeps running for every workspace. `workspaceId` (set by the HTTP endpoint)
+  // only narrows the summary that is returned so one tenant never sees another tenant's mailboxes.
+  async syncMailboxes({ workspaceId = null } = {}) {
     const [domains, accounts] = await Promise.all([this.listDomains(), this.listAccounts()]);
     const domainsById = new Map(domains.map((domain) => [domain.id, domain]));
 
     const summary = { domains: 0, mailboxesCreated: 0, mailboxesUpdated: 0, skipped: [] };
     const replaiDomainIds = new Map(); // maildoso domain id -> replai domains.id
+    const replaiDomainWorkspaces = new Map(); // maildoso domain id -> owning workspace id
+    const newDomainWorkspaceId = await this.resolveNewDomainWorkspaceId();
+    if (!newDomainWorkspaceId) {
+      throw Object.assign(new Error("Cannot sync Maildoso: set MAILDOSO_WORKSPACE_ID to the workspace that owns the Maildoso account"), { statusCode: 500 });
+    }
 
     for (const domain of domains) {
       if (domain.domain_status !== "ACTIVE") continue;
       const { rows } = await db.query(
         `INSERT INTO domains (domain, registrar, dns_provider, provider, external_id, status,
-                              spf_status, dkim_status, dmarc_status, mx_status, mail_from_status, updated_at)
-         VALUES ($1, 'External', 'Maildoso', 'Maildoso', $2, 'Verified', 'Success', 'Success', 'Success', 'Success', 'Success', NOW())
+                              spf_status, dkim_status, dmarc_status, mx_status, mail_from_status, workspace_id, updated_at)
+         VALUES ($1, 'External', 'Maildoso', 'Maildoso', $2, 'Verified', 'Success', 'Success', 'Success', 'Success', 'Success', $3, NOW())
          ON CONFLICT (domain) DO UPDATE SET
            registrar = 'External', dns_provider = 'Maildoso', provider = 'Maildoso', external_id = EXCLUDED.external_id,
            status = 'Verified', spf_status = 'Success', dkim_status = 'Success', dmarc_status = 'Success',
            mx_status = 'Success', mail_from_status = 'Success', is_deleted = FALSE, updated_at = NOW()
-         RETURNING id`,
-        [domain.domain_name.toLowerCase(), String(domain.id)]
+         RETURNING id, workspace_id`,
+        [domain.domain_name.toLowerCase(), String(domain.id), newDomainWorkspaceId]
       );
       replaiDomainIds.set(domain.id, rows[0].id);
-      summary.domains += 1;
+      replaiDomainWorkspaces.set(domain.id, rows[0].workspace_id);
+      if (!workspaceId || rows[0].workspace_id === workspaceId) summary.domains += 1;
     }
 
     for (const account of accounts) {
       const replaiDomainId = replaiDomainIds.get(account.domain_id);
       const email = String(account.email_account || "").toLowerCase();
       if (!replaiDomainId || !account.smtp || !account.imap || !account.password) {
-        summary.skipped.push({ email, reason: domainsById.get(account.domain_id)?.domain_status !== "ACTIVE" ? "domain_not_active" : "missing_connection_details" });
+        // Scoped callers only see skips for domains their own workspace owns.
+        if (!workspaceId || replaiDomainWorkspaces.get(account.domain_id) === workspaceId) {
+          summary.skipped.push({ email, reason: domainsById.get(account.domain_id)?.domain_status !== "ACTIVE" ? "domain_not_active" : "missing_connection_details" });
+        }
         continue;
       }
+      const mailboxWorkspaceId = replaiDomainWorkspaces.get(account.domain_id); // a mailbox always belongs to its domain's workspace
 
       const status = account.status === "active" && account.is_active ? "Active" : account.status === "failed" ? "Error" : "Paused";
       const displayName = [account.first_name, account.last_name].filter(Boolean).join(" ") || null;
 
       const { rows } = await db.query(
         `INSERT INTO mailboxes (domain_id, email, local_part, display_name, status, provider, external_id,
-                                smtp_host, smtp_port, imap_host, imap_port, password_encrypted, updated_at)
-         VALUES ($1, $2, $3, $4, $5, 'maildoso', $6, $7, $8, $9, $10, $11, NOW())
+                                smtp_host, smtp_port, imap_host, imap_port, password_encrypted, workspace_id, updated_at)
+         VALUES ($1, $2, $3, $4, $5, 'maildoso', $6, $7, $8, $9, $10, $11, $12, NOW())
          ON CONFLICT (email) DO UPDATE SET
            domain_id = EXCLUDED.domain_id, display_name = EXCLUDED.display_name,
            -- Maildoso can downgrade a mailbox (failed/inactive) at any time, but must never undo a
@@ -104,6 +129,7 @@ class MaildosoService {
            smtp_host = EXCLUDED.smtp_host, smtp_port = EXCLUDED.smtp_port,
            imap_host = EXCLUDED.imap_host, imap_port = EXCLUDED.imap_port,
            password_encrypted = EXCLUDED.password_encrypted, is_deleted = FALSE, updated_at = NOW()
+         WHERE mailboxes.workspace_id = EXCLUDED.workspace_id
          RETURNING (xmax = 0) AS inserted`,
         [
           replaiDomainId,
@@ -117,24 +143,31 @@ class MaildosoService {
           account.imap.imap_host,
           account.imap.port,
           encryptSecret(account.password),
+          mailboxWorkspaceId,
         ]
       );
+      if (!rows[0]) {
+        // mailboxes.email is globally unique and this address already belongs to a different workspace: leave it alone.
+        if (!workspaceId || mailboxWorkspaceId === workspaceId) summary.skipped.push({ email, reason: "email_in_use_by_another_workspace" });
+        continue;
+      }
+      if (workspaceId && mailboxWorkspaceId !== workspaceId) continue;
       if (rows[0].inserted) summary.mailboxesCreated += 1;
       else summary.mailboxesUpdated += 1;
     }
 
-    // New mailboxes start warming up straight away on the default ramp.
-    const { rows: strategyRows } = await db.query(
-      `SELECT id, start_daily_limit FROM warmup_strategies WHERE is_deleted = FALSE ORDER BY id ASC LIMIT 1`
+    // New mailboxes start warming up straight away on their own workspace's default (oldest) ramp.
+    const { rowCount } = await db.query(
+      `UPDATE mailboxes m SET warmup_strategy_id = s.id, daily_limit = s.start_daily_limit, warmup_stage = 'New', warmup_started_at = NOW(), updated_at = NOW()
+       FROM (
+         SELECT DISTINCT ON (workspace_id) workspace_id, id, start_daily_limit
+         FROM warmup_strategies WHERE is_deleted = FALSE
+         ORDER BY workspace_id, id ASC
+       ) s
+       WHERE s.workspace_id = m.workspace_id
+         AND m.provider = 'maildoso' AND m.is_deleted = FALSE AND m.warmup_strategy_id IS NULL`
     );
-    if (strategyRows[0]) {
-      const { rowCount } = await db.query(
-        `UPDATE mailboxes SET warmup_strategy_id = $1, daily_limit = $2, warmup_stage = 'New', warmup_started_at = NOW(), updated_at = NOW()
-         WHERE provider = 'maildoso' AND is_deleted = FALSE AND warmup_strategy_id IS NULL`,
-        [strategyRows[0].id, strategyRows[0].start_daily_limit]
-      );
-      summary.warmupAssigned = rowCount;
-    }
+    summary.warmupAssigned = rowCount;
 
     return summary;
   }
@@ -221,11 +254,11 @@ class MaildosoService {
    * the user accepted matches a fresh quote, so a price or plan change between "show cost" and
    * "confirm" can never silently spend more than what was shown.
    */
-  async provisionMailboxes({ domain, mailboxes, acceptedMonthlyIncreaseCents }) {
+  async provisionMailboxes({ domain, mailboxes, acceptedMonthlyIncreaseCents, workspaceId }) {
     const domainName = String(domain || "").trim().toLowerCase();
     const { rows: domainRows } = await db.query(
-      `SELECT * FROM domains WHERE domain = $1 AND is_deleted = FALSE AND provider = 'Maildoso'`,
-      [domainName]
+      `SELECT * FROM domains WHERE domain = $1 AND is_deleted = FALSE AND provider = 'Maildoso' AND workspace_id = $2`,
+      [domainName, workspaceId]
     );
     const domainRow = domainRows[0];
     if (!domainRow || domainRow.status !== "Verified") {
@@ -255,9 +288,10 @@ class MaildosoService {
     await this.request("/v1/user/accounts", { method: "POST", body: payload });
 
     // Pull the new mailboxes (and their credentials) straight into Replai.
-    const sync = await this.syncMailboxes();
-    const { rows } = await db.query(`SELECT email, status FROM mailboxes WHERE email = ANY($1::text[]) AND is_deleted = FALSE`, [
+    const sync = await this.syncMailboxes({ workspaceId });
+    const { rows } = await db.query(`SELECT email, status FROM mailboxes WHERE email = ANY($1::text[]) AND is_deleted = FALSE AND workspace_id = $2`, [
       payload.map((item) => item.email_account),
+      workspaceId,
     ]);
     const byEmail = new Map(rows.map((row) => [row.email, row.status]));
     return {
@@ -279,15 +313,16 @@ class MaildosoService {
  * Complaint rate stays null — there is no feedback-loop data for these mailboxes — which the
  * warmup safety tiers treat as "no signal" rather than "zero".
  */
-MaildosoService.prototype.refreshDomainReputation = async function refreshDomainReputation(domain) {
+MaildosoService.prototype.refreshDomainReputation = async function refreshDomainReputation(domain, workspaceId = null) {
   const { rows } = await db.query(
     `SELECT COUNT(*) FILTER (WHERE cl.status IN ('Sent', 'Replied', 'Bounced'))::int AS sent,
             COUNT(*) FILTER (WHERE cl.status = 'Bounced')::int AS bounced
      FROM campaign_leads cl
      JOIN mailboxes m ON m.id = cl.mailbox_id
-     JOIN domains d ON d.id = m.domain_id
-     WHERE d.domain = $1 AND cl.sent_at > NOW() - INTERVAL '14 days'`,
-    [domain]
+     JOIN domains d ON d.id = m.domain_id AND d.workspace_id = m.workspace_id
+     WHERE d.domain = $1 AND cl.workspace_id = m.workspace_id AND ($2::int IS NULL OR d.workspace_id = $2)
+       AND cl.sent_at > NOW() - INTERVAL '14 days'`,
+    [domain, workspaceId]
   );
   const { sent, bounced } = rows[0];
   const bounceRate = sent > 0 ? Math.round((bounced / sent) * 1000) / 1000 : null;
@@ -297,8 +332,8 @@ MaildosoService.prototype.refreshDomainReputation = async function refreshDomain
     `UPDATE domains SET emails_sent_14d = $2, emails_delivered_14d = $3, emails_bounced_14d = $4,
             emails_complained_14d = NULL, bounce_rate = $5, complaint_rate = NULL,
             delivery_rate = $6, reputation = $7, reputation_checked_at = NOW(), last_checked_at = NOW(), updated_at = NOW()
-     WHERE domain = $1 RETURNING *`,
-    [domain, sent, sent - bounced, bounced, bounceRate, sent > 0 ? Math.round(((sent - bounced) / sent) * 1000) / 1000 : null, reputation]
+     WHERE domain = $1 AND ($8::int IS NULL OR workspace_id = $8) RETURNING *`,
+    [domain, sent, sent - bounced, bounced, bounceRate, sent > 0 ? Math.round(((sent - bounced) / sent) * 1000) / 1000 : null, reputation, workspaceId]
   );
   return updated[0];
 };

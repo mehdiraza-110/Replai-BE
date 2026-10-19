@@ -4,7 +4,7 @@ const eventLogService = require("../services/eventLog.service");
 
 async function getConnection(req, res) {
   try {
-    const data = await plusVibeService.getConnection();
+    const data = await plusVibeService.getConnection(req.workspaceId);
 
     res.status(200).json({
       success: true,
@@ -18,7 +18,7 @@ async function getConnection(req, res) {
 
 async function saveConnection(req, res) {
   try {
-    const data = await plusVibeService.saveConnection({
+    const data = await plusVibeService.saveConnection(req.workspaceId, {
       ...req.body,
       createdBy: req.user?.id ?? null,
     });
@@ -35,7 +35,7 @@ async function saveConnection(req, res) {
 
 async function testConnection(req, res) {
   try {
-    const data = await plusVibeService.testConnection(req.body);
+    const data = await plusVibeService.testConnection(req.workspaceId, req.body);
 
     res.status(200).json({
       success: true,
@@ -49,7 +49,7 @@ async function testConnection(req, res) {
 
 async function refreshConnection(req, res) {
   try {
-    const data = await plusVibeService.refreshConnection();
+    const data = await plusVibeService.refreshConnection(req.workspaceId);
 
     res.status(200).json({
       success: true,
@@ -63,7 +63,7 @@ async function refreshConnection(req, res) {
 
 async function listInboxes(req, res) {
   try {
-    const data = await plusVibeService.listInboxes();
+    const data = await plusVibeService.listInboxes(req.workspaceId);
 
     res.status(200).json({
       success: true,
@@ -78,7 +78,7 @@ async function listInboxes(req, res) {
 
 async function listCampaigns(req, res) {
   try {
-    const data = await plusVibeService.listCampaigns();
+    const data = await plusVibeService.listCampaigns(req.workspaceId);
 
     res.status(200).json({
       success: true,
@@ -93,7 +93,7 @@ async function listCampaigns(req, res) {
 
 async function syncCampaigns(req, res) {
   try {
-    const data = await plusVibeService.syncCampaigns();
+    const data = await plusVibeService.syncCampaigns(req.workspaceId);
 
     res.status(200).json({
       success: true,
@@ -108,7 +108,7 @@ async function syncCampaigns(req, res) {
 
 async function assignCampaignAgent(req, res) {
   try {
-    const data = await plusVibeService.assignCampaignAgent(req.params.id, req.body.aiAgentId);
+    const data = await plusVibeService.assignCampaignAgent(req.workspaceId, req.params.id, req.body.aiAgentId);
 
     res.status(200).json({
       success: true,
@@ -122,12 +122,15 @@ async function assignCampaignAgent(req, res) {
 
 async function receiveWebhook(req, res) {
   try {
-    const data = await plusVibeService.recordWebhook(req.body);
-    messageService.generateDraftFromWebhook(req.body).catch(async (error) => {
+    // No session on the webhook: the tenant comes from the integration matched by the payload's PlusVibe
+    // workspace id. Unmatched payloads throw here, before anything is written or any draft job is queued.
+    const { appWorkspaceId, ...data } = await plusVibeService.recordWebhook(req.body);
+    messageService.generateDraftFromWebhook(appWorkspaceId, req.body).catch(async (error) => {
       await eventLogService.record({
         eventType: "ai.draft.webhook_failed",
         source: "webhook",
         status: "Failed",
+        appWorkspaceId,
         threadId: req.body?.thread_id || req.body?.threadId || req.body?.data?.thread_id || null,
         errorMessage: error.message,
         metadata: { webhookEventId: data.id },

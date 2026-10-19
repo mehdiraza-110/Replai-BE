@@ -42,7 +42,7 @@ const insertFields = [
 const updateFields = insertFields.filter((field) => field !== "created_by");
 
 class AiAgentService {
-  async listAgents() {
+  async listAgents(workspaceId) {
     await knowledgeService.ensureSchema();
 
     const result = await db.query(
@@ -51,19 +51,20 @@ class AiAgentService {
                 (
                   SELECT array_agg(aks.knowledge_source_id ORDER BY aks.knowledge_source_id)
                   FROM ai_agent_knowledge_sources aks
-                  WHERE aks.ai_agent_id = a.id
+                  WHERE aks.ai_agent_id = a.id AND aks.workspace_id = a.workspace_id
                 ),
                 '{}'::int[]
               ) AS knowledge_source_ids
        FROM ai_agents a
-       WHERE a.is_deleted = FALSE
-       ORDER BY a.updated_at DESC`
+       WHERE a.is_deleted = FALSE AND a.workspace_id = $1
+       ORDER BY a.updated_at DESC`,
+      [workspaceId]
     );
 
     return result.rows.map(mapAgentRow);
   }
 
-  async getAgentById(agentId) {
+  async getAgentById(workspaceId, agentId) {
     await knowledgeService.ensureSchema();
 
     const result = await db.query(
@@ -72,40 +73,44 @@ class AiAgentService {
                 (
                   SELECT array_agg(aks.knowledge_source_id ORDER BY aks.knowledge_source_id)
                   FROM ai_agent_knowledge_sources aks
-                  WHERE aks.ai_agent_id = a.id
+                  WHERE aks.ai_agent_id = a.id AND aks.workspace_id = a.workspace_id
                 ),
                 '{}'::int[]
               ) AS knowledge_source_ids
        FROM ai_agents a
-       WHERE a.id = $1 AND a.is_deleted = FALSE`,
-      [agentId]
+       WHERE a.id = $1 AND a.workspace_id = $2 AND a.is_deleted = FALSE`,
+      [agentId, workspaceId]
     );
 
     return result.rows[0] ? mapAgentRow(result.rows[0]) : null;
   }
 
-  async createAgent(agentData) {
+  async createAgent(workspaceId, agentData) {
     const startedAt = Date.now();
     const normalized = normalizeAgentPayload(agentData);
     validateAgent(normalized);
 
-    const values = insertFields.map((field) => normalized[field] ?? null);
-    const placeholders = insertFields.map((_, index) => `$${index + 1}`).join(", ");
+    // Linked knowledge sources must belong to this workspace; check before creating anything.
+    await knowledgeService.assertSourcesInWorkspace(workspaceId, agentData.knowledgeSourceIds ?? agentData.knowledge_source_ids);
+
+    const values = [...insertFields.map((field) => normalized[field] ?? null), workspaceId];
+    const placeholders = [...insertFields, "workspace_id"].map((_, index) => `$${index + 1}`).join(", ");
 
     const result = await db.query(
-      `INSERT INTO ai_agents (${insertFields.join(", ")})
+      `INSERT INTO ai_agents (${insertFields.join(", ")}, workspace_id)
        VALUES (${placeholders})
        RETURNING *`,
       values
     );
 
     const agent = mapAgentRow(result.rows[0]);
-    await knowledgeService.setAgentSources(agent.id, agentData.knowledgeSourceIds ?? agentData.knowledge_source_ids);
-    const savedAgent = await this.getAgentById(agent.id);
+    await knowledgeService.setAgentSources(workspaceId, agent.id, agentData.knowledgeSourceIds ?? agentData.knowledge_source_ids);
+    const savedAgent = await this.getAgentById(workspaceId, agent.id);
 
     await eventLogService.record({
       eventType: "ai_agent.created",
       source: "ai",
+      appWorkspaceId: workspaceId,
       status: "Success",
       aiAgentId: savedAgent.id,
       aiAgentName: savedAgent.name,
@@ -123,7 +128,7 @@ class AiAgentService {
     return savedAgent;
   }
 
-  async updateAgent(agentId, agentData) {
+  async updateAgent(workspaceId, agentId, agentData) {
     const startedAt = Date.now();
     const normalized = normalizeAgentPayload(agentData, { partial: true });
     const hasKnowledgeSourceIds =
@@ -145,13 +150,17 @@ class AiAgentService {
       throw error;
     }
 
+    if (hasKnowledgeSourceIds) {
+      await knowledgeService.assertSourcesInWorkspace(workspaceId, agentData.knowledgeSourceIds ?? agentData.knowledge_source_ids);
+    }
+
     let result;
     if (assignments.length > 0) {
-      values.push(agentId);
+      values.push(agentId, workspaceId);
       result = await db.query(
         `UPDATE ai_agents
          SET ${assignments.join(", ")}, updated_at = NOW()
-         WHERE id = $${values.length} AND is_deleted = FALSE
+         WHERE id = $${values.length - 1} AND workspace_id = $${values.length} AND is_deleted = FALSE
          RETURNING *`,
         values
       );
@@ -159,9 +168,9 @@ class AiAgentService {
       result = await db.query(
         `UPDATE ai_agents
          SET updated_at = NOW()
-         WHERE id = $1 AND is_deleted = FALSE
+         WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE
          RETURNING *`,
-        [agentId]
+        [agentId, workspaceId]
       );
     }
 
@@ -172,13 +181,14 @@ class AiAgentService {
     }
 
     if (hasKnowledgeSourceIds) {
-      await knowledgeService.setAgentSources(agentId, agentData.knowledgeSourceIds ?? agentData.knowledge_source_ids);
+      await knowledgeService.setAgentSources(workspaceId, agentId, agentData.knowledgeSourceIds ?? agentData.knowledge_source_ids);
     }
 
-    const agent = await this.getAgentById(agentId);
+    const agent = await this.getAgentById(workspaceId, agentId);
     await eventLogService.record({
       eventType: "ai_agent.updated",
       source: "ai",
+      appWorkspaceId: workspaceId,
       status: "Success",
       aiAgentId: agent.id,
       aiAgentName: agent.name,
@@ -194,14 +204,14 @@ class AiAgentService {
     return agent;
   }
 
-  async deleteAgent(agentId) {
+  async deleteAgent(workspaceId, agentId) {
     const startedAt = Date.now();
     const result = await db.query(
       `UPDATE ai_agents
        SET is_deleted = TRUE, updated_at = NOW()
-       WHERE id = $1 AND is_deleted = FALSE
+       WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE
        RETURNING id, name`,
-      [agentId]
+      [agentId, workspaceId]
     );
 
     if (result.rows.length === 0) {
@@ -213,6 +223,7 @@ class AiAgentService {
     await eventLogService.record({
       eventType: "ai_agent.deleted",
       source: "ai",
+      appWorkspaceId: workspaceId,
       status: "Success",
       aiAgentId: result.rows[0].id,
       aiAgentName: result.rows[0].name,

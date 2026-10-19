@@ -8,6 +8,7 @@ async function listThreads(req, res) {
       search: req.query.search,
       mailboxId: req.query.mailboxId,
       unreadOnly: req.query.unreadOnly === "true",
+      workspaceId: req.workspaceId,
     });
     res.status(200).json({ success: true, message: "Threads fetched successfully", data });
   } catch (error) {
@@ -17,7 +18,7 @@ async function listThreads(req, res) {
 
 async function getThread(req, res) {
   try {
-    const data = await inboxService.getThread(req.params.mailboxId, req.params.threadId);
+    const data = await inboxService.getThread(req.params.mailboxId, req.params.threadId, req.workspaceId);
     res.status(200).json({ success: true, message: "Thread fetched successfully", data });
   } catch (error) {
     sendError(res, error, "Unable to fetch thread");
@@ -26,7 +27,7 @@ async function getThread(req, res) {
 
 async function markThreadRead(req, res) {
   try {
-    const data = await inboxService.markThreadRead(req.params.mailboxId, req.params.threadId);
+    const data = await inboxService.markThreadRead(req.params.mailboxId, req.params.threadId, req.workspaceId);
     res.status(200).json({ success: true, message: "Thread marked as read", data });
   } catch (error) {
     sendError(res, error, "Unable to mark thread as read");
@@ -35,7 +36,7 @@ async function markThreadRead(req, res) {
 
 async function sendReply(req, res) {
   try {
-    const data = await inboxService.sendReply(req.params.mailboxId, req.params.threadId, { body: req.body?.body });
+    const data = await inboxService.sendReply(req.params.mailboxId, req.params.threadId, { body: req.body?.body }, req.workspaceId);
     res.status(200).json({ success: true, message: "Reply sent", data });
   } catch (error) {
     sendError(res, error, "Unable to send reply");

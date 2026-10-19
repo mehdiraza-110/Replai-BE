@@ -77,7 +77,8 @@ class CampaignSendService {
 
   async getSendableMailboxes(campaign) {
     const mode = campaign.mailbox_mode === "specific" ? "specific" : "all";
-    const params = [];
+    // A campaign may only send through mailboxes (and domains) of its own workspace.
+    const params = [campaign.workspace_id];
     let mailboxFilter = "";
     if (mode === "specific") {
       params.push(campaign.mailbox_ids);
@@ -91,8 +92,9 @@ class CampaignSendService {
     const { rows } = await db.query(
       `SELECT m.*, d.status AS domain_status, d.configuration_set_name
        FROM mailboxes m
-       JOIN domains d ON d.id = m.domain_id AND d.is_deleted = FALSE
+       JOIN domains d ON d.id = m.domain_id AND d.is_deleted = FALSE AND d.workspace_id = m.workspace_id
        WHERE m.is_deleted = FALSE
+         AND m.workspace_id = $1
          AND m.status = 'Active'
          AND d.status = 'Verified'
          AND ${capacityFilter}
@@ -144,7 +146,7 @@ class CampaignSendService {
     // Belt-and-suspenders: campaign creation already filters known suppressions at
     // import time, but a lead could opt out (or a new bounce/complaint land) any time
     // between then and now — re-check immediately before every send.
-    if (await suppressionService.isSuppressed(lead.email)) {
+    if (await suppressionService.isSuppressed(lead.email, campaign.workspace_id)) {
       await db.query(`UPDATE campaign_leads SET status = 'Suppressed' WHERE id = $1`, [lead.id]);
       return { sent: false, reason: "suppressed" };
     }
@@ -208,9 +210,9 @@ class CampaignSendService {
       // Record the send in the mailbox's app-native inbox too, so the "open inbox" view
       // shows the full thread (what we sent + any reply), not just replies.
       await db.query(
-        `INSERT INTO messages (mailbox_id, direction, campaign_id, campaign_lead_id, thread_id, message_id, from_address, to_address, subject, body_text)
-         VALUES ($1, 'outbound', $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [mailbox.id, campaign.id, lead.id, threadIdFor(mailbox.id, lead.email), rfcMessageId, mailbox.email, lead.email, subject, body]
+        `INSERT INTO messages (mailbox_id, direction, campaign_id, campaign_lead_id, thread_id, message_id, from_address, to_address, subject, body_text, workspace_id)
+         VALUES ($1, 'outbound', $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [mailbox.id, campaign.id, lead.id, threadIdFor(mailbox.id, lead.email), rfcMessageId, mailbox.email, lead.email, subject, body, campaign.workspace_id]
       );
 
       return { sent: true };
