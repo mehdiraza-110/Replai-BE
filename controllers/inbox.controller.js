@@ -1,3 +1,4 @@
+const quotaService = require("../services/quota.service");
 const inboxService = require("../services/inbox.service");
 
 async function listThreads(req, res) {
@@ -44,6 +45,7 @@ async function sendReply(req, res) {
 }
 
 function sendError(res, error, fallbackMessage) {
+  if (quotaService.isQuotaError(error)) return res.status(403).json(quotaService.errorBody(error));
   res.status(error.statusCode || 500).json({
     success: false,
     message: error.message || fallbackMessage,

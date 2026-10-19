@@ -3,6 +3,7 @@ const { SESv2Client } = require("@aws-sdk/client-sesv2");
 const db = require("../config/db.config");
 const suppressionService = require("./suppression.service");
 const { sendRawEmail } = require("./mailTransport.service");
+const quotaService = require("./quota.service");
 
 const AWS_REGION = process.env.AWS_REGION || "us-east-1";
 const sesClient = new SESv2Client({ region: AWS_REGION });
@@ -25,10 +26,36 @@ class CampaignSendService {
     );
 
     const results = [];
+    // Workspaces whose email limit is used up for this tick: their campaigns are skipped (leads stay Pending, nothing
+    // is marked failed) and it is logged once per workspace, not once per lead.
+    const blocked = new Set();
     for (const campaign of campaigns) {
       if (!isWithinSendingWindow(campaign)) continue;
+      if (!campaign.is_warmup) {
+        if (blocked.has(campaign.workspace_id)) {
+          results.push({ campaignId: campaign.id, sent: 0, reason: "email_limit_reached" });
+          continue;
+        }
+        try {
+          await quotaService.check(campaign.workspace_id, "emails", 1);
+        } catch (error) {
+          if (quotaService.isQuotaError(error)) {
+            blocked.add(campaign.workspace_id);
+            console.warn(`Campaign sending paused for workspace ${campaign.workspace_id} this tick: ${error.message}`);
+            results.push({ campaignId: campaign.id, sent: 0, reason: "email_limit_reached" });
+            continue;
+          }
+          results.push({ campaignId: campaign.id, error: error.message });
+          continue;
+        }
+      }
       try {
-        results.push(await this.tickCampaign(campaign));
+        const result = await this.tickCampaign(campaign);
+        if (result.reason === "email_limit_reached" && !blocked.has(campaign.workspace_id)) {
+          blocked.add(campaign.workspace_id);
+          console.warn(`Campaign sending paused for workspace ${campaign.workspace_id} this tick: email limit reached`);
+        }
+        results.push(result);
       } catch (error) {
         results.push({ campaignId: campaign.id, error: error.message });
       }
@@ -59,6 +86,7 @@ class CampaignSendService {
         const dueFollowUps = await this.getDueFollowUps(campaign.id, mailbox.id, batchSize);
         for (const lead of dueFollowUps) {
           const outcome = await this.sendToLead(campaign, mailbox, lead, { followUp: lead.followup });
+          if (outcome.reason === "email_limit_reached") return { campaignId: campaign.id, sent: sentCount, reason: "email_limit_reached" };
           if (outcome.sent) sentCount += 1;
           batchSize -= 1;
         }
@@ -68,6 +96,7 @@ class CampaignSendService {
       const leads = await this.getPendingLeads(campaign.id, batchSize);
       for (const lead of leads) {
         const outcome = await this.sendToLead(campaign, mailbox, lead);
+        if (outcome.reason === "email_limit_reached") return { campaignId: campaign.id, sent: sentCount, reason: "email_limit_reached" };
         if (outcome.sent) sentCount += 1;
       }
     }
@@ -167,6 +196,18 @@ class CampaignSendService {
       messageIdDomain: mailboxDomain(mailbox),
     });
 
+    // Cold-mailer sends count against the workspace's email limit (warm-up pool traffic does not). At the cap the lead is
+    // left exactly as it was (no failure, no attempt used) and sending resumes once the 24h window frees up.
+    let usageId = null;
+    if (!campaign.is_warmup) {
+      try {
+        usageId = await quotaService.consume(campaign.workspace_id, "emails", 1, { source: followUp ? "followup" : "campaign", campaignId: campaign.id });
+      } catch (error) {
+        if (quotaService.isQuotaError(error)) return { sent: false, reason: "email_limit_reached", error: error.message };
+        throw error;
+      }
+    }
+
     try {
       // Tags come back on bounce/complaint SNS events so sesBounceComplaint.service.js
       // can attribute them to the right campaign for suppression/audit purposes (SES only).
@@ -178,6 +219,7 @@ class CampaignSendService {
         sesClient,
         tags: [{ Name: "campaign_id", Value: String(campaign.id) }],
       });
+      usageId = null; // the email is out: its usage stays counted whatever happens to the bookkeeping below
 
       if (followUp) {
         // The thread's original rfc_message_id stays as the In-Reply-To anchor; only the step
@@ -229,6 +271,8 @@ class CampaignSendService {
 
       return { sent: true };
     } catch (error) {
+      // Nothing went out (or the send failed), so the email is not counted.
+      if (usageId) await quotaService.refund(campaign.workspace_id, usageId);
       if (followUp) {
         // A failed follow-up must not mark the lead Failed (the first email already landed);
         // just back off an hour before this step is tried again.

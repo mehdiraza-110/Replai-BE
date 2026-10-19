@@ -1,4 +1,5 @@
 const db = require("../config/db.config");
+const quota = require("./quota.service");
 
 class WorkspaceError extends Error {
   constructor(message, status = 400, code = undefined) {
@@ -18,7 +19,7 @@ function slugify(name) {
 
 const MEMBERSHIP_SELECT = `
   SELECT w.id, w.name, w.slug, w.type, w.status, w.auto_responder_enabled, w.cold_mailer_enabled,
-         wm.role, wm.permissions
+         wm.role, wm.permissions, ${quota.planColumns("w")}
   FROM workspace_members wm
   JOIN workspaces w ON w.id = wm.workspace_id
   WHERE wm.user_id = $1 AND w.is_deleted = FALSE
@@ -29,16 +30,16 @@ const workspaceService = {
 
   async listForUser(userId) {
     const { rows } = await db.query(MEMBERSHIP_SELECT, [userId]);
-    return rows;
+    return rows.map(quota.withLightPlan);
   },
 
   async getWorkspace(workspaceId) {
     const { rows } = await db.query(
-      `SELECT id, name, slug, type, status, auto_responder_enabled, cold_mailer_enabled
-       FROM workspaces WHERE id = $1 AND is_deleted = FALSE`,
+      `SELECT w.id, w.name, w.slug, w.type, w.status, w.auto_responder_enabled, w.cold_mailer_enabled, ${quota.planColumns("w")}
+       FROM workspaces w WHERE w.id = $1 AND w.is_deleted = FALSE`,
       [workspaceId],
     );
-    return rows[0] || null;
+    return rows[0] ? quota.withLightPlan(rows[0]) : null;
   },
 
   // Decides which workspace a request acts in. `preferredId` is the one stored in the session; sessions issued
@@ -67,13 +68,16 @@ const workspaceService = {
   // (carries the caller's role and permissions; "View as" gives role owner).
   async getDetail(ctxWorkspace, viewingAs) {
     const { rows } = await db.query(
-      `SELECT id, name, slug, type, status, auto_responder_enabled, cold_mailer_enabled, platform_ai_enabled, created_at
-       FROM workspaces WHERE id = $1 AND is_deleted = FALSE`,
+      `SELECT w.id, w.name, w.slug, w.type, w.status, w.auto_responder_enabled, w.cold_mailer_enabled, w.platform_ai_enabled, w.created_at,
+              ${quota.planColumns("w")}
+       FROM workspaces w WHERE w.id = $1 AND w.is_deleted = FALSE`,
       [ctxWorkspace.id],
     );
     if (!rows[0]) throw new WorkspaceError("That workspace no longer exists.", 404);
+    const { plan: _p, trial_started_at: _a, trial_ends_at: _b, trial_expired: _c, trial_secs_left: _d, limits: _e, ...base } = rows[0];
     return {
-      ...rows[0],
+      ...base,
+      plan: await quota.planSummary(rows[0]),
       role: ctxWorkspace.role,
       permissions: {
         auto_responder: ctxWorkspace.permissions?.auto_responder !== false,

@@ -1,6 +1,8 @@
+const quotaService = require("../services/quota.service");
 const workflowService = require("../services/workflow.service");
 
 function sendError(res, error, fallback) {
+  if (quotaService.isQuotaError(error)) return res.status(403).json(quotaService.errorBody(error));
   if (error instanceof workflowService.WorkflowError) {
     return res.status(error.status).json({
       success: false,

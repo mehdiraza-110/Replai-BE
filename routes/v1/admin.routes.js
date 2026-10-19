@@ -8,6 +8,8 @@ router.post('/workspaces', admin.createWorkspace);
 router.get('/workspaces/:id', admin.getWorkspace);
 router.patch('/workspaces/:id', admin.updateWorkspace);
 router.delete('/workspaces/:id', admin.deleteWorkspace);
+router.post('/workspaces/:id/trial', admin.startTrial);
+router.post('/workspaces/:id/usage/reset', admin.resetUsage);
 
 router.post('/workspaces/:id/members', admin.addMember);
 router.patch('/workspaces/:id/members/:userId', admin.updateMember);

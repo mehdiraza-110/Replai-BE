@@ -1,5 +1,6 @@
 const db = require("../config/db.config");
 const aiKeyService = require("./aiKey.service");
+const quotaService = require("./quota.service");
 const plusVibeService = require("./plusVibe.service");
 const eventLogService = require("./eventLog.service");
 const leadProfileService = require("./leadProfile.service");
@@ -746,6 +747,8 @@ async function generateResponse(agent, context) {
   const resolved = await resolveProviderKey(agent);
 
   if (resolved) {
+    // Counts against the workspace's AI limit; a QuotaError is deliberately not swallowed into the local fallback draft.
+    await quotaService.consume(agent.workspace_id, "ai_requests", 1, { action: "generation" });
     try {
       const content = await PROVIDER_ADAPTERS[resolved.provider].call({
         apiKey: resolved.apiKey,
@@ -841,6 +844,7 @@ async function rewriteDraft(agent, instruction, draftReply) {
   if (!resolved) return null;
 
   try {
+    await quotaService.consume(agent.workspace_id, "ai_requests", 1, { action: "rewrite" });
     return await PROVIDER_ADAPTERS[resolved.provider].call({
       apiKey: resolved.apiKey,
       model: agent.agent_model,

@@ -1,3 +1,4 @@
+const quotaService = require("../services/quota.service");
 const domainService = require("../services/domain.service");
 
 async function listAvailableHostedZones(req, res) {
@@ -120,6 +121,7 @@ async function getReputationTrend(req, res) {
 }
 
 function sendError(res, error, fallbackMessage) {
+  if (quotaService.isQuotaError(error)) return res.status(403).json(quotaService.errorBody(error));
   res.status(error.statusCode || 500).json({
     success: false,
     message: error.message || fallbackMessage,

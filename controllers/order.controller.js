@@ -1,7 +1,9 @@
+const quotaService = require("../services/quota.service");
 const orderService = require("../services/order.service");
 const { WorkspaceError } = require("../services/workspace.service");
 
 function sendError(res, error, fallback) {
+  if (quotaService.isQuotaError(error)) return res.status(403).json(quotaService.errorBody(error));
   if (error instanceof WorkspaceError) return res.status(error.status).json({ success: false, message: error.message });
   console.error(fallback, error);
   res.status(500).json({ success: false, message: fallback });

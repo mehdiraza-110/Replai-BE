@@ -30,6 +30,8 @@ module.exports = {
   createWorkspace: handle("We couldn't create the workspace. Please try again.", 201, "Workspace created", (req) => adminService.createWorkspace(req.body || {})),
   getWorkspace: handle("We couldn't load this workspace. Please try again.", 200, null, (req) => adminService.getWorkspace(req.params.id)),
   updateWorkspace: handle("We couldn't update this workspace. Please try again.", 200, "Workspace updated", (req) => adminService.updateWorkspace(req.params.id, req.body || {})),
+  startTrial: handle("We couldn't start the trial. Please try again.", 200, "Trial started", (req) => adminService.startTrial(req.params.id, req.body || {})),
+  resetUsage: handle("We couldn't reset the usage. Please try again.", 200, "Usage reset", (req) => adminService.resetUsage(req.params.id, req.body || {})),
   deleteWorkspace: handle("We couldn't delete this workspace. Please try again.", 200, "Workspace deleted", async (req) => { await adminService.deleteWorkspace(req.params.id); }),
 
   addMember: handle("We couldn't add this member. Please try again.", 201, "Member added", async (req) => {

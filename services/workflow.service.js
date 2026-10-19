@@ -1,4 +1,5 @@
 const db = require("../config/db.config");
+const quota = require("./quota.service");
 const executor = require("./workflowExecutor.service");
 
 const MAX_NODES = 50;
@@ -139,11 +140,26 @@ function defaultReplyGraph() {
 async function create(workspaceId, userId, { name, description, template } = {}) {
   if (template !== undefined && template !== null && template !== "default_reply") throw new WorkflowError('Unknown template. Use "default_reply" or leave it out.');
   const graph = template === "default_reply" ? defaultReplyGraph() : { nodes: [], edges: [] };
-  const { rows } = await db.query(
-    `INSERT INTO workflows (workspace_id, name, description, graph, created_by) VALUES ($1, $2, $3, $4::jsonb, $5) RETURNING id`,
-    [workspaceId, cleanName(name), description ? String(description).slice(0, 2000) : null, JSON.stringify(graph), userId || null]
-  );
-  return get(workspaceId, rows[0].id);
+  // The limit check and the insert share one transaction under the workspace's quota lock, so parallel creates can't overshoot.
+  const client = await db.getClient();
+  let id;
+  try {
+    await client.query("BEGIN");
+    await quota.lock(client, workspaceId);
+    await quota.check(workspaceId, "workflows", 1, client);
+    const { rows } = await client.query(
+      `INSERT INTO workflows (workspace_id, name, description, graph, created_by) VALUES ($1, $2, $3, $4::jsonb, $5) RETURNING id`,
+      [workspaceId, cleanName(name), description ? String(description).slice(0, 2000) : null, JSON.stringify(graph), userId || null]
+    );
+    await client.query("COMMIT");
+    id = rows[0].id;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  return get(workspaceId, id);
 }
 
 /**

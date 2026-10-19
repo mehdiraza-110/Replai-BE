@@ -137,6 +137,7 @@ class WarmupService {
 
     const context = await this.buildAiContext({ domain, mailboxIds, workspaceId });
 
+    await require("./quota.service").consume(workspaceId, "ai_requests", 1, { action: "warmup_schedule" });
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {

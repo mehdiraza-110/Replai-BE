@@ -1,4 +1,5 @@
 const db = require("../config/db.config");
+const quota = require("./quota.service");
 
 const LOCAL_PART_PATTERN = /^[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?$/i;
 
@@ -96,6 +97,14 @@ class MailboxService {
     const limit = Number.isFinite(Number(dailyLimit)) && Number(dailyLimit) > 0 ? Math.floor(Number(dailyLimit)) : 20;
     const results = [];
 
+    // The whole batch is checked against the workspace's mailbox limit before anything is created.
+    const wanted = Array.from(new Set(localParts.map((p) => String(p || "").trim().toLowerCase()).filter((p) => p && LOCAL_PART_PATTERN.test(p))));
+    const { rows: taken } = wanted.length
+      ? await db.query(`SELECT email FROM mailboxes WHERE email = ANY($1::text[]) AND is_deleted = FALSE`, [wanted.map((p) => `${p}@${domainName}`)])
+      : { rows: [] };
+    const newCount = wanted.length - taken.length;
+    const usageId = newCount > 0 ? await quota.consume(workspaceId, "mailboxes", newCount, { domain: domainName }) : null;
+
     for (const rawLocalPart of localParts) {
       const localPart = String(rawLocalPart || "").trim().toLowerCase();
       if (!localPart) continue;
@@ -135,6 +144,7 @@ class MailboxService {
       }
     }
 
+    if (usageId) await quota.refund(workspaceId, usageId, results.filter((r) => r.status === "Created").length);
     return results;
   }
 
@@ -156,12 +166,21 @@ class MailboxService {
     const failed = [...existingEmails].map((email) => ({ email, status: "Failed", error: "A mailbox with this email already exists" }));
     if (toCreate.length === 0) return failed;
 
-    const { results } = await maildosoService.provisionMailboxes({
-      domain: domainRow.domain,
-      mailboxes: toCreate.map((localPart) => ({ localPart, ...nameForMailbox(localPart, displayName) })),
-      acceptedMonthlyIncreaseCents,
-      workspaceId: domainRow.workspace_id,
-    });
+    // Whole batch checked before anything is bought at Maildoso.
+    const usageId = await quota.consume(domainRow.workspace_id, "mailboxes", toCreate.length, { domain: domainRow.domain });
+    let results;
+    try {
+      ({ results } = await maildosoService.provisionMailboxes({
+        domain: domainRow.domain,
+        mailboxes: toCreate.map((localPart) => ({ localPart, ...nameForMailbox(localPart, displayName) })),
+        acceptedMonthlyIncreaseCents,
+        workspaceId: domainRow.workspace_id,
+      }));
+    } catch (error) {
+      await quota.refund(domainRow.workspace_id, usageId);
+      throw error;
+    }
+    await quota.refund(domainRow.workspace_id, usageId, results.filter((r) => r.status === "Created").length);
 
     const { rows } = await db.query(
       `SELECT m.*, d.domain AS domain_name, d.status AS domain_status, d.bounce_rate AS domain_bounce_rate, d.complaint_rate AS domain_complaint_rate

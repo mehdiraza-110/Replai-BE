@@ -7,7 +7,7 @@ const workspaceService = require('../services/workspace.service');
 //   req.workspaceId shorthand every service query must filter on
 // Unlike AuthGuard it does not consult the route/role permission table; access is decided by workspace membership
 // (re-read from the DB each request, so removals and suspensions apply immediately).
-const TenantGuard = async (req, res, next) => {
+const guard = (allowEnded) => async (req, res, next) => {
   const token = req.cookies && req.cookies.token;
   if (!token) return res.status(401).json({ success: false, message: 'Please sign in to continue.' });
 
@@ -30,6 +30,10 @@ const TenantGuard = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'This workspace has been suspended. Please contact support.' });
     }
 
+    if (!allowEnded && ctx.workspace.plan && ctx.workspace.plan.ended && !ctx.isSuperAdmin) {
+      return res.status(403).json({ success: false, code: 'TRIAL_ENDED', message: 'Your trial has ended. Contact support to continue.' });
+    }
+
     req.user = { id: decoded.userId, isSuperAdmin: ctx.isSuperAdmin };
     req.workspace = ctx.workspace;
     req.workspaceId = ctx.workspace.id;
@@ -46,6 +50,10 @@ const TenantGuard = async (req, res, next) => {
     res.status(500).json({ success: false, message: 'We could not verify your session. Please try again.' });
   }
 };
+
+const TenantGuard = guard(false);
+// For /workspaces/current: still works after the trial ended so the app can show the "trial ended" notice.
+const TenantGuardAllowEnded = guard(true);
 
 // Same guard, but lets specific "METHOD /path" pairs through untouched (webhooks / OAuth callbacks that carry
 // their own secret and have no browser session).
@@ -67,4 +75,4 @@ const requireProduct = (product) => (req, res, next) => {
   next();
 };
 
-module.exports = { TenantGuard, tenantGuardExcept, requireProduct };
+module.exports = { TenantGuard, TenantGuardAllowEnded, tenantGuardExcept, requireProduct };

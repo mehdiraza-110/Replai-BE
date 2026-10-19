@@ -1,3 +1,4 @@
+const quotaService = require("../services/quota.service");
 const warmupService = require("../services/warmup.service");
 
 async function listStrategies(req, res) {
@@ -57,6 +58,7 @@ async function runTick(req, res) {
 }
 
 function sendError(res, error, fallbackMessage) {
+  if (quotaService.isQuotaError(error)) return res.status(403).json(quotaService.errorBody(error));
   res.status(error.statusCode || 500).json({
     success: false,
     message: error.message || fallbackMessage,

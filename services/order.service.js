@@ -1,5 +1,6 @@
 const db = require("../config/db.config");
 const { WorkspaceError } = require("./workspace.service");
+const quota = require("./quota.service");
 
 const OPEN = ["requested", "approved", "in_progress"];
 const MAX_OPEN = 10;
@@ -115,6 +116,7 @@ const orderService = {
       throw new WorkspaceError("Quantity must be a whole number between 1 and 500.", 400);
     }
     const details = await validateDetails(workspaceId, body.type, body.details);
+    await quota.assertOrderQuantity(workspaceId, body.type, body.quantity);
 
     const client = await db.getClient();
     try {

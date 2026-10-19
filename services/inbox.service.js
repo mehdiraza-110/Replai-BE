@@ -2,6 +2,7 @@ const db = require("../config/db.config");
 const suppressionService = require("./suppression.service");
 const { buildRawMimeMessage, threadIdFor, sesClient, mailboxDomain } = require("./campaignSend.service");
 const { sendRawEmail } = require("./mailTransport.service");
+const quotaService = require("./quota.service");
 
 /**
  * The unified inbox: every thread (one per mailbox+lead pair) across every mailbox,
@@ -185,14 +186,21 @@ class InboxService {
       messageIdDomain: mailboxDomain(mailbox),
     });
 
-    await sendRawEmail({
-      mailbox,
-      fromAddress,
-      to: leadEmail,
-      raw,
-      sesClient,
-      tags: latest.campaign_id ? [{ Name: "campaign_id", Value: String(latest.campaign_id) }] : undefined,
-    });
+    // Counts against the workspace's email limit just before sending (a manual/workflow reply gets the 403 error).
+    const usageId = await quotaService.consume(mailbox.workspace_id, "emails", 1, { source: "reply" });
+    try {
+      await sendRawEmail({
+        mailbox,
+        fromAddress,
+        to: leadEmail,
+        raw,
+        sesClient,
+        tags: latest.campaign_id ? [{ Name: "campaign_id", Value: String(latest.campaign_id) }] : undefined,
+      });
+    } catch (error) {
+      await quotaService.refund(mailbox.workspace_id, usageId);
+      throw error;
+    }
 
     const { rows: inserted } = await db.query(
       `INSERT INTO messages (mailbox_id, direction, campaign_id, campaign_lead_id, thread_id, message_id, in_reply_to, from_address, to_address, subject, body_text, workspace_id)

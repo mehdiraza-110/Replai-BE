@@ -1,4 +1,5 @@
 const db = require("../config/db.config");
+const quota = require("./quota.service");
 const eventLog = require("./eventLog.service");
 const orderService = require("./order.service");
 const { WorkspaceError } = require("./workspace.service");
@@ -312,6 +313,9 @@ const adminOrderService = {
         }
         orderOut = { id: order.id, status: "in_progress" };
       }
+      // Assigned domains/mailboxes count as the workspace's usage, but an admin assignment is never blocked by a limit.
+      await quota.record(targetId, "domains", domainIds.length, { source: "admin_assign" }, client);
+      if (mailboxIds.length) await quota.record(targetId, "mailboxes", mailboxIds.length, { source: "admin_assign" }, client);
       await client.query("COMMIT");
       result = {
         workspace: { id: target.id, name: target.name, slug: target.slug },

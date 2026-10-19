@@ -21,6 +21,7 @@ const {
 const { CloudWatchClient, GetMetricDataCommand } = require("@aws-sdk/client-cloudwatch");
 const dns = require("node:dns").promises;
 const db = require("../config/db.config");
+const quota = require("./quota.service");
 
 const AWS_REGION = process.env.AWS_REGION || "us-east-1";
 const MAIL_FROM_SUBDOMAIN = process.env.SES_MAIL_FROM_SUBDOMAIN || "mail";
@@ -128,14 +129,32 @@ class DomainService {
         const result = await this.onboardDomain(domainName, hostedZoneId, createdBy, workspaceId);
         results.push(result);
       } catch (error) {
-        results.push({ domain: domainName, status: "Failed", error: error.message });
+        results.push({ domain: domainName, status: "Failed", error: error.message, ...(error.code ? { code: error.code } : {}) });
       }
     }
     return results;
   }
 
+  // Counts a new domain against the workspace's limit before any AWS side effect (re-onboarding a domain the
+  // workspace already has is not a new domain). Returns a usage event id to refund if onboarding then fails.
+  async consumeDomainQuota(domainName, workspaceId) {
+    const { rows } = await db.query(`SELECT 1 FROM domains WHERE domain = $1 AND workspace_id = $2 AND is_deleted = FALSE`, [domainName, workspaceId]);
+    if (rows[0]) return null;
+    return quota.consume(workspaceId, "domains", 1, { domain: domainName });
+  }
+
   async onboardDomain(domainName, hostedZoneId, createdBy, workspaceId) {
     await this.assertDomainAvailable(domainName, workspaceId);
+    const usageId = await this.consumeDomainQuota(domainName, workspaceId);
+    try {
+      return await this.onboardDomainUnchecked(domainName, hostedZoneId, createdBy, workspaceId);
+    } catch (error) {
+      await quota.refund(workspaceId, usageId);
+      throw error;
+    }
+  }
+
+  async onboardDomainUnchecked(domainName, hostedZoneId, createdBy, workspaceId) {
     const { dkimTokens, mailFromDomain } = await this.createSesIdentity(domainName);
 
     // Write the DNS records SES needs into Route53: DKIM CNAMEs, MAIL FROM MX + SPF, root SPF, DMARC.
@@ -178,6 +197,16 @@ class DomainService {
   // instead of writing them ourselves.
   async onboardExternalDomain(domainName, createdBy, workspaceId) {
     await this.assertDomainAvailable(domainName, workspaceId);
+    const usageId = await this.consumeDomainQuota(domainName, workspaceId);
+    try {
+      return await this.onboardExternalDomainUnchecked(domainName, createdBy, workspaceId);
+    } catch (error) {
+      await quota.refund(workspaceId, usageId);
+      throw error;
+    }
+  }
+
+  async onboardExternalDomainUnchecked(domainName, createdBy, workspaceId) {
     const { dkimTokens, mailFromDomain } = await this.createSesIdentity(domainName);
 
     const record = await this.upsertDomainRecord({

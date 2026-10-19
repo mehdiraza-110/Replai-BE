@@ -1,6 +1,7 @@
 const db = require("../config/db.config");
 const workspaceService = require("./workspace.service");
 const memberService = require("./member.service");
+const quota = require("./quota.service");
 
 const { WorkspaceError } = workspaceService;
 const PROVIDERS = ["openai", "anthropic", "gemini"];
@@ -26,7 +27,7 @@ function ownerName(o) {
 }
 
 const WORKSPACE_COLUMNS = `w.id, w.name, w.slug, w.type, w.status, w.auto_responder_enabled, w.cold_mailer_enabled,
-  w.platform_ai_enabled, w.created_at`;
+  w.platform_ai_enabled, w.created_at, ${quota.planColumns("w")}`;
 
 // Decorates workspace rows with member_count, owner and resource counts using grouped queries (no N+1).
 async function decorate(rows) {
@@ -63,8 +64,13 @@ async function decorate(rows) {
   return rows.map((r) => {
     const o = ownerBy.get(r.id);
     const c = countBy.get(r.id) || {};
+    const light = quota.lightPlan(r);
+    const { plan: _p, trial_started_at: _a, trial_ends_at: _b, trial_expired: _c, trial_secs_left: _d, limits: _e, ...base } = r;
     return {
-      ...r,
+      ...base,
+      plan: light.type,
+      trial_ends_at: light.trial_ends_at,
+      days_left: light.days_left,
       member_count: memberBy.get(r.id) || 0,
       owner: o ? { id: o.id, email: o.email, name: ownerName(o) } : null,
       counts: { domains: c.domains || 0, mailboxes: c.mailboxes || 0, campaigns: c.campaigns || 0, agents: c.agents || 0 },
@@ -72,11 +78,17 @@ async function decorate(rows) {
   });
 }
 
-async function loadWorkspace(id) {
+async function loadWorkspace(id, withPlanSummary = false) {
   const { rows } = await db.query(`SELECT ${WORKSPACE_COLUMNS} FROM workspaces w WHERE w.id = $1 AND w.is_deleted = FALSE`, [id]);
   if (!rows[0]) throw new WorkspaceError("That workspace could not be found.", 404);
-  return (await decorate(rows))[0];
+  const decorated = (await decorate(rows))[0];
+  // List/PATCH shape: flat `plan` ("trial"|"standard"), trial_ends_at, days_left. GET /:id swaps `plan` for the full object.
+  return withPlanSummary ? { ...decorated, plan: await quota.planSummary(rows[0]) } : decorated;
 }
+
+const isKoval = (slug) => slug === "koval-group";
+const badRequest = (m) => new WorkspaceError(m, 400);
+const KOVAL_PLAN_MSG = "Koval Group is the platform's own workspace and can't be put on a trial or given limits.";
 
 const adminService = {
   async listWorkspaces(query) {
@@ -116,7 +128,7 @@ const adminService = {
 
   async getWorkspace(idRaw) {
     const id = parseId(idRaw);
-    const workspace = await loadWorkspace(id);
+    const workspace = await loadWorkspace(id, true);
     const [members, keys, usage] = await Promise.all([
       memberService.list(id, null),
       db.query(`SELECT provider, key_preview, updated_at FROM workspace_ai_keys WHERE workspace_id = $1`, [id]),
@@ -157,6 +169,48 @@ const adminService = {
       }
     }
 
+    // ---- plan / trial / limits ----
+    const wantsPlan = body.plan !== undefined, wantsEnd = body.trial_ends_at !== undefined, wantsExtend = body.extend_trial_days !== undefined;
+    if (wantsPlan && !["trial", "standard"].includes(body.plan)) throw badRequest('Plan must be "trial" or "standard".');
+    if (wantsEnd && wantsExtend) throw badRequest("Send either trial_ends_at or extend_trial_days, not both.");
+    let cleanLimits;
+    if (body.limits !== undefined) cleanLimits = quota.validateLimits(body.limits, badRequest);
+    let endsAt;
+    if (wantsEnd) {
+      endsAt = new Date(body.trial_ends_at);
+      if (typeof body.trial_ends_at !== "string" || Number.isNaN(endsAt.getTime())) throw badRequest("trial_ends_at must be a date like 2026-12-31T23:59:00Z.");
+    }
+    if (wantsExtend && (!Number.isInteger(body.extend_trial_days) || body.extend_trial_days < 1 || body.extend_trial_days > 365)) {
+      throw badRequest("extend_trial_days must be a whole number of days between 1 and 365.");
+    }
+    if (wantsPlan || wantsEnd || wantsExtend || body.limits !== undefined) {
+      const { rows: cur } = await db.query(`SELECT plan, trial_ends_at, limits FROM workspaces WHERE id = $1 AND is_deleted = FALSE`, [id]);
+      if (!cur[0]) throw new WorkspaceError("That workspace could not be found.", 404);
+      const willBeTrial = wantsPlan ? body.plan === "trial" : cur[0].plan === "trial";
+      if (isKoval(current[0] && current[0].slug) && (body.plan === "trial" || wantsEnd || wantsExtend || (cleanLimits && Object.keys(cleanLimits).length))) {
+        throw new WorkspaceError(KOVAL_PLAN_MSG, 409);
+      }
+      if ((wantsEnd || wantsExtend) && !willBeTrial) throw badRequest('Only a workspace on a trial has an end date. Set plan to "trial" first (or use the trial endpoint).');
+      if (wantsPlan) add("plan", body.plan);
+      if (body.plan === "trial") {
+        if (cur[0].plan !== "trial") sets.push("trial_started_at = NOW()");
+        if (!wantsEnd && !wantsExtend && (cur[0].plan !== "trial" || !cur[0].trial_ends_at)) sets.push(`trial_ends_at = NOW() + INTERVAL '${quota.TRIAL_DAYS} days'`);
+        if (cleanLimits === undefined && !Object.keys(cur[0].limits || {}).length) cleanLimits = { ...JSON.parse(JSON.stringify(quota.TRIAL_DEFAULTS)) };
+      }
+      if (wantsEnd) {
+        params.push(endsAt.toISOString());
+        sets.push(`trial_ends_at = $${params.length}::timestamptz`);
+      }
+      if (wantsExtend) {
+        params.push(body.extend_trial_days);
+        sets.push(`trial_ends_at = GREATEST(COALESCE(trial_ends_at, NOW()), NOW()) + ($${params.length}::int * INTERVAL '1 day')`);
+      }
+      if (cleanLimits !== undefined) {
+        params.push(JSON.stringify(cleanLimits));
+        sets.push(`limits = $${params.length}::jsonb`);
+      }
+    }
+
     if (body.name !== undefined) {
       const name = String(body.name || "").trim();
       if (name.length < 2 || name.length > 120) throw new WorkspaceError("Workspace name must be between 2 and 120 characters.", 400);
@@ -183,6 +237,41 @@ const adminService = {
     );
     if (!rowCount) throw new WorkspaceError("That workspace could not be found.", 404);
     return loadWorkspace(id);
+  },
+
+  // Starts (or restarts) a trial: plan=trial, a fresh start/end, and the given or default limits.
+  async startTrial(idRaw, body = {}) {
+    const id = parseId(idRaw);
+    const { rows } = await db.query(`SELECT slug FROM workspaces WHERE id = $1 AND is_deleted = FALSE`, [id]);
+    if (!rows[0]) throw new WorkspaceError("That workspace could not be found.", 404);
+    if (isKoval(rows[0].slug)) throw new WorkspaceError(KOVAL_PLAN_MSG, 409);
+    let days = quota.TRIAL_DAYS;
+    if (body.days !== undefined && body.days !== null) {
+      if (!Number.isInteger(body.days) || body.days < 1 || body.days > 365) throw badRequest("Trial length must be a whole number of days between 1 and 365.");
+      days = body.days;
+    }
+    const limits = body.limits !== undefined && body.limits !== null
+      ? quota.validateLimits(body.limits, badRequest)
+      : JSON.parse(JSON.stringify(quota.TRIAL_DEFAULTS));
+    await db.query(
+      `UPDATE workspaces SET plan = 'trial', trial_started_at = NOW(), trial_ends_at = NOW() + ($2::int * INTERVAL '1 day'), limits = $3::jsonb, updated_at = NOW() WHERE id = $1`,
+      [id, days, JSON.stringify(limits)],
+    );
+    return loadWorkspace(id);
+  },
+
+  // Clears rolling usage (all kinds, or one) so the workspace can use its allowance again.
+  async resetUsage(idRaw, body = {}) {
+    const id = parseId(idRaw);
+    await this.assertWorkspace(id);
+    const kind = body.kind;
+    if (kind !== undefined && kind !== null && !["ai_requests", "domains", "mailboxes", "emails"].includes(kind)) {
+      throw badRequest('kind must be one of: ai_requests, domains, mailboxes, emails. (Workflow limits count existing workflows, so there is no usage to reset.)');
+    }
+    const { rowCount } = kind
+      ? await db.query(`DELETE FROM workspace_usage_events WHERE workspace_id = $1 AND kind = $2`, [id, kind])
+      : await db.query(`DELETE FROM workspace_usage_events WHERE workspace_id = $1`, [id]);
+    return { kind: kind || null, cleared: rowCount };
   },
 
   async deleteWorkspace(idRaw) {
