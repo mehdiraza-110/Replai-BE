@@ -30,6 +30,7 @@ const aiKeyRoutes = require('./ai-keys.routes');
 const adminRoutes = require('./admin.routes');
 const memberRoutes = require('./members.routes');
 const workflowRoutes = require('./workflows.routes');
+const orderRoutes = require('./orders.routes');
 
 // User + workspace routes guard themselves (signup/login are public; everything else is per-route).
 router.use('/users', userRoutes);
@@ -51,8 +52,11 @@ router.use('/analytics', TenantGuard, analyticsRoutes);
 router.use('/knowledge', TenantGuard, knowledgeRoutes);
 router.use('/notifications', TenantGuard, notificationRoutes);
 router.use('/calendar', tenantGuardExcept('GET /google/callback'), calendarRoutes); // callback is verified via signed OAuth state
-router.use('/domains', TenantGuard, domainRoutes);
-router.use('/mailboxes', TenantGuard, mailboxRoutes);
+// Reading domains/mailboxes is shared (the auto responder and workflows send through mailboxes);
+// changing them is Cold Mailer work, so members without that product can't.
+const coldMailerForWrites = (req, res, next) => (req.method === 'GET' || req.method === 'HEAD' ? next() : coldMailer(req, res, next));
+router.use('/domains', TenantGuard, coldMailerForWrites, domainRoutes);
+router.use('/mailboxes', TenantGuard, coldMailerForWrites, mailboxRoutes);
 
 // Auto responder
 router.use('/plusvibe', tenantGuardExcept('POST /webhook'), (req, res, next) => (req.path === '/webhook' ? next() : autoResponder(req, res, next)), plusVibeRoutes);
@@ -71,6 +75,7 @@ router.use('/warmup-pool', TenantGuard, coldMailer, warmupPoolRoutes);
 router.use('/members', TenantGuard, memberRoutes);
 router.use('/ai-keys', TenantGuard, aiKeyRoutes);
 router.use('/workflows', TenantGuard, workflowRoutes);
+router.use('/orders', TenantGuard, coldMailer, orderRoutes);
 
 // Platform administration: super admin only, no workspace needed
 router.use('/admin', require('../../middlewares/superAdmin.middleware'), adminRoutes);

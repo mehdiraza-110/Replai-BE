@@ -9,7 +9,17 @@ const MAX_THREAD_SCAN = 250;
 class LeadService {
   async listPositiveLeads(appWorkspaceId) {
     const startedAt = Date.now();
-    const { integration, apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace(appWorkspaceId);
+    let authorized;
+    try {
+      authorized = await plusVibeService.getAuthorizedWorkspace(appWorkspaceId);
+    } catch (error) {
+      // A workspace that has not connected PlusVibe simply has no leads yet.
+      if (error.code === "PLUSVIBE_NOT_CONNECTED") {
+        return { items: [], stats: { totalLeads: 0, highInterest: 0, meetingStage: 0, humanManaged: 0 } };
+      }
+      throw error;
+    }
+    const { integration, apiKey, workspace } = authorized;
     const threads = await fetchThreads(apiKey, workspace.id);
     const positiveThreads = threads.filter(isPositiveThread);
     const campaignMap = await getCampaignMap(integration.id, appWorkspaceId);

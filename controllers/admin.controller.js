@@ -1,10 +1,11 @@
 const adminService = require("../services/admin.service");
 const memberService = require("../services/member.service");
+const adminOrderService = require("../services/adminOrder.service");
 const { WorkspaceError } = require("../services/workspace.service");
 
 function sendError(res, error, fallback) {
   if (error instanceof WorkspaceError) {
-    return res.status(error.status).json({ success: false, message: error.message });
+    return res.status(error.status).json({ success: false, message: error.message, ...(error.code ? { code: error.code } : {}) });
   }
   console.error(fallback, error);
   res.status(500).json({ success: false, message: fallback });
@@ -48,4 +49,10 @@ module.exports = {
   updateUser: handle("We couldn't update this user. Please try again.", 200, "User updated", (req) => adminService.updateUser(req.user.id, req.params.id, req.body || {})),
 
   analytics: handle("We couldn't load analytics. Please try again.", 200, null, (req) => adminService.analytics(req.query)),
+
+  listOrders: handle("We couldn't load order requests. Please try again.", 200, null, (req) => adminOrderService.list(req.query)),
+  countOrders: handle("We couldn't load the order counts. Please try again.", 200, null, () => adminOrderService.count()),
+  getOrder: handle("We couldn't load this request. Please try again.", 200, null, (req) => adminOrderService.get(req.params.id)),
+  updateOrder: handle("We couldn't update this request. Please try again.", 200, "Request updated", (req) => adminOrderService.update(req.user.id, req.params.id, req.body || {})),
+  assignDomains: handle("We couldn't assign these domains. Nothing was changed. Please try again.", 200, "Domains assigned", (req) => adminOrderService.assignDomains(req.user.id, req.params.id, req.body || {})),
 };

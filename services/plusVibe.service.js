@@ -769,6 +769,7 @@ async function getIntegrationOrThrow(workspaceId) {
   if (!integration) {
     const error = new Error("Configure PlusVibe before testing the connection");
     error.statusCode = 400;
+    error.code = "PLUSVIBE_NOT_CONNECTED";
     throw error;
   }
 

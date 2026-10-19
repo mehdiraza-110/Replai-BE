@@ -1,9 +1,10 @@
 const db = require("../config/db.config");
 
 class WorkspaceError extends Error {
-  constructor(message, status = 400) {
+  constructor(message, status = 400, code = undefined) {
     super(message);
     this.status = status;
+    if (code) this.code = code;
   }
 }
 

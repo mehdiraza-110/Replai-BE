@@ -13,7 +13,15 @@ const MEETING_OBJECTIVE = "schedule a meeting";
 class MessageService {
   async listConversations(workspaceId, query = {}) {
     const startedAt = Date.now();
-    const { integration, apiKey, workspace } = await plusVibeService.getAuthorizedWorkspace(workspaceId);
+    let authorized;
+    try {
+      authorized = await plusVibeService.getAuthorizedWorkspace(workspaceId);
+    } catch (error) {
+      // A workspace that has not connected PlusVibe simply has no conversations yet.
+      if (error.code === "PLUSVIBE_NOT_CONNECTED") return { items: [], nextPageTrail: "", hasMore: false };
+      throw error;
+    }
+    const { integration, apiKey, workspace } = authorized;
     const limit = clampLimit(query.limit, 20);
     const pageTrail = cleanString(query.pageTrail) || "";
     const params = new URLSearchParams({
@@ -187,7 +195,10 @@ class MessageService {
     return draft;
   }
 
-  async generateDraftFromWebhook(workspaceId, payload = {}) {
+  // `override` ({ agentId, tone, instructions }, all optional) is used by workflows: the draft is written by that agent
+  // (with the tone/instructions applied) instead of the campaign's assigned agent, and works for campaigns with no agent.
+  // Omitted -> exactly the built-in behaviour.
+  async generateDraftFromWebhook(workspaceId, payload = {}, override = null) {
     const startedAt = Date.now();
     const threadId = getWebhookThreadId(payload);
     const webhookLabel = normalizeWebhookLabel(payload.label || payload.reply_label || payload.intent || payload.webhook_event || payload.event_type || payload.eventType);
@@ -247,7 +258,12 @@ class MessageService {
     }
 
     const campaignId = cleanString(latestInbound.campaign_id || payload.campaign_id || payload.campaignId || remoteMessages[0]?.campaign_id);
-    const campaign = await getCampaignWithAgent(integration.id, campaignId, workspaceId);
+    let campaign = await getCampaignWithAgent(integration.id, campaignId, workspaceId);
+    if (override?.agentId) {
+      const overrideAgent = await getOverrideAgent(workspaceId, override.agentId);
+      if (!overrideAgent) return { status: "Skipped", reason: "The AI agent for this step is not available" };
+      campaign = applyAgentOverride(campaign, overrideAgent, override, campaignId);
+    }
     const mappedInbound = mapMessage(latestInbound);
     const leadEmail = extractEmailAddress(latestInbound.lead || latestInbound.from_address_email || mappedInbound.fromEmail);
 
@@ -608,14 +624,113 @@ async function ensureDraft(workspaceId, integrationId, campaign, latestInbound, 
   return mapDraft(result.rows[0]);
 }
 
-// Resolves the OpenAI key for the agent's workspace (workspace key, else platform key when the workspace may use it).
-// Returns null when the agent isn't an OpenAI agent, or for a platform-enabled workspace with no env key configured
+// Providers an agent can run on. `label` feeds error messages; `call` performs one chat completion and returns the text.
+// OpenAI's request is byte-for-byte what generateResponse/rewriteDraft always sent.
+const PROVIDER_ADAPTERS = {
+  openai: {
+    label: "OpenAI",
+    async call({ apiKey, model, system, user, temperature, action }) {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          ...temperatureParams(model, temperature),
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user },
+          ],
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+
+      if (!response.ok) throw new Error(payload?.error?.message || `OpenAI ${action} failed`);
+
+      return cleanString(payload.choices?.[0]?.message?.content);
+    },
+  },
+  anthropic: {
+    label: "Anthropic",
+    async call({ apiKey, model, system, user, temperature, action }) {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 2048,
+          temperature,
+          system,
+          messages: [{ role: "user", content: user }],
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+
+      if (!response.ok) throw new Error(payload?.error?.message || `Anthropic ${action} failed`);
+
+      const text = (Array.isArray(payload.content) ? payload.content : [])
+        .filter((block) => block?.type === "text")
+        .map((block) => block.text)
+        .join("");
+      return cleanString(text);
+    },
+  },
+  gemini: {
+    label: "Gemini",
+    async call({ apiKey, model, system, user, temperature, action }) {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "x-goog-api-key": apiKey,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: system }] },
+            contents: [{ role: "user", parts: [{ text: user }] }],
+            generationConfig: { temperature },
+          }),
+        }
+      );
+      const payload = await response.json().catch(() => ({}));
+
+      if (!response.ok) throw new Error(payload?.error?.message || `Gemini ${action} failed`);
+
+      const parts = payload.candidates?.[0]?.content?.parts;
+      const text = (Array.isArray(parts) ? parts : []).map((part) => part?.text || "").join("");
+      return cleanString(text);
+    },
+  },
+};
+
+// Maps whatever is stored in ai_agents.ai_provider ("OpenAI", "anthropic", "Google Gemini"...) to an adapter id, or null.
+function providerIdOf(agent) {
+  const raw = String(agent.agent_provider || "").trim().toLowerCase();
+  if (!raw) return null;
+  try {
+    const id = aiKeyService.normalizeProvider(raw);
+    return PROVIDER_ADAPTERS[id] ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolves { provider, apiKey } for the agent's workspace (workspace key, else platform key when the workspace may use it).
+// Returns null when the agent's provider isn't supported, or for a platform-enabled workspace with no env key configured
 // (legacy behaviour: local fallback draft). Throws AI_PROVIDER_KEY_MISSING (402) for a workspace without a usable key.
-async function resolveOpenAiKey(agent) {
-  if (String(agent.agent_provider || "").toLowerCase() !== "openai") return null;
+async function resolveProviderKey(agent) {
+  const provider = providerIdOf(agent);
+  if (!provider) return null;
 
   try {
-    return await aiKeyService.getApiKey(agent.workspace_id, "openai");
+    return { provider, apiKey: await aiKeyService.getApiKey(agent.workspace_id, provider) };
   } catch (error) {
     if (error.code === "AI_PROVIDER_KEY_MISSING" && error.platformAiEnabled) return null;
     throw error;
@@ -628,30 +743,19 @@ function temperatureParams(model, value) {
 }
 
 async function generateResponse(agent, context) {
-  const openAiKey = await resolveOpenAiKey(agent);
+  const resolved = await resolveProviderKey(agent);
 
-  if (openAiKey) {
+  if (resolved) {
     try {
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${openAiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: agent.agent_model,
-          ...temperatureParams(agent.agent_model, 0.4),
-          messages: [
-            { role: "system", content: buildSystemPrompt(agent, context) },
-            { role: "user", content: JSON.stringify(context, null, 2) },
-          ],
-        }),
+      const content = await PROVIDER_ADAPTERS[resolved.provider].call({
+        apiKey: resolved.apiKey,
+        model: agent.agent_model,
+        system: buildSystemPrompt(agent, context),
+        user: JSON.stringify(context, null, 2),
+        temperature: 0.4,
+        action: "generation",
       });
-      const payload = await response.json().catch(() => ({}));
 
-      if (!response.ok) throw new Error(payload?.error?.message || "OpenAI generation failed");
-
-      const content = cleanString(payload.choices?.[0]?.message?.content);
       if (content) {
         const parsed = parseMeetingGeneration(agent, content);
 
@@ -661,7 +765,7 @@ async function generateResponse(agent, context) {
           selectedSlot: parsed.selectedSlot,
           intent: parsed.intent,
           confidence: 82,
-          generatedBy: "openai",
+          generatedBy: resolved.provider,
           error: null,
         };
       }
@@ -728,35 +832,23 @@ function stripJsonFences(content) {
  * the rewrite is unavailable or fails — callers keep the original draft.
  */
 async function rewriteDraft(agent, instruction, draftReply) {
-  let openAiKey = null;
+  let resolved = null;
   try {
-    openAiKey = await resolveOpenAiKey(agent);
+    resolved = await resolveProviderKey(agent);
   } catch (error) {
     console.warn("Meeting reply rewrite skipped:", error.message);
   }
-  if (!openAiKey) return null;
+  if (!resolved) return null;
 
   try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${openAiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: agent.agent_model,
-        ...temperatureParams(agent.agent_model, 0.4),
-        messages: [
-          { role: "system", content: instruction },
-          { role: "user", content: draftReply },
-        ],
-      }),
+    return await PROVIDER_ADAPTERS[resolved.provider].call({
+      apiKey: resolved.apiKey,
+      model: agent.agent_model,
+      system: instruction,
+      user: draftReply,
+      temperature: 0.4,
+      action: "rewrite",
     });
-    const payload = await response.json().catch(() => ({}));
-
-    if (!response.ok) throw new Error(payload?.error?.message || "OpenAI rewrite failed");
-
-    return cleanString(payload.choices?.[0]?.message?.content);
   } catch (error) {
     console.warn("Meeting reply rewrite failed, keeping the original draft:", error.message);
     return null;
@@ -949,6 +1041,45 @@ async function getProfileMap(pvWorkspaceId, threads, workspaceId) {
     .filter(Boolean);
 
   return leadProfileService.getByEmails(pvWorkspaceId, emails, workspaceId);
+}
+
+async function getOverrideAgent(workspaceId, agentId) {
+  const { rows } = await db.query(
+    `SELECT * FROM ai_agents WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE AND status = 'Active'`,
+    [agentId, workspaceId]
+  );
+  return rows[0] || null;
+}
+
+// Overlays a workflow node's agent (plus optional tone/instructions) on the campaign row ensureDraft expects.
+function applyAgentOverride(campaign, agent, override, campaignId) {
+  const extra = String(override.instructions || "").trim();
+  const rules = extra ? [agent.response_rules, extra].map((v) => String(v || "").trim()).filter(Boolean).join(". ") : agent.response_rules;
+
+  return {
+    ...(campaign || { name: null, plusvibe_campaign_id: campaignId || null }),
+    workspace_id: agent.workspace_id,
+    assigned_ai_agent_id: agent.id,
+    agent_name: agent.name,
+    agent_status: agent.status,
+    agent_persona: agent.persona,
+    agent_tone: override.tone || agent.tone,
+    agent_response_style: agent.response_style,
+    agent_company_name: agent.company_name,
+    agent_value_proposition: agent.value_proposition,
+    agent_objective: agent.objective,
+    agent_response_rules: rules,
+    agent_sales_rules: agent.sales_rules,
+    agent_safety_rules: agent.safety_rules,
+    agent_knowledge_sources: agent.knowledge_sources,
+    agent_provider: agent.ai_provider,
+    agent_model: agent.ai_model,
+    agent_fallback_meeting_url: agent.fallback_meeting_url,
+    agent_meeting_duration_minutes: agent.meeting_duration_minutes,
+    agent_working_hours_start: agent.working_hours_start,
+    agent_working_hours_end: agent.working_hours_end,
+    agent_timezone: agent.timezone,
+  };
 }
 
 async function getCampaignWithAgent(integrationId, campaignId, workspaceId) {

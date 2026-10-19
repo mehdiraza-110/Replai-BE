@@ -2,8 +2,6 @@ const db = require("../config/db.config");
 const suppressionService = require("./suppression.service");
 const messageService = require("./message.service");
 const nativeAgentReplyService = require("./nativeAgentReply.service");
-const knowledgeService = require("./knowledge.service");
-const meetingBookingService = require("./meetingBooking.service");
 const eventLogService = require("./eventLog.service");
 
 /**
@@ -318,141 +316,55 @@ async function aiAgent(node, ctx) {
 
 async function aiAgentPlusVibe({ data, ctx, agentRow, mode }) {
   const { workspaceId, event, state } = ctx;
-  // generateDraftFromWebhook resolves the agent from the campaign's assignment and has no override hook.
-  if (event.campaignId) {
-    const { rows } = await db.query(
-      `SELECT assigned_ai_agent_id FROM plusvibe_campaigns WHERE plusvibe_campaign_id = $1 AND workspace_id = $2 AND is_deleted = FALSE LIMIT 1`,
-      [String(event.campaignId), workspaceId]
-    );
-    if (rows[0] && rows[0].assigned_ai_agent_id !== agentRow.id) {
-      throw new Error(`PlusVibe replies are answered by the agent assigned to the campaign. Assign "${agentRow.name}" to this campaign in PlusVibe settings, or pick the assigned agent in this step.`);
-    }
-  }
-  const result = await messageService.generateDraftFromWebhook(workspaceId, event.payload || {});
+  // The node's agent (with its tone/instructions) answers, whichever agent the campaign has assigned.
+  const result = await messageService.generateDraftFromWebhook(workspaceId, event.payload || {}, overrideOf(data, agentRow));
   if (!result || result.status !== "Generated") {
     return { status: "skipped", output: { reason: "no_draft", detail: result?.reason || "No draft was generated for this reply." } };
   }
   state.draft = { source: "plusvibe", id: result.draft.id, lead_email: event.leadEmail };
   state.draftCreated = true;
   if (mode === "review") state.reviewOnly = true;
-  return {
-    output: {
-      draftId: result.draft.id,
-      mode,
-      confidence: Number(result.draft.confidence),
-      overridesIgnored: Boolean(data.tone || data.instructions),
-      note: data.tone || data.instructions ? "Tone/instructions overrides are not applied to PlusVibe replies." : undefined,
-    },
-  };
+  return { output: { draftId: result.draft.id, mode, confidence: Number(result.draft.confidence) } };
+}
+
+function overrideOf(data, agentRow) {
+  return { agentId: agentRow.id, tone: data.tone || undefined, instructions: data.instructions || undefined };
 }
 
 async function aiAgentNative({ data, ctx, agentRow, mode }) {
   const { workspaceId, event, state } = ctx;
-  const helpers = messageService.agentHelpers;
 
-  const [{ rows: inboundRows }, { rows: mailboxRows }] = await Promise.all([
-    db.query(`SELECT * FROM messages WHERE id = $1 AND workspace_id = $2`, [event.inboundMessageId, workspaceId]),
-    db.query(`SELECT * FROM mailboxes WHERE id = $1 AND workspace_id = $2`, [event.mailboxId, workspaceId]),
-  ]);
-  const inbound = inboundRows[0];
-  const mailbox = mailboxRows[0];
-  if (!inbound || !mailbox) throw new Error("The incoming message or its mailbox could not be found in this workspace.");
+  const result = await nativeAgentReplyService.handleInbound({
+    mailboxId: event.mailboxId,
+    campaignId: event.campaignId || null,
+    leadId: event.leadId || null,
+    inboundMessageId: event.inboundMessageId,
+    workspaceId,
+    override: overrideOf(data, agentRow),
+  });
 
-  let campaign = null;
-  let lead = null;
-  if (event.campaignId) {
-    campaign = (await db.query(`SELECT * FROM campaigns WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE`, [event.campaignId, workspaceId])).rows[0] || null;
+  if (result.status === "Skipped" && result.reason === "missing_context") {
+    throw new Error("The incoming message or its mailbox could not be found in this workspace.");
   }
-  if (event.leadId) {
-    lead = (await db.query(`SELECT * FROM campaign_leads WHERE id = $1 AND workspace_id = $2`, [event.leadId, workspaceId])).rows[0] || null;
-  }
-  const leadEmail = lead?.email || inbound.from_address;
-
-  const agent = toAgentContext(agentRow, campaign, data);
-  agent.workspace_id = workspaceId;
-  const { rows: thread } = await db.query(
-    `SELECT direction, body_text, created_at FROM messages WHERE mailbox_id = $1 AND thread_id = $2 AND workspace_id = $4 ORDER BY created_at DESC LIMIT $3`,
-    [mailbox.id, inbound.thread_id, 20, workspaceId]
-  );
-  const context = {
-    campaign: campaign?.name || null,
-    leadEmail,
-    knowledge: await knowledgeService.getAgentKnowledgeContext(workspaceId, agentRow.id),
-    latestReply: helpers.stripQuotedReply(inbound.body_text || ""),
-    conversation: thread.reverse().map((m) => ({ from: m.direction === "inbound" ? "prospect" : "human", text: m.body_text || "", timestamp: m.created_at })),
-  };
-  const meetingOffer = helpers.isMeetingObjective(agent) ? await meetingBookingService.getActiveOffer(inbound.thread_id, workspaceId).catch(() => null) : null;
-  if (meetingOffer) {
-    context.offeredSlots = meetingOffer.slots.map((slot, index) => ({ number: index + 1, time: helpers.describeSlot(slot.startTime, agent.agent_timezone) }));
-  }
-
-  const generation = await helpers.generateResponse(agent, context, workspaceId);
-  let body = generation.body;
-  if (generation.wantsMeeting || generation.selectedSlot) {
-    body = await helpers.applyMeetingBooking(agent, generation.body, {
-      offer: meetingOffer,
-      selectedSlot: generation.selectedSlot,
-      threadId: inbound.thread_id,
-      leadEmail,
-      leadName: lead?.full_name || lead?.first_name || null,
-    });
-  }
-
-  const { rows: draftRows } = await db.query(
-    `INSERT INTO ai_response_drafts (
-       ai_agent_id, plusvibe_campaign_id, thread_id, reply_to_message_id, lead_email, subject,
-       from_email, to_email, body, confidence, generated_by, generation_error, raw_context, source, mailbox_id, workspace_id
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'native', $14, $15)
-     ON CONFLICT (thread_id, reply_to_message_id) DO NOTHING
-     RETURNING *`,
-    [
-      agentRow.id,
-      campaign ? String(campaign.id) : null,
-      inbound.thread_id,
-      String(inbound.id),
-      leadEmail,
-      helpers.buildReplySubject(inbound.subject),
-      mailbox.email,
-      leadEmail,
-      body,
-      generation.confidence,
-      generation.generatedBy,
-      generation.error,
-      JSON.stringify(context),
-      mailbox.id,
-      workspaceId,
-    ]
-  );
-  const draft = draftRows[0];
-  if (!draft) {
+  if (result.status === "Skipped" && result.reason === "already_drafted") {
     state.draftCreated = true; // a draft for this message exists already: never let the built-in path add another
     return { status: "skipped", output: { reason: "already_drafted" } };
   }
-  state.draft = draft;
+  if (result.status !== "Drafted") {
+    return { status: "skipped", output: { reason: result.reason || "no_draft" } };
+  }
+
+  state.draft = result.draft;
   state.draftCreated = true;
-  await eventLogService.record({
-    eventType: "ai.draft.generated",
-    source: "native",
-    appWorkspaceId: workspaceId,
-    status: "Success",
-    campaignId: campaign ? String(campaign.id) : null,
-    campaignName: campaign?.name,
-    aiAgentId: agentRow.id,
-    aiAgentName: agentRow.name,
-    leadEmail,
-    threadId: inbound.thread_id,
-    draftId: draft.id,
-    metadata: { generatedBy: generation.generatedBy, confidence: generation.confidence, intent: generation.intent, workflow: true },
-  });
 
   let note;
   if (mode === "review") {
     state.reviewOnly = true;
-  } else if (Number(generation.confidence) < Number(agentRow.confidence_threshold)) {
+  } else if (Number(result.confidence) < Number(agentRow.confidence_threshold)) {
     state.reviewOnly = true;
-    note = `Confidence ${generation.confidence} is below the agent's threshold ${agentRow.confidence_threshold}; left as a draft for review.`;
+    note = `Confidence ${result.confidence} is below the agent's threshold ${agentRow.confidence_threshold}; left as a draft for review.`;
   }
-  return { output: { draftId: draft.id, mode, confidence: Number(generation.confidence), generatedBy: generation.generatedBy, note } };
+  return { output: { draftId: result.draftId, mode, confidence: Number(result.confidence), generatedBy: result.generatedBy, note } };
 }
 
 async function sendReply(node, ctx) {
@@ -494,34 +406,6 @@ async function sendReply(node, ctx) {
     metadata: { workflow: true },
   });
   return { output: { via: "mailbox", mailboxId, draftId: draft.id, messageId: sent.id } };
-}
-
-/** Same field names message.service.js's prompt builder reads off a PlusVibe campaign+agent row (see nativeAgentReply). */
-function toAgentContext(agent, campaign, override = {}) {
-  const rules = [agent.response_rules, override.instructions].map((v) => String(v || "").trim()).filter(Boolean).join(". ");
-  return {
-    name: campaign?.name || agent.name,
-    assigned_ai_agent_id: agent.id,
-    agent_name: agent.name,
-    agent_status: agent.status,
-    agent_persona: agent.persona,
-    agent_tone: override.tone || agent.tone,
-    agent_response_style: agent.response_style,
-    agent_company_name: agent.company_name,
-    agent_value_proposition: agent.value_proposition,
-    agent_objective: agent.objective,
-    agent_response_rules: rules || agent.response_rules,
-    agent_sales_rules: agent.sales_rules,
-    agent_safety_rules: agent.safety_rules,
-    agent_knowledge_sources: agent.knowledge_sources,
-    agent_provider: agent.ai_provider,
-    agent_model: agent.ai_model,
-    agent_fallback_meeting_url: agent.fallback_meeting_url,
-    agent_meeting_duration_minutes: agent.meeting_duration_minutes,
-    agent_working_hours_start: agent.working_hours_start,
-    agent_working_hours_end: agent.working_hours_end,
-    agent_timezone: agent.timezone,
-  };
 }
 
 module.exports = { maybeRun, runWorkflow, describeTriggerTypes, NODE_TYPES, TRIGGER_TYPES };

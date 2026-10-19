@@ -17,15 +17,32 @@ const MAX_CONVERSATION_MESSAGES = 20;
  * confidence clears the agent's threshold. Anything else waits as a Pending draft.
  */
 class NativeAgentReplyService {
-  async handleInbound({ mailboxId, campaignId, leadId, inboundMessageId }) {
-    const { rows: campaignRows } = await db.query(`SELECT * FROM campaigns WHERE id = $1 AND is_deleted = FALSE`, [campaignId]);
-    const campaign = campaignRows[0];
-    if (!campaign || campaign.is_warmup || !campaign.ai_agent_id) return { status: "Skipped", reason: "no_agent" };
+  /**
+   * `override` ({ agentId, tone, instructions }) is for workflows. Omitted, this is the built-in path, unchanged.
+   * With `override.agentId` set: that agent answers (tone/instructions applied) instead of the campaign's agent; the
+   * campaign and lead are optional (a workflow event can have neither, so `workspaceId` identifies the tenant, and the
+   * mailbox must belong to it); the draft is only saved, never auto-sent (the workflow's send step decides that).
+   */
+  async handleInbound({ mailboxId, campaignId, leadId, inboundMessageId, override = null, workspaceId: explicitWorkspaceId = null }) {
+    const overrideAgentId = override?.agentId || null;
+    let campaign = null;
+    if (campaignId) {
+      const { rows: campaignRows } = await db.query(`SELECT * FROM campaigns WHERE id = $1 AND is_deleted = FALSE`, [campaignId]);
+      campaign = campaignRows[0] || null;
+    }
+    if (!overrideAgentId) {
+      if (!campaign || campaign.is_warmup || !campaign.ai_agent_id) return { status: "Skipped", reason: "no_agent" };
+    } else if (campaign?.is_warmup) {
+      return { status: "Skipped", reason: "no_agent" };
+    }
 
     // The tenant is whatever workspace owns the campaign; every other row below must belong to it too.
-    const workspaceId = campaign.workspace_id;
+    // (Workflow case with no campaign: the caller's workspace, which the mailbox is then checked against.)
+    const workspaceId = campaign ? campaign.workspace_id : explicitWorkspaceId;
+    if (!workspaceId) return { status: "Skipped", reason: "no_agent" };
+    if (campaign && explicitWorkspaceId && Number(explicitWorkspaceId) !== Number(workspaceId)) return { status: "Skipped", reason: "missing_context" };
 
-    const { rows: agentRows } = await db.query(`SELECT * FROM ai_agents WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE`, [campaign.ai_agent_id, workspaceId]);
+    const { rows: agentRows } = await db.query(`SELECT * FROM ai_agents WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE`, [overrideAgentId || campaign.ai_agent_id, workspaceId]);
     const agentRow = agentRows[0];
     if (!agentRow || agentRow.status !== "Active") return { status: "Skipped", reason: "agent_inactive" };
 
@@ -37,21 +54,22 @@ class NativeAgentReplyService {
     const inbound = inboundRows[0];
     const lead = leadRows[0];
     const mailbox = mailboxRows[0];
-    if (!inbound || !lead || !mailbox) return { status: "Skipped", reason: "missing_context" };
+    if (!inbound || !mailbox || (!lead && !overrideAgentId)) return { status: "Skipped", reason: "missing_context" };
+    const leadEmail = lead ? lead.email : inbound.from_address;
 
     // An opt-out reply (or any suppressed address) must never get an AI answer.
-    if (await suppressionService.isSuppressed(lead.email, workspaceId)) return { status: "Skipped", reason: "suppressed" };
+    if (leadEmail && (await suppressionService.isSuppressed(leadEmail, workspaceId))) return { status: "Skipped", reason: "suppressed" };
 
     const helpers = messageService.agentHelpers;
-    const agent = toAgentContext(agentRow, campaign);
+    const agent = toAgentContext(agentRow, campaign, override || {});
     agent.workspace_id = workspaceId;
     const { rows: thread } = await db.query(
       `SELECT direction, body_text, created_at FROM messages WHERE mailbox_id = $1 AND thread_id = $2 AND workspace_id = $4 ORDER BY created_at DESC LIMIT $3`,
       [mailboxId, inbound.thread_id, MAX_CONVERSATION_MESSAGES, workspaceId]
     );
     const context = {
-      campaign: campaign.name,
-      leadEmail: lead.email,
+      campaign: campaign?.name || null,
+      leadEmail,
       knowledge: await knowledgeService.getAgentKnowledgeContext(workspaceId, agentRow.id),
       latestReply: helpers.stripQuotedReply(inbound.body_text || ""),
       conversation: thread.reverse().map((message) => ({
@@ -76,8 +94,8 @@ class NativeAgentReplyService {
         offer: meetingOffer,
         selectedSlot: generation.selectedSlot,
         threadId: inbound.thread_id,
-        leadEmail: lead.email,
-        leadName: lead.full_name || lead.first_name || null,
+        leadEmail,
+        leadName: lead?.full_name || lead?.first_name || null,
       });
     }
 
@@ -90,13 +108,13 @@ class NativeAgentReplyService {
        RETURNING *`,
       [
         agentRow.id,
-        String(campaign.id),
+        campaign ? String(campaign.id) : null,
         inbound.thread_id,
         String(inbound.id),
-        lead.email,
+        leadEmail,
         helpers.buildReplySubject(inbound.subject),
         mailbox.email,
-        lead.email,
+        leadEmail,
         body,
         generation.confidence,
         generation.generatedBy,
@@ -114,22 +132,25 @@ class NativeAgentReplyService {
       source: "native",
       appWorkspaceId: workspaceId,
       status: "Success",
-      campaignId: String(campaign.id),
-      campaignName: campaign.name,
+      campaignId: campaign ? String(campaign.id) : null,
+      campaignName: campaign?.name,
       aiAgentId: agentRow.id,
       aiAgentName: agentRow.name,
-      leadEmail: lead.email,
+      leadEmail,
       threadId: inbound.thread_id,
       draftId: draft.id,
-      metadata: { generatedBy: generation.generatedBy, confidence: generation.confidence, intent: generation.intent },
+      metadata: { generatedBy: generation.generatedBy, confidence: generation.confidence, intent: generation.intent, ...(overrideAgentId ? { workflow: true } : {}) },
     });
+
+    const result = { draftId: draft.id, draft, confidence: generation.confidence, generatedBy: generation.generatedBy };
+    if (overrideAgentId) return { status: "Drafted", ...result };
 
     const autoSend =
       !campaign.human_review_required &&
       agentRow.auto_reply_enabled &&
       !agentRow.require_human_review &&
       Number(generation.confidence) >= Number(agentRow.confidence_threshold);
-    if (!autoSend) return { status: "Drafted", draftId: draft.id };
+    if (!autoSend) return { status: "Drafted", ...result };
 
     await this.sendDraft(draft, {});
     await db.query(`UPDATE ai_response_drafts SET status = 'Sent', updated_at = NOW() WHERE id = $1 AND workspace_id = $2`, [draft.id, workspaceId]);
@@ -140,11 +161,11 @@ class NativeAgentReplyService {
       status: "Success",
       campaignId: String(campaign.id),
       aiAgentId: agentRow.id,
-      leadEmail: lead.email,
+      leadEmail,
       threadId: inbound.thread_id,
       draftId: draft.id,
     });
-    return { status: "Sent", draftId: draft.id };
+    return { status: "Sent", ...result };
   }
 
   /** Sends a native draft from the mailbox that received the reply (same path as a manual inbox reply). */
@@ -156,19 +177,21 @@ class NativeAgentReplyService {
 }
 
 /** Same field names message.service.js's prompt builder reads off a PlusVibe campaign+agent row. */
-function toAgentContext(agent, campaign) {
+function toAgentContext(agent, campaign, override = {}) {
+  const extra = String(override.instructions || "").trim();
+  const rules = extra ? [agent.response_rules, extra].map((v) => String(v || "").trim()).filter(Boolean).join(". ") : agent.response_rules;
   return {
-    name: campaign.name,
+    name: campaign?.name || agent.name,
     assigned_ai_agent_id: agent.id,
     agent_name: agent.name,
     agent_status: agent.status,
     agent_persona: agent.persona,
-    agent_tone: agent.tone,
+    agent_tone: override.tone || agent.tone,
     agent_response_style: agent.response_style,
     agent_company_name: agent.company_name,
     agent_value_proposition: agent.value_proposition,
     agent_objective: agent.objective,
-    agent_response_rules: agent.response_rules,
+    agent_response_rules: rules,
     agent_sales_rules: agent.sales_rules,
     agent_safety_rules: agent.safety_rules,
     agent_knowledge_sources: agent.knowledge_sources,

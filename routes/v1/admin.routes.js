@@ -13,6 +13,13 @@ router.post('/workspaces/:id/members', admin.addMember);
 router.patch('/workspaces/:id/members/:userId', admin.updateMember);
 router.delete('/workspaces/:id/members/:userId', admin.removeMember);
 
+router.post('/workspaces/:id/assign-domains', admin.assignDomains);
+
+router.get('/orders', admin.listOrders);
+router.get('/orders/count', admin.countOrders);
+router.get('/orders/:id', admin.getOrder);
+router.patch('/orders/:id', admin.updateOrder);
+
 router.get('/users', admin.listUsers);
 router.patch('/users/:id', admin.updateUser);
 
