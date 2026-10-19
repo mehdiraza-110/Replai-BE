@@ -10,7 +10,8 @@ const eventLogService = require("./eventLog.service");
  * maybeRun() is called by the existing pipelines at their trigger points. A workspace with no active workflow for
  * that trigger type (or whose trigger filter does not match the event) gets `{ handled: false }` and the caller
  * keeps doing exactly what it does today. When a workflow runs, every node reuses an existing service:
- *   save_to_db   -> the persistence the built-in path already performed (verified, plus the PlusVibe lead profile)
+ *   save_to_db   -> the persistence the built-in path already performed (verified, plus the PlusVibe lead profile).
+ *                   Optional in the graph: when absent it runs automatically right after the trigger.
  *   ai_agent     -> message.service agentHelpers.generateResponse / generateDraftFromWebhook (+ the same draft insert)
  *   send_reply   -> nativeAgentReply.sendDraft (inbox.service.sendReply) or message.service.approveDraft (PlusVibe)
  *
@@ -106,6 +107,9 @@ async function runWorkflow(workflow, { event = {}, dryRun = false } = {}) {
     const nodesById = new Map(graph.nodes.map((n) => [n.id, n]));
     const activated = new Set([trigger.id]);
     const ctx = { workspaceId: workflow.workspace_id, event: ev, dryRun, state, triggerType };
+    // The save step is optional in the graph, but the data is ALWAYS saved: without a "Save to database" node it runs
+    // automatically right after the trigger. It never blocks a reply (a failed save is shown in the trace only).
+    const hasSaveNode = graph.nodes.some((n) => n.type === "action.save_to_db");
 
     for (const nodeId of order) {
       if (!activated.has(nodeId)) continue;
@@ -125,6 +129,20 @@ async function runWorkflow(workflow, { event = {}, dryRun = false } = {}) {
       if (result.output !== undefined) step.output = result.output;
       step.finishedAt = new Date().toISOString();
       steps.push(step);
+
+      if (!hasSaveNode && node.type.startsWith("trigger.")) {
+        const auto = { nodeId: "auto-save", type: "action.save_to_db", status: "success", startedAt: new Date().toISOString() };
+        try {
+          const saved = await saveToDb(ctx);
+          auto.status = saved.status || "success";
+          auto.output = { ...(saved.output || {}), automatic: true };
+        } catch (error) {
+          auto.status = "failed";
+          auto.error = error.message || String(error);
+        }
+        auto.finishedAt = new Date().toISOString();
+        steps.push(auto);
+      }
 
       for (const edge of graph.edges) {
         if (edge.source !== nodeId) continue;
