@@ -27,33 +27,47 @@ const sesEventsRoutes = require('./ses-events.routes');
 const postalRoutes = require('./postal.routes');
 const workspaceRoutes = require('./workspace.routes');
 
-// User routes
+// User + workspace routes guard themselves (signup/login are public; everything else is per-route).
 router.use('/users', userRoutes);
 router.use('/workspaces', workspaceRoutes);
-router.use('/ai-models', aiModelRoutes);
-router.use('/ai-agents', aiAgentRoutes);
-router.use('/plusvibe', plusVibeRoutes);
-router.use('/messages', messageRoutes);
-router.use('/event-logs', eventLogRoutes);
-router.use('/leads', leadRoutes);
-router.use('/analytics', analyticsRoutes);
-router.use('/reviews', reviewRoutes);
-router.use('/knowledge', knowledgeRoutes);
-router.use('/notifications', notificationRoutes);
-router.use('/ghl', ghlRoutes);
-router.use('/forwarded-leads', forwardedLeadRoutes);
-router.use('/calendar', calendarRoutes);
-router.use('/domains', domainRoutes);
-router.use('/mailboxes', mailboxRoutes);
-router.use('/warmup', warmupRoutes);
-router.use('/campaigns', campaignRoutes);
+
+// Everything below is tenant data: the caller must be signed in and acting inside a workspace, and services
+// must filter by req.workspaceId. Only endpoints with their own secret or no browser session are left public.
+const { TenantGuard, tenantGuardExcept, requireProduct } = require('../../middlewares/tenant.middleware');
+const coldMailer = requireProduct('cold_mailer');
+const autoResponder = requireProduct('auto_responder');
+
+// Shared across products
+router.use('/ai-models', TenantGuard, aiModelRoutes);
+router.use('/ai-agents', TenantGuard, aiAgentRoutes);
+router.use('/messages', TenantGuard, messageRoutes);
+router.use('/event-logs', TenantGuard, eventLogRoutes);
+router.use('/leads', TenantGuard, leadRoutes);
+router.use('/analytics', TenantGuard, analyticsRoutes);
+router.use('/knowledge', TenantGuard, knowledgeRoutes);
+router.use('/notifications', TenantGuard, notificationRoutes);
+router.use('/calendar', tenantGuardExcept('GET /google/callback'), calendarRoutes); // callback is verified via signed OAuth state
+router.use('/domains', TenantGuard, domainRoutes);
+router.use('/mailboxes', TenantGuard, mailboxRoutes);
+
+// Auto responder
+router.use('/plusvibe', tenantGuardExcept('POST /webhook'), (req, res, next) => (req.path === '/webhook' ? next() : autoResponder(req, res, next)), plusVibeRoutes);
+router.use('/ghl', TenantGuard, autoResponder, ghlRoutes);
+router.use('/reviews', TenantGuard, autoResponder, reviewRoutes);
+router.use('/forwarded-leads', TenantGuard, autoResponder, forwardedLeadRoutes);
+
+// Cold mailer
+router.use('/warmup', TenantGuard, coldMailer, warmupRoutes);
+router.use('/campaigns', TenantGuard, coldMailer, campaignRoutes);
+router.use('/suppressions', TenantGuard, coldMailer, suppressionRoutes);
+router.use('/mailer-inbox', TenantGuard, coldMailer, inboxRoutes);
+router.use('/warmup-pool', TenantGuard, coldMailer, warmupPoolRoutes);
+
+// Public by design: unsubscribe links (signed token) and provider webhooks (own secret / signature).
 router.use('/unsubscribe', unsubscribeRoutes);
-router.use('/suppressions', suppressionRoutes);
 router.use('/ses-inbound', sesInboundRoutes);
 router.use('/ses-events', sesEventsRoutes);
 router.use('/postal', postalRoutes);
-router.use('/mailer-inbox', inboxRoutes);
-router.use('/warmup-pool', warmupPoolRoutes);
 
 
 module.exports = router;
