@@ -132,16 +132,15 @@ class WarmupService {
   }
 
   async generateAiSchedule({ domain, mailboxIds, workspaceId }) {
-    if (!process.env.OPENAI_API_KEY) {
-      throw Object.assign(new Error("OPENAI_API_KEY is not configured on the server"), { statusCode: 503, code: "OPENAI_NOT_CONFIGURED" });
-    }
+    // Workspace key first; platform key only if the workspace is allowed to use it (throws AI_PROVIDER_KEY_MISSING / 402).
+    const openAiKey = await require("./aiKey.service").getApiKey(workspaceId, "openai");
 
     const context = await this.buildAiContext({ domain, mailboxIds, workspaceId });
 
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${openAiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({

@@ -3,10 +3,15 @@ const router = express.Router();
 const userController = require('../../controllers/user.controller');
 const { upload } = require('../../config/multer.config');
 const AuthGuard = require('../../middlewares/jwt.middleware');
+const SessionGuard = require('../../middlewares/session.middleware');
 const SuperAdminGuard = require('../../middlewares/superAdmin.middleware');
 
 // Login
 router.post('/login', userController.login.bind(userController));
+
+// Sign out (clears the cookie; works even with an expired/missing token) and current session user
+router.post('/logout', userController.logout.bind(userController));
+router.get('/me', SessionGuard, userController.me.bind(userController));
 
 // Create a new user (public signup; privileged fields are ignored)
 router.post('/', userController.createUser.bind(userController));

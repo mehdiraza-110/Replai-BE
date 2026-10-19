@@ -62,6 +62,35 @@ const workspaceService = {
     return { isSuperAdmin, viewingAs: false, workspace: active, memberships };
   },
 
+  // Full detail of the active workspace for GET/PATCH /workspaces/current. `ctxWorkspace` is req.workspace
+  // (carries the caller's role and permissions; "View as" gives role owner).
+  async getDetail(ctxWorkspace, viewingAs) {
+    const { rows } = await db.query(
+      `SELECT id, name, slug, type, status, auto_responder_enabled, cold_mailer_enabled, platform_ai_enabled, created_at
+       FROM workspaces WHERE id = $1 AND is_deleted = FALSE`,
+      [ctxWorkspace.id],
+    );
+    if (!rows[0]) throw new WorkspaceError("That workspace no longer exists.", 404);
+    return {
+      ...rows[0],
+      role: ctxWorkspace.role,
+      permissions: {
+        auto_responder: ctxWorkspace.permissions?.auto_responder !== false,
+        cold_mailer: ctxWorkspace.permissions?.cold_mailer !== false,
+      },
+      viewingAs: viewingAs === true,
+    };
+  },
+
+  async renameWorkspace(ctxWorkspace, viewingAs, name) {
+    if (ctxWorkspace.role !== "owner") throw new WorkspaceError("Only the workspace owner can rename the workspace.", 403);
+    const cleanName = String(name || "").trim();
+    if (cleanName.length < 2) throw new WorkspaceError("Workspace name must be at least 2 characters.");
+    if (cleanName.length > 120) throw new WorkspaceError("Workspace name must be 120 characters or fewer.");
+    await db.query(`UPDATE workspaces SET name = $2, updated_at = NOW() WHERE id = $1`, [ctxWorkspace.id, cleanName]);
+    return this.getDetail(ctxWorkspace, viewingAs);
+  },
+
   async createWorkspace(userId, { name, type }) {
     const cleanName = String(name || "").trim();
     if (cleanName.length < 2) throw new WorkspaceError("Workspace name must be at least 2 characters.");

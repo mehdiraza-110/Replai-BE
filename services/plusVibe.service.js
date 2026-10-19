@@ -5,14 +5,62 @@ const eventLogService = require("./eventLog.service");
 const PLUSVIBE_API_BASE_URL = process.env.PLUSVIBE_API_BASE_URL || "https://api.plusvibe.ai";
 
 class PlusVibeService {
-  async getConnection(workspaceId) {
-    const integration = await getActiveIntegration(workspaceId);
+  // opts.baseUrl = public origin of this API, used to build the webhook URL when none is stored.
+  async getConnection(workspaceId, opts = {}) {
+    let integration = await getActiveIntegration(workspaceId);
 
     if (!integration) {
       return buildDisconnectedState();
     }
 
-    return mapIntegrationRow(integration);
+    // Integrations created before webhook secrets existed get one lazily (still not enforced) so the UI can show
+    // the tokenised URL; the owner switches enforcement on once PlusVibe has been updated.
+    if (!integration.webhook_secret) {
+      integration = await ensureWebhookSecret(integration);
+    }
+
+    return mapIntegrationRow(integration, opts);
+  }
+
+  async rotateWebhookSecret(workspaceId, opts = {}) {
+    const integration = await getIntegrationOrThrow(workspaceId);
+    const result = await db.query(
+      `UPDATE plusvibe_integrations SET webhook_secret = $1, updated_at = NOW()
+       WHERE id = $2 AND app_workspace_id = $3 RETURNING *`,
+      [generateWebhookSecret(), integration.id, workspaceId]
+    );
+    await eventLogService.record({
+      eventType: "plusvibe.webhook_secret.rotated",
+      source: "plusvibe",
+      appWorkspaceId: workspaceId,
+      status: "Success",
+      workspaceId: integration.workspace_id,
+      workspaceName: integration.workspace_name,
+      createdBy: opts.userId ?? null,
+    });
+    return webhookSummary(result.rows[0], opts);
+  }
+
+  async setWebhookSecretEnforced(workspaceId, enforced, opts = {}) {
+    const integration = await getIntegrationOrThrow(workspaceId);
+    const result = await db.query(
+      `UPDATE plusvibe_integrations
+       SET webhook_secret_enforced = $1,
+           webhook_secret = COALESCE(webhook_secret, $2),
+           updated_at = NOW()
+       WHERE id = $3 AND app_workspace_id = $4 RETURNING *`,
+      [Boolean(enforced), generateWebhookSecret(), integration.id, workspaceId]
+    );
+    await eventLogService.record({
+      eventType: enforced ? "plusvibe.webhook_secret.enforced" : "plusvibe.webhook_secret.relaxed",
+      source: "plusvibe",
+      appWorkspaceId: workspaceId,
+      status: "Success",
+      workspaceId: integration.workspace_id,
+      workspaceName: integration.workspace_name,
+      createdBy: opts.userId ?? null,
+    });
+    return webhookSummary(result.rows[0], opts);
   }
 
   async saveConnection(workspaceId, data) {
@@ -42,7 +90,7 @@ class PlusVibeService {
       cleanString(data.workspaceName),
       cleanString(data.apiKeyScope) || "workspace",
       cleanString(data.webhookEventType) || "ALL_EMAIL_REPLIES",
-      cleanString(data.webhookUrl),
+      stripWebhookToken(cleanString(data.webhookUrl)),
       data.createdBy ?? null,
     ];
 
@@ -70,7 +118,9 @@ class PlusVibeService {
         [...values.slice(0, 5), ...keyValues, existing.id, workspaceId]
       );
 
-      const mapped = mapIntegrationRow(result.rows[0]);
+      let updatedRow = result.rows[0];
+      if (!updatedRow.webhook_secret) updatedRow = await ensureWebhookSecret(updatedRow);
+      const mapped = mapIntegrationRow(updatedRow, { baseUrl: data.baseUrl });
       await eventLogService.record({
         eventType: "plusvibe.connection.updated",
         source: "plusvibe",
@@ -104,14 +154,16 @@ class PlusVibeService {
         api_key_tag,
         connection_status,
         api_status,
-        app_workspace_id
+        app_workspace_id,
+        webhook_secret,
+        webhook_secret_enforced
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Configured', 'Not tested', $10)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Configured', 'Not tested', $10, $11, TRUE)
       RETURNING *`,
-      [...values, encryptedKey.encrypted, encryptedKey.iv, encryptedKey.tag, workspaceId]
+      [...values, encryptedKey.encrypted, encryptedKey.iv, encryptedKey.tag, workspaceId, generateWebhookSecret()]
     );
 
-    const mapped = mapIntegrationRow(result.rows[0]);
+    const mapped = mapIntegrationRow(result.rows[0], { baseUrl: data.baseUrl });
     await eventLogService.record({
       eventType: "plusvibe.connection.created",
       source: "plusvibe",
@@ -490,13 +542,15 @@ class PlusVibeService {
     return plusVibeRequest(path, apiKey, options);
   }
 
-  async recordWebhook(payload) {
+  // token = the `?token=` query value sent by PlusVibe.
+  async recordWebhook(payload, token) {
     const startedAt = Date.now();
     const workspaceId = cleanString(payload.workspace_id);
 
     // No session here: the tenant is whoever owns the integration for this PlusVibe workspace id.
     const integration = await resolveWebhookIntegration(workspaceId);
     const appWorkspaceId = integration.app_workspace_id;
+    verifyWebhookToken(integration, token);
 
     const result = await db.query(
       `INSERT INTO plusvibe_webhook_events (
@@ -574,6 +628,84 @@ async function getActiveIntegration(workspaceId) {
   );
 
   return result.rows[0] || null;
+}
+
+function generateWebhookSecret() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+async function ensureWebhookSecret(integration) {
+  // `WHERE webhook_secret IS NULL` keeps concurrent first calls from overwriting each other's secret.
+  const result = await db.query(
+    `UPDATE plusvibe_integrations SET webhook_secret = $1 WHERE id = $2 AND webhook_secret IS NULL RETURNING *`,
+    [generateWebhookSecret(), integration.id]
+  );
+  if (result.rows[0]) return result.rows[0];
+  const current = await db.query(`SELECT * FROM plusvibe_integrations WHERE id = $1`, [integration.id]);
+  return current.rows[0] || integration;
+}
+
+function safeEqual(a, b) {
+  const left = crypto.createHash("sha256").update(String(a)).digest();
+  const right = crypto.createHash("sha256").update(String(b)).digest();
+  return crypto.timingSafeEqual(left, right);
+}
+
+// Enforced integrations reject a missing/wrong token (401, nothing written). Not-yet-enforced ones (the legacy live
+// setup) still accept it but log a warning so the owner knows the URL must be updated in PlusVibe.
+function verifyWebhookToken(integration, token) {
+  const provided = typeof token === "string" ? token : "";
+  const valid = Boolean(integration.webhook_secret) && provided.length > 0 && safeEqual(provided, integration.webhook_secret);
+  if (valid) return;
+
+  if (integration.webhook_secret_enforced) {
+    const error = new Error("Invalid or missing webhook token. Copy the current webhook URL (including ?token=) from Settings → Integrations into PlusVibe.");
+    error.statusCode = 401;
+    error.code = "WEBHOOK_TOKEN_INVALID";
+    throw error;
+  }
+
+  console.warn(
+    `PlusVibe webhook for workspace ${integration.app_workspace_id} (integration ${integration.id}) arrived ${provided ? "with an invalid" : "without a"} token; accepted because enforcement is off.`
+  );
+}
+
+// Strip any ?token= from a URL (the UI echoes the tokenised URL back on save; the secret must not be stored twice).
+function stripWebhookToken(url) {
+  if (!url) return url;
+  try {
+    const parsed = new URL(url);
+    parsed.searchParams.delete("token");
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+// Public webhook URL: the stored one (PlusVibe may already be pointing at it) or `<baseUrl>/api/v1/plusvibe/webhook`,
+// plus ?token=<secret> when a secret exists.
+function buildWebhookUrl(row, opts = {}) {
+  let base = null;
+  if (row.webhook_url) {
+    try {
+      const parsed = new URL(row.webhook_url);
+      if (/\/plusvibe\/webhook\/?$/.test(parsed.pathname)) base = `${parsed.origin}${parsed.pathname}`;
+    } catch {
+      base = null;
+    }
+  }
+  if (!base) {
+    const origin = String(opts.baseUrl || process.env.APP_BASE_URL || "http://localhost:3001").replace(/\/+$/, "");
+    base = `${origin}/api/v1/plusvibe/webhook`;
+  }
+  return row.webhook_secret ? `${base}?token=${row.webhook_secret}` : base;
+}
+
+function webhookSummary(row, opts) {
+  return {
+    webhookUrl: buildWebhookUrl(row, opts),
+    webhookSecretEnforced: row.webhook_secret_enforced === true,
+  };
 }
 
 // Webhook side: match the PlusVibe workspace id from the payload against plusvibe_integrations.workspace_id.
@@ -722,7 +854,7 @@ async function markIntegrationFailure(integrationId, message, appWorkspaceId) {
   );
 }
 
-function mapIntegrationRow(row) {
+function mapIntegrationRow(row, opts = {}) {
   return {
     id: row.id,
     provider: "PlusVibe",
@@ -732,7 +864,8 @@ function mapIntegrationRow(row) {
     webhookEventType: row.webhook_event_type || "ALL_EMAIL_REPLIES",
     apiKeyConfigured: Boolean(row.api_key_encrypted),
     apiKeyPreview: row.api_key_encrypted ? "••••••••" : null,
-    webhookUrl: row.webhook_url,
+    webhookUrl: row.webhook_url || row.webhook_secret ? buildWebhookUrl(row, opts) : row.webhook_url,
+    webhookSecretEnforced: row.webhook_secret_enforced === true,
     connectionStatus: row.connection_status,
     apiStatus: row.api_status,
     webhookStatus: row.webhook_status,
@@ -805,6 +938,7 @@ function buildDisconnectedState() {
     apiKeyConfigured: false,
     apiKeyPreview: null,
     webhookUrl: "",
+    webhookSecretEnforced: false,
     connectionStatus: "Disconnected",
     apiStatus: "Not configured",
     webhookStatus: "Not configured",
@@ -853,4 +987,9 @@ function cleanString(value) {
   return text.length > 0 ? text : null;
 }
 
-module.exports = new PlusVibeService();
+// Shared AES-256-GCM helpers (also used by aiKey.service.js for workspace AI keys; same env-derived key).
+const plusVibeService = new PlusVibeService();
+plusVibeService.encryptValue = encrypt;
+plusVibeService.decryptValue = decrypt;
+
+module.exports = plusVibeService;

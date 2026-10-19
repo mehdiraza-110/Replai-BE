@@ -1,3 +1,5 @@
+const aiKeyService = require("./aiKey.service");
+
 const PROVIDERS = {
   openai: {
     label: "OpenAI",
@@ -50,7 +52,7 @@ function getProvider(providerId) {
   return PROVIDERS[normalizeProvider(providerId)];
 }
 
-async function getModels(providerId) {
+async function getModels(providerId, workspaceId) {
   const provider = getProvider(providerId);
 
   if (!provider) {
@@ -59,14 +61,8 @@ async function getModels(providerId) {
     throw error;
   }
 
-  const apiKey = provider.envKeys.map((key) => process.env[key]).find(Boolean);
-
-  if (!apiKey) {
-    const error = new Error(`Add a ${provider.label} API key before selecting a model.`);
-    error.code = "AI_PROVIDER_KEY_MISSING";
-    error.statusCode = 503;
-    throw error;
-  }
+  // Workspace key first; platform env key only when the workspace is allowed to use it (throws AI_PROVIDER_KEY_MISSING / 402).
+  const apiKey = await aiKeyService.getApiKey(workspaceId, normalizeProvider(providerId));
 
   const models = await provider.listModels(apiKey);
 

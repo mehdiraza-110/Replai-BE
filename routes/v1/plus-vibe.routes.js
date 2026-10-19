@@ -11,6 +11,8 @@ router.get("/inboxes", plusVibeController.listInboxes);
 router.get("/campaigns", plusVibeController.listCampaigns);
 router.post("/campaigns/sync", plusVibeController.syncCampaigns);
 router.patch("/campaigns/:id/agent", plusVibeController.assignCampaignAgent);
+router.post("/webhook-secret/rotate", plusVibeController.rotateWebhookSecret);
+router.post("/webhook-secret/enforce", plusVibeController.enforceWebhookSecret);
 router.post("/webhook", plusVibeController.receiveWebhook);
 
 module.exports = router;

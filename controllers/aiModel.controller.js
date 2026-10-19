@@ -2,7 +2,7 @@ const aiModelService = require("../services/aiModel.service");
 
 async function getModels(req, res) {
   try {
-    const data = await aiModelService.getModels(req.query.provider);
+    const data = await aiModelService.getModels(req.query.provider, req.workspaceId);
 
     res.status(200).json({
       success: true,

@@ -26,6 +26,10 @@ const sesInboundRoutes = require('./ses-inbound.routes');
 const sesEventsRoutes = require('./ses-events.routes');
 const postalRoutes = require('./postal.routes');
 const workspaceRoutes = require('./workspace.routes');
+const aiKeyRoutes = require('./ai-keys.routes');
+const adminRoutes = require('./admin.routes');
+const memberRoutes = require('./members.routes');
+const workflowRoutes = require('./workflows.routes');
 
 // User + workspace routes guard themselves (signup/login are public; everything else is per-route).
 router.use('/users', userRoutes);
@@ -62,6 +66,14 @@ router.use('/campaigns', TenantGuard, coldMailer, campaignRoutes);
 router.use('/suppressions', TenantGuard, coldMailer, suppressionRoutes);
 router.use('/mailer-inbox', TenantGuard, coldMailer, inboxRoutes);
 router.use('/warmup-pool', TenantGuard, coldMailer, warmupPoolRoutes);
+
+// Workspace management (owner/admin checks live in the controllers), AI keys, automation workflows
+router.use('/members', TenantGuard, memberRoutes);
+router.use('/ai-keys', TenantGuard, aiKeyRoutes);
+router.use('/workflows', TenantGuard, workflowRoutes);
+
+// Platform administration: super admin only, no workspace needed
+router.use('/admin', require('../../middlewares/superAdmin.middleware'), adminRoutes);
 
 // Public by design: unsubscribe links (signed token) and provider webhooks (own secret / signature).
 router.use('/unsubscribe', unsubscribeRoutes);

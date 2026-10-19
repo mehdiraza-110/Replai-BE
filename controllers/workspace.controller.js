@@ -46,6 +46,26 @@ const workspaceController = {
     }
   },
 
+  // GET /workspaces/current — details of the active workspace (TenantGuard).
+  async current(req, res) {
+    try {
+      const data = await workspaceService.getDetail(req.workspace, req.viewingAs);
+      res.status(200).json({ success: true, data });
+    } catch (error) {
+      sendError(res, error, "We couldn't load your workspace. Please try again.");
+    }
+  },
+
+  // PATCH /workspaces/current { name } — owner only.
+  async updateCurrent(req, res) {
+    try {
+      const data = await workspaceService.renameWorkspace(req.workspace, req.viewingAs, (req.body || {}).name);
+      res.status(200).json({ success: true, message: "Workspace updated", data });
+    } catch (error) {
+      sendError(res, error, "We couldn't update your workspace. Please try again.");
+    }
+  },
+
   // POST /workspaces — a new user creates their workspace (required before using the app).
   async create(req, res) {
     try {

@@ -275,6 +275,42 @@ class UserController {
     }
   }
   
+  // Sign out: clear the session cookie (same options as login so the browser actually removes it)
+  async logout(req, res) {
+    res.clearCookie('token', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict'
+    });
+    res.status(200).json({ success: true, message: 'Signed out successfully' });
+  }
+
+  // Current session user, fresh from the DB, in the same shape login returns (needs a valid token only)
+  async me(req, res) {
+    try {
+      const user = await userService.getUserById(req.user.id);
+      if (!user) {
+        return res.status(401).json({ success: false, message: 'Your session has expired. Please sign in again.' });
+      }
+      delete user.password_hash;
+
+      const ctx = await workspaceService.resolveContext(user.id, req.session && req.session.workspaceId, null);
+      res.status(200).json({
+        success: true,
+        message: 'User retrieved successfully',
+        data: {
+          ...user,
+          is_super_admin: Boolean(ctx && ctx.isSuperAdmin),
+          workspaces: (ctx && ctx.memberships) || [],
+          active_workspace_id: ctx && ctx.workspace ? ctx.workspace.id : null
+        }
+      });
+    } catch (error) {
+      console.error('Error fetching current user:', error);
+      res.status(500).json({ success: false, message: 'We could not load your account right now. Please try again.' });
+    }
+  }
+
   // Update user profile (authenticated user's own profile)
   async updateProfile(req, res) {
     try {

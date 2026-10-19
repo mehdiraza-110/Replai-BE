@@ -59,7 +59,8 @@ class EventLogService {
       // this single hook is enough to keep every connected browser tab live —
       // no matter which page it's on — without wiring a broadcast into each
       // individual service method.
-      realtimeService.broadcast("event", mapped);
+      // Scoped to the owning workspace so other tenants never see it.
+      realtimeService.broadcast(result.rows[0].app_workspace_id, "event", mapped);
 
       return mapped;
     } catch (error) {

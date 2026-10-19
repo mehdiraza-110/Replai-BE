@@ -215,6 +215,18 @@ class CampaignSendService {
         [mailbox.id, campaign.id, lead.id, threadIdFor(mailbox.id, lead.email), rfcMessageId, mailbox.email, lead.email, subject, body, campaign.workspace_id]
       );
 
+      // Let an active "mail sent" workflow react (fire-and-forget: the email is already out). Not for warmup
+      // traffic or follow-up steps.
+      if (!campaign.is_warmup && !followUp) {
+        require("./workflowExecutor.service")
+          .maybeRun({
+            workspaceId: campaign.workspace_id,
+            triggerType: "trigger.mail_sent",
+            event: { mailboxId: mailbox.id, campaignId: campaign.id, leadId: lead.id, leadEmail: lead.email, subject, body },
+          })
+          .catch(() => {});
+      }
+
       return { sent: true };
     } catch (error) {
       if (followUp) {

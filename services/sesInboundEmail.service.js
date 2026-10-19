@@ -137,11 +137,32 @@ class SesInboundEmailService {
 
     // Let the campaign's AI agent (if any) draft — or send — a reply. Fire-and-forget: a model
     // or send failure must never lose the inbound message that was just recorded.
-    if (lead?.campaign_id) {
-      require("./nativeAgentReply.service")
-        .handleInbound({ mailboxId: mailbox.id, campaignId: lead.campaign_id, leadId: lead.id, inboundMessageId: insertedRows[0].id })
-        .catch((error) => console.error("Native AI reply failed:", error.message));
-    }
+    // A workspace with an active "mail received" workflow lets that workflow handle the reply; with none
+    // (or when it fails before doing anything) the built-in campaign handler below runs exactly as before.
+    (async () => {
+      const wf = await require("./workflowExecutor.service").maybeRun({
+        workspaceId,
+        triggerType: "trigger.inbox_mail",
+        event: {
+          mailboxId: mailbox.id,
+          campaignId: lead?.campaign_id || null,
+          leadId: lead?.id || null,
+          inboundMessageId: insertedRows[0].id,
+          threadId: `${mailbox.id}:${fromAddress}`,
+          fromAddress,
+          toAddress,
+          subject: parsed.subject || "",
+          body: bodyText,
+        },
+      });
+      if (wf.handled || !lead?.campaign_id) return;
+      await require("./nativeAgentReply.service").handleInbound({
+        mailboxId: mailbox.id,
+        campaignId: lead.campaign_id,
+        leadId: lead.id,
+        inboundMessageId: insertedRows[0].id,
+      });
+    })().catch((error) => console.error("Native AI reply failed:", error.message));
   }
 }
 

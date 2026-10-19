@@ -88,6 +88,7 @@ function sendError(res, error, fallbackMessage) {
   res.status(error.statusCode || 500).json({
     success: false,
     message: error.message || fallbackMessage,
+    ...(error.code ? { code: error.code } : {}),
   });
 }
 

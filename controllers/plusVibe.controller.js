@@ -2,14 +2,31 @@ const plusVibeService = require("../services/plusVibe.service");
 const messageService = require("../services/message.service");
 const eventLogService = require("../services/eventLog.service");
 
+// Public origin of this API (behind a proxy, trust X-Forwarded-* headers; APP_BASE_URL wins when set).
+function baseUrlOf(req) {
+  if (process.env.APP_BASE_URL) return String(process.env.APP_BASE_URL).replace(/\/+$/, "");
+  const proto = String(req.get("x-forwarded-proto") || req.protocol).split(",")[0].trim();
+  return `${proto}://${req.get("x-forwarded-host") || req.get("host")}`;
+}
+
+function canManageWebhook(req) {
+  return req.user?.isSuperAdmin === true || ["owner", "admin"].includes(req.workspace?.role);
+}
+
+// The webhook secret is only for owners/admins; plain members get the URL without ?token=.
+function scrubSecret(req, data) {
+  if (canManageWebhook(req) || !data || typeof data.webhookUrl !== "string") return data;
+  return { ...data, webhookUrl: data.webhookUrl.replace(/([?&])token=[^&]*&?/, "$1").replace(/[?&]$/, "") };
+}
+
 async function getConnection(req, res) {
   try {
-    const data = await plusVibeService.getConnection(req.workspaceId);
+    const data = await plusVibeService.getConnection(req.workspaceId, { baseUrl: baseUrlOf(req) });
 
     res.status(200).json({
       success: true,
       message: "PlusVibe connection fetched successfully",
-      data,
+      data: scrubSecret(req, data),
     });
   } catch (error) {
     sendError(res, error, "Unable to fetch PlusVibe connection");
@@ -21,12 +38,13 @@ async function saveConnection(req, res) {
     const data = await plusVibeService.saveConnection(req.workspaceId, {
       ...req.body,
       createdBy: req.user?.id ?? null,
+      baseUrl: baseUrlOf(req),
     });
 
     res.status(200).json({
       success: true,
       message: "PlusVibe connection saved successfully",
-      data,
+      data: scrubSecret(req, data),
     });
   } catch (error) {
     sendError(res, error, "Unable to save PlusVibe connection");
@@ -40,7 +58,7 @@ async function testConnection(req, res) {
     res.status(200).json({
       success: true,
       message: "PlusVibe connection tested successfully",
-      data,
+      data: scrubSecret(req, data),
     });
   } catch (error) {
     sendError(res, error, "Unable to test PlusVibe connection");
@@ -54,7 +72,7 @@ async function refreshConnection(req, res) {
     res.status(200).json({
       success: true,
       message: "PlusVibe connection refreshed successfully",
-      data,
+      data: scrubSecret(req, data),
     });
   } catch (error) {
     sendError(res, error, "Unable to refresh PlusVibe connection");
@@ -120,12 +138,48 @@ async function assignCampaignAgent(req, res) {
   }
 }
 
+async function rotateWebhookSecret(req, res) {
+  if (!canManageWebhook(req)) {
+    return res.status(403).json({ success: false, message: "Only workspace owners and admins can rotate the webhook secret.", data: null });
+  }
+  try {
+    const data = await plusVibeService.rotateWebhookSecret(req.workspaceId, { baseUrl: baseUrlOf(req), userId: req.user?.id });
+    res.status(200).json({ success: true, message: "Webhook secret rotated. Update the webhook URL in PlusVibe.", data });
+  } catch (error) {
+    sendError(res, error, "Unable to rotate the webhook secret");
+  }
+}
+
+async function enforceWebhookSecret(req, res) {
+  if (!canManageWebhook(req)) {
+    return res.status(403).json({ success: false, message: "Only workspace owners and admins can change webhook protection.", data: null });
+  }
+  if (typeof req.body?.enforced !== "boolean") {
+    return res.status(400).json({ success: false, message: "Send { enforced: true } or { enforced: false }.", data: null });
+  }
+  try {
+    const data = await plusVibeService.setWebhookSecretEnforced(req.workspaceId, req.body.enforced, { baseUrl: baseUrlOf(req), userId: req.user?.id });
+    res.status(200).json({
+      success: true,
+      message: req.body.enforced ? "Webhook token is now required." : "Webhook token is no longer required.",
+      data,
+    });
+  } catch (error) {
+    sendError(res, error, "Unable to change webhook protection");
+  }
+}
+
 async function receiveWebhook(req, res) {
   try {
     // No session on the webhook: the tenant comes from the integration matched by the payload's PlusVibe
     // workspace id. Unmatched payloads throw here, before anything is written or any draft job is queued.
-    const { appWorkspaceId, ...data } = await plusVibeService.recordWebhook(req.body);
-    messageService.generateDraftFromWebhook(appWorkspaceId, req.body).catch(async (error) => {
+    const { appWorkspaceId, ...data } = await plusVibeService.recordWebhook(req.body, req.query?.token);
+    // An active "PlusVibe reply" workflow handles the reply; otherwise (or if it fails before doing anything)
+    // the built-in draft generation runs exactly as before.
+    require("../services/workflowExecutor.service")
+      .maybeRun({ workspaceId: appWorkspaceId, triggerType: "trigger.plusvibe_reply", event: { payload: req.body, webhookEventId: data.id } })
+      .then((wf) => (wf.handled ? null : messageService.generateDraftFromWebhook(appWorkspaceId, req.body)))
+      .catch(async (error) => {
       await eventLogService.record({
         eventType: "ai.draft.webhook_failed",
         source: "webhook",
@@ -169,4 +223,6 @@ module.exports = {
   syncCampaigns,
   assignCampaignAgent,
   receiveWebhook,
+  rotateWebhookSecret,
+  enforceWebhookSecret,
 };

@@ -55,9 +55,14 @@ const tenantGuardExcept = (...publicRoutes) => (req, res, next) =>
 // Gate a whole product. Super admin toggles these per workspace; "View as" bypasses nothing, it just acts as the owner.
 const requireProduct = (product) => (req, res, next) => {
   const flag = product === 'cold_mailer' ? req.workspace.cold_mailer_enabled : req.workspace.auto_responder_enabled;
+  const label = product === 'cold_mailer' ? 'Cold Mailer' : 'Auto Responder';
   if (flag === false) {
-    const label = product === 'cold_mailer' ? 'Cold Mailer' : 'Auto Responder';
     return res.status(403).json({ success: false, message: `${label} isn't enabled for this workspace. Contact support to turn it on.` });
+  }
+  // Plain members are further limited by their own permissions. Owners/admins and super-admin "View as"
+  // (which acts as owner) are not.
+  if (!req.viewingAs && req.workspace.role === 'member' && req.workspace.permissions && req.workspace.permissions[product] === false) {
+    return res.status(403).json({ success: false, message: `${label} isn't enabled for your account. Ask your workspace admin.` });
   }
   next();
 };

@@ -1,4 +1,5 @@
 const db = require("../config/db.config");
+const aiKeyService = require("./aiKey.service");
 const plusVibeService = require("./plusVibe.service");
 const eventLogService = require("./eventLog.service");
 const leadProfileService = require("./leadProfile.service");
@@ -607,18 +608,34 @@ async function ensureDraft(workspaceId, integrationId, campaign, latestInbound, 
   return mapDraft(result.rows[0]);
 }
 
+// Resolves the OpenAI key for the agent's workspace (workspace key, else platform key when the workspace may use it).
+// Returns null when the agent isn't an OpenAI agent, or for a platform-enabled workspace with no env key configured
+// (legacy behaviour: local fallback draft). Throws AI_PROVIDER_KEY_MISSING (402) for a workspace without a usable key.
+async function resolveOpenAiKey(agent) {
+  if (String(agent.agent_provider || "").toLowerCase() !== "openai") return null;
+
+  try {
+    return await aiKeyService.getApiKey(agent.workspace_id, "openai");
+  } catch (error) {
+    if (error.code === "AI_PROVIDER_KEY_MISSING" && error.platformAiEnabled) return null;
+    throw error;
+  }
+}
+
 // Reasoning-style models (gpt-5*, o-series) only accept the default temperature.
 function temperatureParams(model, value) {
   return /^(gpt-5|o\d)/i.test(String(model || "")) ? {} : { temperature: value };
 }
 
 async function generateResponse(agent, context) {
-  if (String(agent.agent_provider || "").toLowerCase() === "openai" && process.env.OPENAI_API_KEY) {
+  const openAiKey = await resolveOpenAiKey(agent);
+
+  if (openAiKey) {
     try {
       const response = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          Authorization: `Bearer ${openAiKey}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -711,15 +728,19 @@ function stripJsonFences(content) {
  * the rewrite is unavailable or fails — callers keep the original draft.
  */
 async function rewriteDraft(agent, instruction, draftReply) {
-  if (String(agent.agent_provider || "").toLowerCase() !== "openai" || !process.env.OPENAI_API_KEY) {
-    return null;
+  let openAiKey = null;
+  try {
+    openAiKey = await resolveOpenAiKey(agent);
+  } catch (error) {
+    console.warn("Meeting reply rewrite skipped:", error.message);
   }
+  if (!openAiKey) return null;
 
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${openAiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
