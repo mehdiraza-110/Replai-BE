@@ -7,6 +7,7 @@ const plusVibeRoutes = require('./plus-vibe.routes');
 const messageRoutes = require('./message.routes');
 const eventLogRoutes = require('./event-log.routes');
 const leadRoutes = require('./lead.routes');
+const leadLibraryRoutes = require('./lead-library.routes');
 const analyticsRoutes = require('./analytics.routes');
 const reviewRoutes = require('./review.routes');
 const knowledgeRoutes = require('./knowledge.routes');
@@ -67,6 +68,7 @@ router.use('/forwarded-leads', TenantGuard, autoResponder, forwardedLeadRoutes);
 // Cold mailer
 router.use('/warmup', TenantGuard, coldMailer, warmupRoutes);
 router.use('/campaigns', TenantGuard, coldMailer, campaignRoutes);
+router.use('/lead-library', TenantGuard, coldMailer, leadLibraryRoutes);
 router.use('/suppressions', TenantGuard, coldMailer, suppressionRoutes);
 router.use('/mailer-inbox', TenantGuard, coldMailer, inboxRoutes);
 router.use('/warmup-pool', TenantGuard, coldMailer, warmupPoolRoutes);

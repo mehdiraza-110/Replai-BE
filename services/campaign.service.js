@@ -1,6 +1,7 @@
 const db = require("../config/db.config");
 const { parseLeadsFile } = require("./leadFileParser");
 const suppressionService = require("./suppression.service");
+const leadLibraryService = require("./leadLibrary.service");
 
 // Appended to every campaign email (and each follow-up step) so every outbound message
 // carries a working opt-out mechanism, per PlusVibe-Plan.md 12A. Reply-based rather than
@@ -102,6 +103,8 @@ class CampaignService {
     subject,
     body,
     leads,
+    leadSource,
+    saveToLibrary,
     followUps,
     mailboxMode,
     mailboxIds,
@@ -146,7 +149,11 @@ class CampaignService {
         raw: isPlainString ? {} : lead.raw || {},
       });
     }
-    if (normalizedLeads.length === 0) {
+    // Leads can come from an upload (`leads`), from the lead library (`leadSource`: whole lists and/or picked leads), or both.
+    const libraryListIds = Array.isArray(leadSource?.listIds) ? leadSource.listIds : [];
+    const libraryContacts = leadSource?.contacts || null;
+    const hasLibrarySource = libraryListIds.length > 0 || Boolean(libraryContacts && ((Array.isArray(libraryContacts.ids) && libraryContacts.ids.length) || libraryContacts.filter));
+    if (normalizedLeads.length === 0 && !hasLibrarySource) {
       throw Object.assign(new Error("At least one lead email is required"), { statusCode: 400 });
     }
 
@@ -155,7 +162,7 @@ class CampaignService {
     const suppressedEmails = await suppressionService.filterSuppressed(normalizedLeads.map((lead) => lead.email), workspaceId);
     const suppressedCount = suppressedEmails.size;
     const sendableLeads = normalizedLeads.filter((lead) => !suppressedEmails.has(lead.email));
-    if (sendableLeads.length === 0) {
+    if (normalizedLeads.length > 0 && sendableLeads.length === 0 && !hasLibrarySource) {
       throw Object.assign(new Error("All provided leads are on the suppression list (unsubscribed, complained, or bounced)"), { statusCode: 400 });
     }
 
@@ -215,24 +222,51 @@ class CampaignService {
       );
       const campaign = rows[0];
 
-      await client.query(
-        `INSERT INTO campaign_leads (campaign_id, workspace_id, email, full_name, first_name, last_name, company, role, phone, raw_data)
-         SELECT $1, $10::int, * FROM unnest(
-           $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::jsonb[]
-         )`,
-        [
-          campaign.id,
-          sendableLeads.map((lead) => lead.email),
-          sendableLeads.map((lead) => lead.fullName),
-          sendableLeads.map((lead) => lead.firstName),
-          sendableLeads.map((lead) => lead.lastName),
-          sendableLeads.map((lead) => lead.company),
-          sendableLeads.map((lead) => lead.role),
-          sendableLeads.map((lead) => lead.phone),
-          sendableLeads.map((lead) => JSON.stringify(lead.raw || {})),
-          campaign.workspace_id,
-        ]
-      );
+      if (sendableLeads.length > 0) {
+        await client.query(
+          `INSERT INTO campaign_leads (campaign_id, workspace_id, email, full_name, first_name, last_name, company, role, phone, raw_data)
+           SELECT $1, $10::int, * FROM unnest(
+             $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::jsonb[]
+           )`,
+          [
+            campaign.id,
+            sendableLeads.map((lead) => lead.email),
+            sendableLeads.map((lead) => lead.fullName),
+            sendableLeads.map((lead) => lead.firstName),
+            sendableLeads.map((lead) => lead.lastName),
+            sendableLeads.map((lead) => lead.company),
+            sendableLeads.map((lead) => lead.role),
+            sendableLeads.map((lead) => lead.phone),
+            sendableLeads.map((lead) => JSON.stringify(lead.raw || {})),
+            campaign.workspace_id,
+          ]
+        );
+      }
+
+      if (hasLibrarySource) {
+        await leadLibraryService.copyIntoCampaign(client, {
+          campaignId: campaign.id,
+          workspaceId: campaign.workspace_id,
+          listIds: libraryListIds,
+          contacts: libraryContacts,
+        });
+      }
+
+      const queuedLeads = (await client.query(`SELECT COUNT(*)::int AS count FROM campaign_leads WHERE campaign_id = $1`, [campaign.id])).rows[0].count;
+      if (queuedLeads === 0) {
+        throw Object.assign(new Error("All provided leads are on the suppression list (unsubscribed, complained, or bounced), or the selected lists are empty"), { statusCode: 400 });
+      }
+
+      let savedToList = null;
+      if (saveToLibrary && normalizedLeads.length > 0) {
+        savedToList = await leadLibraryService.saveToLibrary(client, {
+          listId: saveToLibrary.listId || null,
+          newListName: saveToLibrary.newListName,
+          leads: normalizedLeads,
+          workspaceId: campaign.workspace_id,
+          userId: createdBy || null,
+        });
+      }
 
       const followUpList = Array.isArray(followUps) ? followUps : [];
       for (let index = 0; index < followUpList.length; index += 1) {
@@ -264,11 +298,12 @@ class CampaignService {
           mailbox_count: mailboxCount,
           reply_rate: 0,
           bounce_rate: 0,
-          leads_count: sendableLeads.length,
+          leads_count: queuedLeads,
           contacted_count: 0,
           followup_count: followupCount,
         }),
         suppressedCount,
+        savedToList,
       };
     } catch (error) {
       await client.query("ROLLBACK");

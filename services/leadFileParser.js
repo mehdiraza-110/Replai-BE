@@ -10,6 +10,9 @@ const FIELD_ALIASES = {
   company: ["company", "companyname", "companynamecleaned", "organization", "org", "employer", "business"],
   role: ["role", "title", "jobtitle", "position", "designation"],
   phone: ["phone", "phonenumber", "mobile", "telephone", "cell", "cellphone"],
+  website: ["website", "websiteurl", "companywebsite", "url", "domain"],
+  linkedinUrl: ["linkedin", "linkedinurl", "linkedinprofile", "linkedinprofileurl"],
+  location: ["location", "city", "country", "state", "region", "address"],
 };
 
 function normalizeHeader(header) {
@@ -27,6 +30,7 @@ function detectFieldForHeader(normalized) {
   if (normalized.includes("lastname")) return "lastName";
   if (normalized.includes("title") || normalized.includes("role") || normalized.includes("position")) return "role";
   if (normalized.includes("phone") || normalized.includes("mobile")) return "phone";
+  if (normalized.includes("linkedin")) return "linkedinUrl";
   return null;
 }
 
@@ -130,6 +134,9 @@ function parseLeadsFile(buffer, originalName = "") {
       company: fieldMap.company ? cleanString(row[fieldMap.company]) : null,
       role: fieldMap.role ? cleanString(row[fieldMap.role]) : null,
       phone: fieldMap.phone ? cleanString(row[fieldMap.phone]) : null,
+      website: fieldMap.website ? cleanString(row[fieldMap.website]) : null,
+      linkedinUrl: fieldMap.linkedinUrl ? cleanString(row[fieldMap.linkedinUrl]) : null,
+      location: fieldMap.location ? cleanString(row[fieldMap.location]) : null,
       raw,
     });
   }
