@@ -54,8 +54,12 @@ class AiAgentService {
                   WHERE aks.ai_agent_id = a.id AND aks.workspace_id = a.workspace_id
                 ),
                 '{}'::int[]
-              ) AS knowledge_source_ids
+              ) AS knowledge_source_ids,
+              cc.status AS calendar_status,
+              cc.google_email AS calendar_email
        FROM ai_agents a
+       LEFT JOIN calendar_connections cc
+         ON cc.ai_agent_id = a.id AND cc.workspace_id = a.workspace_id AND cc.provider = 'google'
        WHERE a.is_deleted = FALSE AND a.workspace_id = $1
        ORDER BY a.updated_at DESC`,
       [workspaceId]
@@ -390,6 +394,8 @@ function mapAgentRow(row) {
     workingHoursStart: row.working_hours_start,
     workingHoursEnd: row.working_hours_end,
     timezone: row.timezone,
+    calendarStatus: row.calendar_status || null,
+    calendarEmail: row.calendar_email || null,
     status: row.status,
     createdBy: row.created_by,
     createdAt: row.created_at,
