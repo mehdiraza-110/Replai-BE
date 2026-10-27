@@ -55,6 +55,14 @@ class SesInboundEmailService {
    * detection, the inbound_messages audit row, and the per-mailbox inbox record.
    */
   async processParsedEmail({ parsed, bucket = null, key = null }) {
+    // Replies from our warm-up seed inboxes belong to the warm-up network only: no inbox record, AI agent or suppression.
+    try {
+      const warm = await require("./warmnetEngine.service").handleInbound(parsed);
+      if (warm.handled) return { status: "Processed", warmup: true };
+    } catch (error) {
+      console.error("Warm-up inbound handling failed:", error.message);
+    }
+
     const fromAddress = parsed.from?.value?.[0]?.address?.toLowerCase() || null;
     const toAddress = parsed.to?.value?.[0]?.address?.toLowerCase() || null;
     const bodyText = String(parsed.text || "").trim();

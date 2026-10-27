@@ -86,6 +86,29 @@ cron.schedule('*/10 * * * *', () => {
         .catch((error) => console.error('Maildoso sync failed:', error.message));
 });
 
+// Warm-up network (super admin Deliverability module): the engine sends each warming mailbox's due emails and the
+// seed replies; the poller reads the seed inboxes (placement, spam rescue, read/star, reply scheduling). Both are
+// overlap-guarded and do nothing while the network is switched off.
+cron.schedule('*/3 * * * *', () => {
+    require('./services/warmnetEngine.service').runTick()
+        .then((r) => { if (r && !r.skipped) console.log('Warm-up network tick:', JSON.stringify(r)); })
+        .catch((error) => console.error('Warm-up network tick failed:', error.message));
+});
+cron.schedule('*/4 * * * *', async () => {
+    try {
+        const engine = require('./services/warmnetEngine.service');
+        const settings = await engine.getSettings();
+        if (!settings.enabled) return;
+        await require('./services/warmnetSeed.service').pollAll(settings);
+    } catch (error) {
+        console.error('Warm-up seed poll failed:', error.message);
+    }
+});
+cron.schedule('30 6 * * *', () => {
+    require('./services/warmnetIp.service').checkAll()
+        .catch((error) => console.error('Warm-up IP blocklist check failed:', error.message));
+});
+
 // Trial milestone emails (7/3/1 days before the end, and when it has ended). Hourly, deduplicated in the database.
 try {
     require('./services/trialNotifier.service').start();

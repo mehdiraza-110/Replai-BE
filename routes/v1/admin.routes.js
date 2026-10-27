@@ -33,4 +33,6 @@ router.patch('/users/:id', admin.updateUser);
 
 router.get('/analytics', admin.analytics);
 
+router.use('/warmnet', require('./warmnet.routes'));
+
 module.exports = router;
