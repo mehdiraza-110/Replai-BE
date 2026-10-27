@@ -8,7 +8,7 @@
 const outbox = [];
 let warnedUnconfigured = false;
 
-const DEFAULT_APP_URL = "https://www.replyos.kovalai.ai/app";
+const DEFAULT_APP_URL = "https://app.sendvybe.com/app";
 
 function appUrl(path = "") {
   const base = String(process.env.APP_FRONTEND_URL || DEFAULT_APP_URL).replace(/\/+$/, "");
