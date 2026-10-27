@@ -75,11 +75,48 @@ async function listCampaignLeads(req, res) {
       page: req.query.page,
       limit: req.query.limit,
       search: req.query.search,
+      status: req.query.status,
       workspaceId: req.workspaceId,
     });
     res.status(200).json({ success: true, message: "Campaign leads fetched successfully", data });
   } catch (error) {
     sendError(res, error, "Unable to fetch campaign leads");
+  }
+}
+
+async function getCampaign(req, res) {
+  try {
+    const data = await campaignService.getCampaign(req.params.id, { workspaceId: req.workspaceId });
+    res.status(200).json({ success: true, message: "Campaign fetched successfully", data });
+  } catch (error) {
+    sendError(res, error, "Unable to fetch campaign");
+  }
+}
+
+async function updateCampaign(req, res) {
+  try {
+    const data = await campaignService.updateCampaign(req.params.id, req.body || {}, { workspaceId: req.workspaceId, userId: req.user?.id ?? null });
+    res.status(200).json({ success: true, message: "Campaign updated successfully", data });
+  } catch (error) {
+    sendError(res, error, "Unable to update campaign");
+  }
+}
+
+async function addCampaignLeads(req, res) {
+  try {
+    const data = await campaignService.addCampaignLeads(req.params.id, { leads: req.body?.leads, leadSource: req.body?.leadSource }, { workspaceId: req.workspaceId });
+    res.status(200).json({ success: true, message: "Leads added to the campaign", data });
+  } catch (error) {
+    sendError(res, error, "Unable to add leads");
+  }
+}
+
+async function removeCampaignLeads(req, res) {
+  try {
+    const data = await campaignService.removeCampaignLeads(req.params.id, req.body?.selection, { workspaceId: req.workspaceId });
+    res.status(200).json({ success: true, message: "Leads removed from the campaign", data });
+  } catch (error) {
+    sendError(res, error, "Unable to remove leads");
   }
 }
 
@@ -98,4 +135,8 @@ module.exports = {
   deleteCampaign,
   parseLeadsFile,
   listCampaignLeads,
+  getCampaign,
+  updateCampaign,
+  addCampaignLeads,
+  removeCampaignLeads,
 };

@@ -313,11 +313,275 @@ class CampaignService {
     }
   }
 
+  /** Everything the edit screen needs: settings, follow-up steps, and how many leads are in each state. */
+  async getCampaign(campaignId, { workspaceId }) {
+    const campaign = await this.requireEditable(campaignId, workspaceId);
+    const [followUps, counts] = await Promise.all([
+      db.query(`SELECT step_order, delay_days, body FROM campaign_followups WHERE campaign_id = $1 ORDER BY step_order`, [campaign.id]),
+      db.query(`SELECT status, COUNT(*)::int AS count FROM campaign_leads WHERE campaign_id = $1 GROUP BY status`, [campaign.id]),
+    ]);
+    const leadCounts = { total: 0, Pending: 0, Sent: 0, Replied: 0, Bounced: 0, Suppressed: 0, Failed: 0 };
+    for (const row of counts.rows) {
+      leadCounts[row.status] = row.count;
+      leadCounts.total += row.count;
+    }
+    return {
+      id: campaign.id,
+      name: campaign.name,
+      objective: campaign.objective || "",
+      status: campaign.status,
+      subject: campaign.subject,
+      body: stripOptOutFooter(campaign.body),
+      followUps: followUps.rows.map((row) => ({ delayDays: row.delay_days, body: stripOptOutFooter(row.body) })),
+      mailboxMode: campaign.mailbox_mode,
+      mailboxIds: campaign.mailbox_ids || [],
+      dailyLimitOverride: campaign.daily_limit_override,
+      sendingDays: Array.isArray(campaign.sending_days) ? campaign.sending_days : [],
+      windowStart: campaign.window_start,
+      windowEnd: campaign.window_end,
+      timezone: campaign.timezone,
+      aiAgentId: campaign.ai_agent_id,
+      humanReviewRequired: campaign.human_review_required,
+      sentTotal: campaign.sent_total,
+      leadCounts,
+    };
+  }
+
+  async requireEditable(campaignId, workspaceId) {
+    const id = Number(campaignId);
+    const notFound = () => Object.assign(new Error("Campaign not found"), { statusCode: 404, code: "CAMPAIGN_NOT_FOUND" });
+    if (!Number.isInteger(id) || id <= 0) throw notFound();
+    const { rows } = await db.query(
+      `SELECT * FROM campaigns WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE AND is_warmup = FALSE`,
+      [id, workspaceId]
+    );
+    if (!rows[0]) throw notFound();
+    return rows[0];
+  }
+
+  /**
+   * Edits a campaign. Only fields present in `changes` are touched. The send engine re-reads the campaign every tick, so
+   * changes apply to the next send cycle; emails already sent are never altered. Follow-up steps are matched by position so
+   * leads already part-way through the sequence keep their place.
+   */
+  async updateCampaign(campaignId, changes, { workspaceId, userId = null } = {}) {
+    const campaign = await this.requireEditable(campaignId, workspaceId);
+    const bad = (message) => Object.assign(new Error(message), { statusCode: 400, code: "CAMPAIGN_INVALID" });
+    const has = (key) => Object.prototype.hasOwnProperty.call(changes, key);
+    const sets = [];
+    const values = [];
+    const set = (column, value) => {
+      values.push(value);
+      sets.push(`${column} = $${values.length}`);
+    };
+
+    if (has("name")) {
+      const name = String(changes.name || "").trim();
+      if (!name) throw bad("Campaign name is required");
+      set("name", name);
+    }
+    if (has("objective")) set("objective", String(changes.objective || "").trim() || null);
+    if (has("subject")) {
+      const subject = String(changes.subject || "").trim();
+      if (!subject) throw bad("Subject line is required");
+      set("subject", subject);
+    }
+    if (has("body")) {
+      if (!String(changes.body || "").trim()) throw bad("Email body is required");
+      set("body", withOptOutFooter(changes.body));
+    }
+    if (has("status")) {
+      if (!["Active", "Paused"].includes(changes.status)) throw bad("Status must be Active or Paused");
+      set("status", changes.status);
+    }
+    if (has("mailboxMode") || has("mailboxIds")) {
+      const mode = (has("mailboxMode") ? changes.mailboxMode : campaign.mailbox_mode) === "specific" ? "specific" : "all";
+      const ids = mode === "specific"
+        ? Array.from(new Set((has("mailboxIds") ? changes.mailboxIds : campaign.mailbox_ids || []).map(Number).filter(Number.isFinite)))
+        : [];
+      if (mode === "specific") {
+        if (ids.length === 0) throw bad("Select at least one sending mailbox");
+        const { rows } = await db.query(
+          `SELECT id FROM mailboxes WHERE id = ANY($1::bigint[]) AND workspace_id = $2 AND is_deleted = FALSE`,
+          [ids, workspaceId]
+        );
+        if (rows.length !== ids.length) throw Object.assign(new Error("One or more selected mailboxes were not found"), { statusCode: 404 });
+      }
+      set("mailbox_mode", mode);
+      set("mailbox_ids", ids);
+    }
+    if (has("dailyLimitOverride")) {
+      const limit = Number(changes.dailyLimitOverride);
+      set("daily_limit_override", Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : null);
+    }
+    if (has("sendingDays")) set("sending_days", JSON.stringify(Array.isArray(changes.sendingDays) ? changes.sendingDays : []));
+    if (has("windowStart")) set("window_start", changes.windowStart || "09:00");
+    if (has("windowEnd")) set("window_end", changes.windowEnd || "17:00");
+    if (has("timezone")) set("timezone", changes.timezone || "UTC");
+    if (has("humanReviewRequired")) set("human_review_required", changes.humanReviewRequired !== false);
+    if (has("aiAgentId")) {
+      if (changes.aiAgentId) {
+        const { rows } = await db.query(`SELECT id FROM ai_agents WHERE id = $1 AND workspace_id = $2`, [changes.aiAgentId, workspaceId]);
+        if (!rows[0]) throw Object.assign(new Error("The selected AI agent was not found"), { statusCode: 404 });
+      }
+      set("ai_agent_id", changes.aiAgentId || null);
+    }
+
+    const followUps = has("followUps")
+      ? (Array.isArray(changes.followUps) ? changes.followUps : []).filter((step) => step?.body && String(step.body).trim())
+      : null;
+
+    const client = await db.getClient();
+    try {
+      await client.query("BEGIN");
+      if (sets.length) {
+        values.push(campaign.id);
+        await client.query(`UPDATE campaigns SET ${sets.join(", ")}, updated_at = NOW() WHERE id = $${values.length}`, values);
+      }
+      if (followUps) {
+        for (let index = 0; index < followUps.length; index += 1) {
+          const step = followUps[index];
+          const delay = Number(step.delayDays) > 0 ? Math.floor(Number(step.delayDays)) : 3;
+          await client.query(
+            `INSERT INTO campaign_followups (campaign_id, workspace_id, step_order, delay_days, body)
+             SELECT $1, $2, $3, $4, $5
+             WHERE NOT EXISTS (SELECT 1 FROM campaign_followups WHERE campaign_id = $1 AND step_order = $3)`,
+            [campaign.id, workspaceId, index + 1, delay, withOptOutFooter(step.body)]
+          );
+          await client.query(
+            `UPDATE campaign_followups SET delay_days = $3, body = $4 WHERE campaign_id = $1 AND step_order = $2`,
+            [campaign.id, index + 1, delay, withOptOutFooter(step.body)]
+          );
+        }
+        await client.query(`DELETE FROM campaign_followups WHERE campaign_id = $1 AND step_order > $2`, [campaign.id, followUps.length]);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    await require("./eventLog.service").record({
+      eventType: "campaign.updated",
+      source: "campaigns",
+      status: "Success",
+      appWorkspaceId: workspaceId,
+      campaignId: String(campaign.id),
+      campaignName: has("name") ? String(changes.name).trim() : campaign.name,
+      createdBy: userId,
+      metadata: { campaignId: campaign.id, fields: Object.keys(changes) },
+    });
+    return this.getCampaign(campaign.id, { workspaceId });
+  }
+
+  /** Adds leads to a running campaign from an upload and/or the lead library. Suppressed and already-queued addresses are skipped. */
+  async addCampaignLeads(campaignId, { leads, leadSource }, { workspaceId }) {
+    const campaign = await this.requireEditable(campaignId, workspaceId);
+    const seen = new Set();
+    const uploaded = [];
+    for (const lead of Array.isArray(leads) ? leads : []) {
+      const isPlain = typeof lead === "string";
+      const email = String(isPlain ? lead : lead?.email || "").trim().toLowerCase();
+      if (!email || seen.has(email)) continue;
+      seen.add(email);
+      uploaded.push({
+        email,
+        fullName: isPlain ? null : lead.fullName || null,
+        firstName: isPlain ? null : lead.firstName || null,
+        lastName: isPlain ? null : lead.lastName || null,
+        company: isPlain ? null : lead.company || null,
+        role: isPlain ? null : lead.role || null,
+        phone: isPlain ? null : lead.phone || null,
+        raw: isPlain ? {} : lead.raw || {},
+      });
+    }
+    const listIds = Array.isArray(leadSource?.listIds) ? leadSource.listIds : [];
+    const contacts = leadSource?.contacts || null;
+    const hasLibrary = listIds.length > 0 || Boolean(contacts && ((Array.isArray(contacts.ids) && contacts.ids.length) || contacts.filter));
+    if (uploaded.length === 0 && !hasLibrary) {
+      throw Object.assign(new Error("Choose at least one lead to add"), { statusCode: 400, code: "CAMPAIGN_LEADS_REQUIRED" });
+    }
+
+    const suppressed = await suppressionService.filterSuppressed(uploaded.map((lead) => lead.email), workspaceId);
+    const sendable = uploaded.filter((lead) => !suppressed.has(lead.email));
+
+    const client = await db.getClient();
+    try {
+      await client.query("BEGIN");
+      let added = 0;
+      if (sendable.length > 0) {
+        const { rowCount } = await client.query(
+          `INSERT INTO campaign_leads (campaign_id, workspace_id, email, full_name, first_name, last_name, company, role, phone, raw_data)
+           SELECT $1, $10::int, t.* FROM unnest(
+             $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::jsonb[]
+           ) AS t(email, full_name, first_name, last_name, company, role, phone, raw_data)
+           WHERE NOT EXISTS (SELECT 1 FROM campaign_leads cl WHERE cl.campaign_id = $1 AND cl.email = t.email)`,
+          [
+            campaign.id,
+            sendable.map((lead) => lead.email),
+            sendable.map((lead) => lead.fullName),
+            sendable.map((lead) => lead.firstName),
+            sendable.map((lead) => lead.lastName),
+            sendable.map((lead) => lead.company),
+            sendable.map((lead) => lead.role),
+            sendable.map((lead) => lead.phone),
+            sendable.map((lead) => JSON.stringify(lead.raw || {})),
+            workspaceId,
+          ]
+        );
+        added += rowCount;
+      }
+      if (hasLibrary) {
+        added += await leadLibraryService.copyIntoCampaign(client, { campaignId: campaign.id, workspaceId, listIds, contacts });
+      }
+      await client.query(`UPDATE campaigns SET updated_at = NOW() WHERE id = $1`, [campaign.id]);
+      await client.query("COMMIT");
+      return { added, suppressed: suppressed.size };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Removes leads that haven't been emailed yet. Leads already sent to, replied, or bounced stay, since they are the
+   * campaign's history and drive follow-ups. `selection` is explicit ids, or a search filter with optional exclusions.
+   */
+  async removeCampaignLeads(campaignId, selection, { workspaceId }) {
+    const campaign = await this.requireEditable(campaignId, workspaceId);
+    const params = [campaign.id];
+    const conditions = [`campaign_id = $1`, `status = 'Pending'`];
+    const ids = Array.from(new Set((Array.isArray(selection?.ids) ? selection.ids : []).map(Number).filter((id) => Number.isSafeInteger(id) && id > 0)));
+    if (ids.length) {
+      params.push(ids);
+      conditions.push(`id = ANY($${params.length}::int[])`);
+    } else if (selection?.filter && typeof selection.filter === "object") {
+      const term = String(selection.filter.search || "").trim();
+      if (term) {
+        params.push(`%${term.replace(/[\\%_]/g, (char) => `\\${char}`)}%`);
+        conditions.push(`(email ILIKE $${params.length} OR full_name ILIKE $${params.length} OR company ILIKE $${params.length})`);
+      }
+      const excluded = Array.from(new Set((Array.isArray(selection.excludeIds) ? selection.excludeIds : []).map(Number).filter((id) => Number.isSafeInteger(id) && id > 0)));
+      if (excluded.length) {
+        params.push(excluded);
+        conditions.push(`NOT (id = ANY($${params.length}::int[]))`);
+      }
+    } else {
+      throw Object.assign(new Error("Select at least one lead to remove"), { statusCode: 400, code: "CAMPAIGN_LEADS_REQUIRED" });
+    }
+    const { rowCount } = await db.query(`DELETE FROM campaign_leads WHERE ${conditions.join(" AND ")}`, params);
+    return { removed: rowCount };
+  }
+
   parseLeadsFile(buffer, originalName) {
     return parseLeadsFile(buffer, originalName);
   }
 
-  async listCampaignLeads(campaignId, { page = 1, limit = 20, search = "", workspaceId } = {}) {
+  async listCampaignLeads(campaignId, { page = 1, limit = 20, search = "", status = "", workspaceId } = {}) {
     const pageNum = Math.max(1, Number.parseInt(page, 10) || 1);
     const limitNum = Math.min(Math.max(Number.parseInt(limit, 10) || 20, 1), 200);
     const offset = (pageNum - 1) * limitNum;
@@ -329,6 +593,10 @@ class CampaignService {
     if (searchTerm) {
       params.push(`%${searchTerm}%`);
       conditions.push(`(email ILIKE $${params.length} OR full_name ILIKE $${params.length} OR company ILIKE $${params.length})`);
+    }
+    if (["Pending", "Sent", "Replied", "Bounced", "Suppressed", "Failed"].includes(status)) {
+      params.push(status);
+      conditions.push(`status = $${params.length}`);
     }
     const whereClause = `WHERE ${conditions.join(" AND ")}`;
 
@@ -354,6 +622,12 @@ class CampaignService {
       totalPages: Math.max(1, Math.ceil(total / limitNum)),
     };
   }
+}
+
+/** Campaigns store their body with the opt-out line appended; the edit screen shows what the user wrote. */
+function stripOptOutFooter(body) {
+  const text = String(body || "");
+  return text.endsWith(OPT_OUT_FOOTER) ? text.slice(0, -OPT_OUT_FOOTER.length) : text;
 }
 
 function mapCampaignSummaryRow(row) {
