@@ -3,6 +3,7 @@ const jwtUtil = require('../utils/jwt.util');
 const workspaceService = require('../services/workspace.service');
 const { uploadToS3, deleteFromS3 } = require('../utils/s3.util');
 const passwordResetService = require('../services/passwordReset.service');
+const emailLoginOtpService = require('../services/emailLoginOtp.service');
 
 function clientIp(req) {
   const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
@@ -230,40 +231,18 @@ class UserController {
       }
       
       const user = await userService.loginUser(email, password);
-      
-      // Create JWT token
-      // The user's active workspace rides in the session. null for a brand-new user, who must create one first.
-      const ctx = await workspaceService.resolveContext(user.id, null, null);
-      const tokenData = {
-        userId: user.id,
-        email: user.email,
-        roles: user.roles,
-        workspaceId: ctx && ctx.workspace ? ctx.workspace.id : null
-      };
-      
-      const token = await jwtUtil.createToken(tokenData);
-      
-      // Set token in HTTP-only cookie
-      res.cookie('token', token, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'strict',
-        maxAge: 3600000 // 1 hour
-      });
-      
-      res.status(200).json({
-        success: true,
-        message: 'Login successful',
-        data: {
-          user: {
-            ...user,
-            is_super_admin: Boolean(ctx && ctx.isSuperAdmin),
-            workspaces: (ctx && ctx.memberships) || [],
-            active_workspace_id: ctx && ctx.workspace ? ctx.workspace.id : null
-          },
-          token: token
-        }
-      });
+
+      // Password is correct: email a one-time code and issue the session only once it is verified.
+      if (emailLoginOtpService.isEnabled()) {
+        const challenge = await emailLoginOtpService.createChallenge(user, clientIp(req));
+        return res.status(200).json({
+          success: true,
+          message: 'We sent a 6-digit verification code to your email.',
+          data: { requires_otp: true, ...challenge }
+        });
+      }
+
+      return await this.issueSession(res, user, 'Login successful');
     } catch (error) {
       console.error('Error logging in:', error);
       
@@ -273,11 +252,93 @@ class UserController {
           message: 'Invalid email or password'
         });
       }
+
+      if (error instanceof emailLoginOtpService.OtpError) {
+        return this.sendOtpError(res, error);
+      }
       
       res.status(500).json({
         success: false,
         message: 'We could not sign you in right now. Please try again in a moment.'
       });
+    }
+  }
+
+  // Sets the session cookie and returns the normal login payload. Only reached with verified credentials
+  // (and, when email OTP is enabled, a verified code).
+  async issueSession(res, user, message) {
+    // The user's active workspace rides in the session. null for a brand-new user, who must create one first.
+    const ctx = await workspaceService.resolveContext(user.id, null, null);
+    const tokenData = {
+      userId: user.id,
+      email: user.email,
+      roles: user.roles,
+      workspaceId: ctx && ctx.workspace ? ctx.workspace.id : null
+    };
+
+    const token = await jwtUtil.createToken(tokenData);
+
+    // Set token in HTTP-only cookie
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 3600000 // 1 hour
+    });
+
+    return res.status(200).json({
+      success: true,
+      message,
+      data: {
+        user: {
+          ...user,
+          is_super_admin: Boolean(ctx && ctx.isSuperAdmin),
+          workspaces: (ctx && ctx.memberships) || [],
+          active_workspace_id: ctx && ctx.workspace ? ctx.workspace.id : null
+        },
+        token: token
+      }
+    });
+  }
+
+  sendOtpError(res, error) {
+    if (error.retryAfter) res.set('Retry-After', String(error.retryAfter));
+    return res.status(error.status).json({
+      success: false,
+      message: error.message,
+      ...(error.code ? { code: error.code } : {}),
+      ...(error.attempts_remaining !== undefined ? { attempts_remaining: error.attempts_remaining } : {})
+    });
+  }
+
+  // Step 2 of sign-in: exchange the emailed code for the normal session.
+  async verifyLoginOtp(req, res) {
+    try {
+      const { challenge_token, otp } = req.body || {};
+      const { userId } = await emailLoginOtpService.verify(challenge_token, otp);
+
+      const user = await userService.getUserById(userId);
+      if (!user) {
+        return res.status(401).json({ success: false, message: 'Your session has expired. Please sign in again.' });
+      }
+      return await this.issueSession(res, user, 'Login successful');
+    } catch (error) {
+      if (error instanceof emailLoginOtpService.OtpError) return this.sendOtpError(res, error);
+      console.error('Error verifying login code:', error.message);
+      res.status(500).json({ success: false, message: 'We could not verify your code right now. Please try again in a moment.' });
+    }
+  }
+
+  // Sends a fresh code for an open sign-in challenge (cooldown and a per-challenge cap apply).
+  async resendLoginOtp(req, res) {
+    try {
+      const { challenge_token } = req.body || {};
+      const data = await emailLoginOtpService.resend(challenge_token);
+      res.status(200).json({ success: true, message: 'We sent a new verification code to your email.', data });
+    } catch (error) {
+      if (error instanceof emailLoginOtpService.OtpError) return this.sendOtpError(res, error);
+      console.error('Error resending login code:', error.message);
+      res.status(500).json({ success: false, message: 'We could not send a new code right now. Please try again in a moment.' });
     }
   }
   

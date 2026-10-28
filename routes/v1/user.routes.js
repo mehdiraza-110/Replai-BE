@@ -8,6 +8,9 @@ const SuperAdminGuard = require('../../middlewares/superAdmin.middleware');
 
 // Login
 router.post('/login', userController.login.bind(userController));
+// Email OTP step of sign-in (public: the caller holds a challenge token, not a session yet)
+router.post('/login/verify-otp', userController.verifyLoginOtp.bind(userController));
+router.post('/login/resend-otp', userController.resendLoginOtp.bind(userController));
 
 // Sign out (clears the cookie; works even with an expired/missing token) and current session user
 router.post('/logout', userController.logout.bind(userController));

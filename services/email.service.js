@@ -99,8 +99,14 @@ async function send({ to, subject, text, html, replyTo = null, category = null }
     });
     if (!response.ok) {
       const body = await response.text().catch(() => "");
-      console.error(`SendGrid rejected an email (${response.status}): ${body.slice(0, 300)}`);
-      return { ok: false, error: `SendGrid returned ${response.status}` };
+      // SendGrid answers with {"errors":[{"message":...,"field":...}]}; those messages carry no secrets (never log the request).
+      let detail = body.slice(0, 300);
+      try {
+        const messages = JSON.parse(body).errors.map((e) => `${e.message}${e.field ? ` [${e.field}]` : ""}`);
+        if (messages.length) detail = messages.join("; ").slice(0, 300);
+      } catch (_) { /* non-JSON body: keep the raw excerpt */ }
+      console.error(`SendGrid rejected an email (category=${category || "none"}, HTTP ${response.status}): ${detail}`);
+      return { ok: false, error: `SendGrid returned ${response.status}`, detail };
     }
     return { ok: true };
   } catch (error) {
