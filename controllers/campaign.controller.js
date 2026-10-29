@@ -140,3 +140,45 @@ module.exports = {
   addCampaignLeads,
   removeCampaignLeads,
 };
+
+// ---- insights (Cold Email Agent home and campaign Analytics tab) ----
+const campaignInsights = require("../services/campaignInsights.service");
+
+function insightsError(res, error, fallback) {
+  const status = error.statusCode || 500;
+  if (status >= 500) console.error(fallback, error);
+  res.status(status).json({ success: false, message: status >= 500 ? fallback : error.message, code: error.code || "CAMPAIGN_INSIGHTS_FAILED", data: null });
+}
+
+module.exports.overview = async (req, res) => {
+  try {
+    res.status(200).json({ success: true, message: "Campaign overview", data: await campaignInsights.overview(req.workspaceId, req.query) });
+  } catch (error) {
+    insightsError(res, error, "Unable to load campaigns");
+  }
+};
+
+module.exports.analytics = async (req, res) => {
+  try {
+    res.status(200).json({ success: true, message: "Campaign analytics", data: await campaignInsights.analytics(req.workspaceId, req.params.id, { days: req.query.days }) });
+  } catch (error) {
+    insightsError(res, error, "Unable to load analytics");
+  }
+};
+
+module.exports.saveTargets = async (req, res) => {
+  try {
+    res.status(200).json({ success: true, message: "Targets saved", data: await campaignInsights.saveTargets(req.workspaceId, req.params.id, req.body || {}) });
+  } catch (error) {
+    insightsError(res, error, "Unable to save targets");
+  }
+};
+
+module.exports.generateSequence = async (req, res) => {
+  try {
+    const data = await require("../services/sdr/sequenceGenerator.service").generate(req.workspaceId, req.body || {});
+    res.status(200).json({ success: true, message: "Sequence generated", data });
+  } catch (error) {
+    insightsError(res, error, "Unable to generate a sequence");
+  }
+};

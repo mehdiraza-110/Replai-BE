@@ -27,6 +27,18 @@ const corsOptions = {
 app.use(cors(corsOptions))
 app.use(cookieParser());
 
+// Published sites at /s/<slug>, and (opt-in) on a customer's own domain by Host header.
+const sitesService = require('./services/ai/sites.service');
+const sendSite = (res, out) => res.set(out.headers).status(out.status).send(out.body);
+app.get('/s/:slug', (req, res) => sitesService.servePublic({ slug: req.params.slug }).then((out) => sendSite(res, out)).catch(() => res.status(500).send('Unable to load this site.')));
+if (process.env.SITES_CUSTOM_DOMAINS === '1') {
+    app.use((req, res, next) => {
+        if (req.method !== 'GET' || req.path.startsWith('/api/')) return next();
+        const host = String(req.headers.host || '').split(':')[0];
+        sitesService.servePublic({ host }).then((out) => (out.status === 200 ? sendSite(res, out) : next())).catch(() => next());
+    });
+}
+
 app.use("/api/v1", routes);
 
 const server = http.createServer(app);
@@ -79,6 +91,14 @@ cron.schedule('0 * * * *', async () => {
     }
 });
 
+// Own-mail-server (Postal) domains: re-reads their DNS and asks Postal to verify. Unverified ones every 15 minutes, so warm-up
+// starts on its own once DNS has spread; verified ones daily, so a removed record is noticed.
+cron.schedule('*/15 * * * *', () => {
+    require('./services/domain.service').refreshDuePostalDomains()
+        .then((r) => { if (r.checked) console.log(`Postal domain re-check: ${JSON.stringify(r)}`); })
+        .catch((error) => console.error('Postal domain re-check failed:', error.message));
+});
+
 // Keeps Replai's mailbox table in step with Maildoso: promotes mailboxes that finished setup,
 // picks up ones created outside Replai, and mirrors failures. Cheap (two API calls).
 cron.schedule('*/10 * * * *', () => {
@@ -107,6 +127,14 @@ cron.schedule('*/4 * * * *', async () => {
 cron.schedule('30 6 * * *', () => {
     require('./services/warmnetIp.service').checkAll()
         .catch((error) => console.error('Warm-up IP blocklist check failed:', error.message));
+});
+
+// AI SDR follow-ups: sends the ones that are due (the prospect still has not answered our last email). Claims each
+// thread atomically and is overlap-guarded, so it is safe if a tick runs long.
+cron.schedule('*/10 * * * *', () => {
+    require('./services/sdr/followup.service').runTick()
+        .then((r) => { if (r && r.processed) console.log(`AI SDR follow-ups: ${r.processed} processed`); })
+        .catch((error) => console.error('AI SDR follow-up tick failed:', error.message));
 });
 
 // Trial milestone emails (7/3/1 days before the end, and when it has ended). Hourly, deduplicated in the database.

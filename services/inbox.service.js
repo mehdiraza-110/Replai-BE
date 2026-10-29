@@ -1,6 +1,6 @@
 const db = require("../config/db.config");
 const suppressionService = require("./suppression.service");
-const { buildRawMimeMessage, threadIdFor, sesClient, mailboxDomain } = require("./campaignSend.service");
+const { buildRawMimeMessage, threadIdFor, mailboxDomain } = require("./campaignSend.service");
 const { sendRawEmail } = require("./mailTransport.service");
 const quotaService = require("./quota.service");
 
@@ -189,14 +189,7 @@ class InboxService {
     // Counts against the workspace's email limit just before sending (a manual/workflow reply gets the 403 error).
     const usageId = await quotaService.consume(mailbox.workspace_id, "emails", 1, { source: "reply" });
     try {
-      await sendRawEmail({
-        mailbox,
-        fromAddress,
-        to: leadEmail,
-        raw,
-        sesClient,
-        tags: latest.campaign_id ? [{ Name: "campaign_id", Value: String(latest.campaign_id) }] : undefined,
-      });
+      await sendRawEmail({ mailbox, to: leadEmail, raw });
     } catch (error) {
       await quotaService.refund(mailbox.workspace_id, usageId);
       throw error;

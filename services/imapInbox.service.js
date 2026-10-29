@@ -2,7 +2,7 @@ const { ImapFlow } = require("imapflow");
 const { simpleParser } = require("mailparser");
 const db = require("../config/db.config");
 const suppressionService = require("./suppression.service");
-const sesInboundEmailService = require("./sesInboundEmail.service");
+const inboundEmailService = require("./inboundEmail.service");
 const { decryptSecret } = require("../utils/secretBox.util");
 
 // Mailboxes polled in parallel, and messages fetched per mailbox per poll. Both are kept
@@ -102,7 +102,7 @@ class ImapInboxService {
     }
     if (isAutoReply(parsed)) return; // out-of-office etc: neither a real reply nor a bounce
     // workspaceId lets the inbound pipeline attribute the reply to this mailbox's tenant (ignored by older signatures).
-    await sesInboundEmailService.processParsedEmail({ parsed, workspaceId: mailbox.workspace_id });
+    await inboundEmailService.processParsedEmail({ parsed, workspaceId: mailbox.workspace_id });
   }
 
   /** Only a permanent (5.x.x) failure suppresses, mirroring the SES bounce handler. */

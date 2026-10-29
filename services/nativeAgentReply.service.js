@@ -176,6 +176,7 @@ class NativeAgentReplyService {
   async sendDraft(draft, { body } = {}) {
     // CROSS-AGENT: inbox.service.sendReply is cold-mailer code; workspaceId is passed as an extra trailing argument.
     const sent = await require("./inbox.service").sendReply(draft.mailbox_id, draft.thread_id, { body: body || draft.body }, draft.workspace_id);
+    await db.query(`UPDATE messages SET author = 'ai' WHERE id = $1 AND workspace_id = $2`, [sent.id, draft.workspace_id]);
     return { id: String(sent.id) };
   }
 }

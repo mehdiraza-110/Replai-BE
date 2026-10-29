@@ -1,5 +1,4 @@
 const nodemailer = require("nodemailer");
-const { SendEmailCommand } = require("@aws-sdk/client-sesv2");
 const { decryptSecret } = require("../utils/secretBox.util");
 const postalService = require("./postal.service");
 
@@ -36,10 +35,9 @@ function smtpTransportFor(mailbox) {
 /**
  * Sends an already-built raw MIME message through whichever channel owns the mailbox:
  * Maildoso mailboxes go out over their own authenticated SMTP session, Postal mailboxes through
- * our self-hosted Postal server's HTTP API, everything else
- * through Amazon SES exactly as before. Returns the provider's message id (or null).
+ * our self-hosted Postal server's HTTP API. Anything else is refused. Returns the provider's message id (or null).
  */
-async function sendRawEmail({ mailbox, fromAddress, to, raw, sesClient, tags }) {
+async function sendRawEmail({ mailbox, to, raw }) {
   if (mailbox.provider === "maildoso") {
     const info = await smtpTransportFor(mailbox).sendMail({
       envelope: { from: mailbox.email, to: [to] },
@@ -52,16 +50,7 @@ async function sendRawEmail({ mailbox, fromAddress, to, raw, sesClient, tags }) 
     return postalService.sendRaw({ mailFrom: mailbox.email, to, raw });
   }
 
-  const response = await sesClient.send(
-    new SendEmailCommand({
-      FromEmailAddress: fromAddress,
-      Destination: { ToAddresses: [to] },
-      Content: { Raw: { Data: raw } },
-      ConfigurationSetName: mailbox.configuration_set_name || undefined,
-      EmailTags: tags && tags.length ? tags : undefined,
-    })
-  );
-  return response.MessageId || null;
+  throw Object.assign(new Error(`This inbox sends through "${mailbox.provider}", which is no longer supported. Move its domain to the own mail server.`), { code: "PROVIDER_UNSUPPORTED" });
 }
 
 module.exports = { sendRawEmail };

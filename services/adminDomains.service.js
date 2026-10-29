@@ -10,7 +10,7 @@ const { WorkspaceError } = require("./workspace.service");
 
 const DOMAIN_RE = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 const PLATFORM_SLUG = "koval-group";
-const PROVIDER_LABELS = { maildoso: "Maildoso", postal: "Hetzner (Postal)", ses: "Amazon SES" };
+const PROVIDER_LABELS = { maildoso: "Maildoso", postal: "Hetzner (Postal)", ses: "Amazon SES (retired)" };
 
 const normProvider = (p) => {
   const v = String(p || "").trim().toLowerCase();

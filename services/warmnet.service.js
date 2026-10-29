@@ -345,7 +345,7 @@ class WarmnetService {
     const list = Array.isArray(input.domains) ? input.domains : [];
     if (!list.length) throw new WorkspaceError("Provide at least one domain.", 400);
     if (list.length > 150) throw new WorkspaceError("At most 150 domains at a time.", 400);
-    const perDomain = Math.min(10, Math.max(1, parseInt(input.mailboxesPerDomain, 10) || 5));
+    const perDomain = input.mailboxesPerDomain === 0 ? 0 : Math.min(10, Math.max(1, parseInt(input.mailboxesPerDomain, 10) || 5));
     let workspaceId = parseInt(input.workspaceId, 10) || null;
     if (!workspaceId) {
       const { rows } = await db.query(`SELECT id FROM workspaces WHERE slug = $1 AND is_deleted = FALSE`, [PLATFORM_SLUG]);
@@ -357,6 +357,19 @@ class WarmnetService {
     const used = new Set();
     const { rows: existingNames } = await db.query(`SELECT display_name FROM mailboxes WHERE workspace_id = $1 AND display_name IS NOT NULL`, [workspaceId]);
     existingNames.forEach((r) => used.add(r.display_name));
+
+    // Check each domain's real DNS first (a few at a time). A domain whose DNS isn't ready yet is still registered, as
+    // Pending Verification, and starts warming once a re-check finds the records.
+    const postalDns = require("./postalDns.service");
+    const dnsByName = new Map();
+    const names = [...new Set(list.map((e) => String((typeof e === "string" ? e : e?.domain) || "").trim().toLowerCase()).filter((n) => DOMAIN_RE.test(n)))];
+    for (let i = 0; i < names.length; i += 10) {
+      await Promise.all(names.slice(i, i + 10).map(async (n) => {
+        const entry = list.find((e) => String((typeof e === "string" ? e : e?.domain) || "").trim().toLowerCase() === n);
+        const selector = typeof entry === "object" && entry?.dkimSelector ? String(entry.dkimSelector).trim().toLowerCase() : null;
+        dnsByName.set(n, { selector, ...(await postalDns.check(n, { dkimSelector: selector }).catch(() => ({ unreliable: true, statuses: {} }))) });
+      }));
+    }
 
     const results = [];
     for (const entry of list) {
@@ -372,6 +385,12 @@ class WarmnetService {
         const exists = await client.query(`SELECT id FROM domains WHERE domain = $1`, [name]);
         if (exists.rows[0]) throw new WorkspaceError("This domain is already in the system.", 409);
 
+        const dnsResult = dnsByName.get(name);
+        const dbStatus = (v) => (!v || v === "Unknown" ? "Pending" : v);
+        const dnsStatus = dnsResult && !dnsResult.unreliable
+          ? { overall: postalDns.overall(dnsResult.statuses) === "Failed" ? "Pending Verification" : postalDns.overall(dnsResult.statuses), mx: dbStatus(dnsResult.statuses.mx), spf: dbStatus(dnsResult.statuses.spf), dmarc: dbStatus(dnsResult.statuses.dmarc), dkim: dbStatus(dnsResult.statuses.dkim), note: postalDns.overall(dnsResult.statuses) === "Verified" ? null : "DNS isn't ready yet: MX and SPF must point at the mail server. Check the DNS records, then re-check." }
+          : { overall: "Pending Verification", mx: "Pending", spf: "Pending", dmarc: "Pending", dkim: "Pending", note: "DNS couldn't be checked yet. Re-check shortly." };
+
         let ipId = null;
         const ipText = String(item.ip || "").trim();
         if (ipText) {
@@ -383,9 +402,9 @@ class WarmnetService {
           ipId = ip.rows[0].id;
         }
         const dom = await client.query(
-          `INSERT INTO domains (domain, registrar, dns_provider, provider, status, spf_status, dkim_status, dmarc_status, mx_status, created_by, workspace_id)
-           VALUES ($1, 'Porkbun', 'Porkbun', 'Postal', 'Verified', 'Success', 'Success', 'Success', 'Success', $2, $3) RETURNING id`,
-          [name, actorId || null, workspaceId]
+          `INSERT INTO domains (domain, registrar, dns_provider, provider, status, spf_status, dkim_status, dmarc_status, mx_status, created_by, workspace_id, dkim_selector, last_checked_at, last_error)
+           VALUES ($1, 'Porkbun', 'Porkbun', 'Postal', $4, $5, $6, $7, $8, $2, $3, $9, NOW(), $10) RETURNING id`,
+          [name, actorId || null, workspaceId, dnsStatus.overall, dnsStatus.spf, dnsStatus.dkim, dnsStatus.dmarc, dnsStatus.mx, dnsByName.get(name)?.selector || null, dnsStatus.note]
         );
         const domainId = dom.rows[0].id;
         await client.query(`INSERT INTO warmnet_domains (domain_id, ip_id) VALUES ($1, $2)`, [domainId, ipId]);

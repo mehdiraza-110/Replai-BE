@@ -1,7 +1,7 @@
 const { simpleParser } = require("mailparser");
 const postalService = require("../services/postal.service");
 const postalEventsService = require("../services/postalEvents.service");
-const sesInboundEmailService = require("../services/sesInboundEmail.service");
+const inboundEmailService = require("../services/inboundEmail.service");
 
 // Public — Postal calls these directly, authenticated by the shared ?token= secret.
 function authorized(req, res) {
@@ -28,7 +28,7 @@ async function receiveInbound(req, res) {
     if (!message) return res.status(400).json({ success: false, message: "Missing message" });
     const raw = base64 === false || base64 === "false" ? Buffer.from(message) : Buffer.from(message, "base64");
     const parsed = await simpleParser(raw);
-    const result = await sesInboundEmailService.processParsedEmail({ parsed, bucket: "postal", key: parsed.messageId || null });
+    const result = await inboundEmailService.processParsedEmail({ parsed, bucket: "postal", key: parsed.messageId || null });
     res.status(200).json({ success: true, data: result });
   } catch (error) {
     res.status(error.statusCode || 500).json({ success: false, message: error.message || "Unable to process inbound message" });

@@ -1,59 +1,10 @@
-const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
-const { simpleParser } = require("mailparser");
 const db = require("../config/db.config");
 const suppressionService = require("./suppression.service");
-const { resolveSnsEnvelope } = require("../utils/snsEnvelope.util");
 
-// SES inbound receiving is only available in a handful of regions (not necessarily
-// the same region used for sending) — configurable independently of AWS_REGION.
-const SES_INBOUND_REGION = process.env.SES_INBOUND_REGION || process.env.AWS_REGION || "us-east-1";
-const s3Client = new S3Client({ region: SES_INBOUND_REGION });
-
-class SesInboundEmailService {
-  /**
-   * Entry point for the SNS HTTPS subscription (raw request body, text/plain JSON per SNS).
-   * Handles both the one-time SubscriptionConfirmation handshake and ongoing Notifications.
-   */
-  async handleSnsMessage(rawBody) {
-    const { handled, result, message } = await resolveSnsEnvelope(rawBody);
-    if (handled) return result;
-    return this.handleSesNotification(message);
-  }
-
-  /**
-   * The decoded SES notification (already JSON.parse'd out of the SNS envelope).
-   * SES receipt rules configured with an S3 action deliver the raw MIME message to S3
-   * and include the bucket/key here; we fetch and parse it from there.
-   */
-  async handleSesNotification(sesNotification) {
-    const mail = sesNotification?.mail;
-    const s3Info = sesNotification?.receipt?.action;
-    if (!mail || !s3Info || s3Info.type !== "S3") {
-      return { status: "Ignored", reason: "Notification did not include an S3-delivered message" };
-    }
-
-    const bucket = s3Info.bucketName;
-    const key = `${s3Info.objectKeyPrefix || ""}${s3Info.objectKey}`.replace(/^\/+/, "");
-    return this.processStoredEmail({ bucket, key });
-  }
-
-  /**
-   * Fetches the raw MIME message from S3, parses it, checks for an opt-out reply,
-   * and logs it. This is the piece that actually matters for compliance: any reply
-   * whose body matches the opt-out pattern suppresses that sender address immediately.
-   * Also records the message in the app-native per-mailbox inbox (see `messages` table)
-   * when the recipient address matches one of our onboarded mailboxes.
-   */
-  async processStoredEmail({ bucket, key }) {
-    const raw = await fetchRawEmail(bucket, key);
-    const parsed = await simpleParser(raw);
-    return this.processParsedEmail({ parsed, bucket, key });
-  }
-
-  /**
-   * Shared by the SES/S3 path above and the IMAP poller (imapInbox.service.js): opt-out
-   * detection, the inbound_messages audit row, and the per-mailbox inbox record.
-   */
+// Handles a parsed inbound email: opt-out detection, the inbound_messages audit row, the per-mailbox inbox record and the AI hand-off.
+// Replies arrive from our own mail server (Postal webhook) or from Maildoso mailboxes (IMAP poll); both end up here.
+class InboundEmailService {
+  /** Opt-out detection, the inbound_messages audit row, and the per-mailbox inbox record. */
   async processParsedEmail({ parsed, bucket = null, key = null }) {
     // Replies from our warm-up seed inboxes belong to the warm-up network only: no inbox record, AI agent or suppression.
     try {
@@ -148,6 +99,25 @@ class SesInboundEmailService {
     // A workspace with an active "mail received" workflow lets that workflow handle the reply; with none
     // (or when it fails before doing anything) the built-in campaign handler below runs exactly as before.
     (async () => {
+      const inboundMessageId = insertedRows[0].id;
+      const threadId = `${mailbox.id}:${fromAddress}`;
+      const sdr = require("./sdr/inbound.service");
+      const leadRow = lead ? (await db.query(`SELECT * FROM campaign_leads WHERE id = $1 AND workspace_id = $2`, [lead.id, workspaceId])).rows[0] : null;
+      const campaignRow = lead?.campaign_id ? (await db.query(`SELECT * FROM campaigns WHERE id = $1 AND workspace_id = $2`, [lead.campaign_id, workspaceId])).rows[0] : null;
+
+      // AI SDR, step 1: label the thread (status, interest, escalation task, positive-reply webhook). Warm-up traffic is not inbox work.
+      let classification = null;
+      if (!campaignRow?.is_warmup) {
+        try {
+          ({ classification } = await sdr.classify({
+            workspaceId, mailboxId: mailbox.id, threadId, inboundMessageId,
+            subject: parsed.subject || "", body: bodyText, lead: leadRow, fromAddress,
+          }));
+        } catch (error) {
+          console.error("AI SDR classification failed:", error.message);
+        }
+      }
+
       const wf = await require("./workflowExecutor.service").maybeRun({
         workspaceId,
         triggerType: "trigger.inbox_mail",
@@ -164,6 +134,23 @@ class SesInboundEmailService {
         },
       });
       if (wf.handled || !lead?.campaign_id) return;
+
+      // AI SDR, step 2: write (and, unless approval is required, send) the reply. It steps aside for campaigns that
+      // still have a legacy AI agent, which answers in the call below.
+      if (classification) {
+        try {
+          const [{ rows: inboundRows }, { rows: mailboxRows }] = await Promise.all([
+            db.query(`SELECT * FROM messages WHERE id = $1 AND workspace_id = $2`, [inboundMessageId, workspaceId]),
+            db.query(`SELECT * FROM mailboxes WHERE id = $1 AND workspace_id = $2`, [mailbox.id, workspaceId]),
+          ]);
+          if (inboundRows[0] && mailboxRows[0]) {
+            await sdr.reply({ workspaceId, mailbox: mailboxRows[0], lead: leadRow, campaign: campaignRow, inbound: inboundRows[0], classification });
+          }
+        } catch (error) {
+          console.error("AI SDR reply failed:", error.message);
+        }
+      }
+
       await require("./nativeAgentReply.service").handleInbound({
         mailboxId: mailbox.id,
         campaignId: lead.campaign_id,
@@ -174,19 +161,4 @@ class SesInboundEmailService {
   }
 }
 
-function fetchRawEmail(bucket, key) {
-  return s3Client
-    .send(new GetObjectCommand({ Bucket: bucket, Key: key }))
-    .then((result) => streamToBuffer(result.Body));
-}
-
-function streamToBuffer(stream) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on("data", (chunk) => chunks.push(chunk));
-    stream.on("error", reject);
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-  });
-}
-
-module.exports = new SesInboundEmailService();
+module.exports = new InboundEmailService();

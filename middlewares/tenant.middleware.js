@@ -1,5 +1,6 @@
 const jwtUtil = require('../utils/jwt.util');
 const workspaceService = require('../services/workspace.service');
+const apiTokens = require('../services/settings/apiTokens.service');
 
 // Guards every tenant route: the caller must be signed in AND acting inside a workspace. On success it sets
 //   req.user        { id, isSuperAdmin }
@@ -9,10 +10,14 @@ const workspaceService = require('../services/workspace.service');
 // (re-read from the DB each request, so removals and suspensions apply immediately).
 const guard = (allowEnded) => async (req, res, next) => {
   const token = req.cookies && req.cookies.token;
-  if (!token) return res.status(401).json({ success: false, message: 'Please sign in to continue.' });
+  const bearer = !token && /^Bearer (sv_\w+)$/.exec(req.get('authorization') || '');
+  if (!token && !bearer) return res.status(401).json({ success: false, message: 'Please sign in to continue.' });
 
   try {
-    const decoded = jwtUtil.verifyToken(token);
+    // An API token acts as the person who made it, inside the workspace it was made in. Browser sessions are unchanged.
+    const decoded = bearer ? await apiTokens.resolve(bearer[1]) : jwtUtil.verifyToken(token);
+    if (!decoded) return res.status(401).json({ success: false, message: 'That API token is not valid or was revoked.' });
+    req.viaApiToken = Boolean(bearer);
     const ctx = await workspaceService.resolveContext(
       decoded.userId,
       decoded.workspaceId,

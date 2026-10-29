@@ -20,11 +20,15 @@ const mailboxRoutes = require('./mailbox.routes');
 const warmupRoutes = require('./warmup.routes');
 const campaignRoutes = require('./campaign.routes');
 const inboxRoutes = require('./inbox.routes');
+const aiSdrRoutes = require('./aiSdr.routes');
+const schedulingRoutes = require('./scheduling.routes');
+const emailAccountsRoutes = require('./emailAccounts.routes');
+const crmRoutes = require('./crm.routes');
+const settingsRoutes = require('./settings.routes');
+const aiRoutes = require('./ai.routes');
 const warmupPoolRoutes = require('./warmup-pool.routes');
 const unsubscribeRoutes = require('./unsubscribe.routes');
 const suppressionRoutes = require('./suppression.routes');
-const sesInboundRoutes = require('./ses-inbound.routes');
-const sesEventsRoutes = require('./ses-events.routes');
 const postalRoutes = require('./postal.routes');
 const workspaceRoutes = require('./workspace.routes');
 const aiKeyRoutes = require('./ai-keys.routes');
@@ -71,6 +75,17 @@ router.use('/campaigns', TenantGuard, coldMailer, campaignRoutes);
 router.use('/lead-library', TenantGuard, coldMailer, leadLibraryRoutes);
 router.use('/suppressions', TenantGuard, coldMailer, suppressionRoutes);
 router.use('/mailer-inbox', TenantGuard, coldMailer, inboxRoutes);
+router.use('/ai-sdr', TenantGuard, coldMailer, aiSdrRoutes);
+router.use('/scheduling', TenantGuard, schedulingRoutes);
+router.use('/email-accounts', TenantGuard, coldMailer, emailAccountsRoutes);
+router.use('/crm', TenantGuard, coldMailer, crmRoutes);
+router.use('/settings', TenantGuard, settingsRoutes);
+router.use('/ai', TenantGuard, coldMailer, aiRoutes);
+// Published sites are public: no login, and the page is served with a locked-down CSP (see services/ai/siteHtml.js).
+router.get('/public/sites/:slug', async (req, res) => {
+  const out = await require('../../services/ai/sites.service').servePublic({ slug: req.params.slug }).catch(() => ({ status: 500, headers: { 'Content-Type': 'text/plain' }, body: 'Unable to load this site.' }));
+  res.set(out.headers).status(out.status).send(out.body);
+});
 router.use('/warmup-pool', TenantGuard, coldMailer, warmupPoolRoutes);
 
 // Workspace management (owner/admin checks live in the controllers), AI keys, automation workflows
@@ -84,8 +99,6 @@ router.use('/admin', require('../../middlewares/superAdmin.middleware'), adminRo
 
 // Public by design: unsubscribe links (signed token) and provider webhooks (own secret / signature).
 router.use('/unsubscribe', unsubscribeRoutes);
-router.use('/ses-inbound', sesInboundRoutes);
-router.use('/ses-events', sesEventsRoutes);
 router.use('/postal', postalRoutes);
 
 

@@ -1,12 +1,9 @@
 const crypto = require("crypto");
-const { SESv2Client } = require("@aws-sdk/client-sesv2");
 const db = require("../config/db.config");
 const suppressionService = require("./suppression.service");
 const { sendRawEmail } = require("./mailTransport.service");
 const quotaService = require("./quota.service");
-
-const AWS_REGION = process.env.AWS_REGION || "us-east-1";
-const sesClient = new SESv2Client({ region: AWS_REGION });
+const { renderMessage, hasUnresolvedPlaceholders, buildRawMimeMessage } = require("../utils/emailTemplate.util");
 
 // How many leads a single mailbox may send in one tick. Kept deliberately small so a
 // mailbox's daily_limit is spread across the whole sending window instead of bursting —
@@ -124,12 +121,13 @@ class CampaignSendService {
       : "m.market_daily_limit > 0 AND m.market_sent_today < m.market_daily_limit";
 
     const { rows } = await db.query(
-      `SELECT m.*, d.status AS domain_status, d.configuration_set_name
+      `SELECT m.*, d.status AS domain_status
        FROM mailboxes m
        JOIN domains d ON d.id = m.domain_id AND d.is_deleted = FALSE AND d.workspace_id = m.workspace_id
        WHERE m.is_deleted = FALSE
          AND m.workspace_id = $1
          AND m.status = 'Active'
+         AND m.provider IN ('maildoso', 'postal')
          AND d.status = 'Verified'
          AND ${capacityFilter}
          ${mailboxFilter}
@@ -185,9 +183,26 @@ class CampaignSendService {
       return { sent: false, reason: "suppressed" };
     }
 
-    const baseSubject = personalize(campaign.subject, lead);
-    const subject = followUp ? (/^re:/i.test(baseSubject) ? baseSubject : `Re: ${baseSubject}`) : baseSubject;
-    const body = personalize(followUp ? followUp.body : campaign.body, lead);
+    const rendered = renderMessage({ subject: campaign.subject, body: followUp ? followUp.body : campaign.body }, lead, mailbox);
+    // An unknown {{variable}} would reach the recipient as literal text. Refuse to send and leave the lead exactly
+    // as it was (no attempt used) so fixing the template resumes sending with nothing lost.
+    if (hasUnresolvedPlaceholders(rendered.subject) || hasUnresolvedPlaceholders(rendered.text)) {
+      console.warn(`Campaign ${campaign.id}: not sending to lead ${lead.id}, template has an unresolved {{placeholder}}`);
+      return { sent: false, reason: "unresolved_placeholder" };
+    }
+    // A lead with no value for a variable the template uses (e.g. no company) would get a broken sentence. First
+    // emails fail the lead with the reason recorded; a follow-up just backs off, since the first email already landed.
+    if (rendered.missing.length > 0) {
+      const reason = `Missing ${rendered.missing.join(", ")} for this lead; not sent`;
+      if (followUp) {
+        await db.query(`UPDATE campaign_leads SET last_error = $2, followup_retry_after = NOW() + INTERVAL '1 hour' WHERE id = $1`, [lead.id, reason]);
+      } else {
+        await db.query(`UPDATE campaign_leads SET status = 'Failed', last_error = $2 WHERE id = $1`, [lead.id, reason]);
+      }
+      return { sent: false, reason: "missing_merge_value" };
+    }
+    const subject = followUp ? (/^re:/i.test(rendered.subject) ? rendered.subject : `Re: ${rendered.subject}`) : rendered.subject;
+    const body = rendered.text;
     const listUnsubscribeHeaders = suppressionService.buildListUnsubscribeHeaders({ email: lead.email, campaignId: campaign.id });
     const threadHeaders = followUp && lead.rfc_message_id ? { "In-Reply-To": lead.rfc_message_id, References: lead.rfc_message_id } : {};
     const fromAddress = mailbox.display_name ? `"${escapeHeaderValue(mailbox.display_name)}" <${mailbox.email}>` : mailbox.email;
@@ -197,6 +212,7 @@ class CampaignSendService {
       to: lead.email,
       subject,
       body,
+      htmlBody: rendered.html,
       extraHeaders: { ...listUnsubscribeHeaders, ...threadHeaders },
       messageIdDomain: mailboxDomain(mailbox),
     });
@@ -214,16 +230,7 @@ class CampaignSendService {
     }
 
     try {
-      // Tags come back on bounce/complaint SNS events so sesBounceComplaint.service.js
-      // can attribute them to the right campaign for suppression/audit purposes (SES only).
-      const providerMessageId = await sendRawEmail({
-        mailbox,
-        fromAddress,
-        to: lead.email,
-        raw,
-        sesClient,
-        tags: [{ Name: "campaign_id", Value: String(campaign.id) }],
-      });
+      const providerMessageId = await sendRawEmail({ mailbox, to: lead.email, raw });
       usageId = null; // the email is out: its usage stays counted whatever happens to the bookkeeping below
 
       if (followUp) {
@@ -334,23 +341,6 @@ function isWithinSendingWindow(campaign, now = new Date()) {
   return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
 }
 
-/** Simple {{firstName}}-style template substitution against lead fields. */
-function personalize(text, lead) {
-  const values = {
-    firstName: lead.first_name || firstNameFromFullName(lead.full_name) || "",
-    lastName: lead.last_name || "",
-    fullName: lead.full_name || "",
-    company: lead.company || "",
-    role: lead.role || "",
-  };
-  return String(text || "").replace(/\{\{\s*(\w+)\s*\}\}/g, (match, key) => (key in values ? values[key] : match));
-}
-
-function firstNameFromFullName(fullName) {
-  if (!fullName) return null;
-  return String(fullName).trim().split(/\s+/)[0] || null;
-}
-
 function escapeHeaderValue(value) {
   return String(value || "").replace(/["\r\n]/g, "");
 }
@@ -360,32 +350,9 @@ function mailboxDomain(mailbox) {
   return String(mailbox.email || "").split("@")[1] || undefined;
 }
 
-function buildRawMimeMessage({ from, to, subject, body, extraHeaders = {}, messageIdDomain = "replyos" }) {
-  const messageId = `<${crypto.randomUUID()}@${messageIdDomain}>`;
-  const headerLines = [
-    `From: ${from}`,
-    `To: ${to}`,
-    `Subject: ${encodeSubject(subject)}`,
-    `Date: ${new Date().toUTCString()}`,
-    `MIME-Version: 1.0`,
-    `Content-Type: text/plain; charset="UTF-8"`,
-    `Content-Transfer-Encoding: 7bit`,
-    `Message-ID: ${messageId}`,
-    ...Object.entries(extraHeaders).map(([key, value]) => `${key}: ${value}`),
-  ];
-  return { raw: Buffer.from(`${headerLines.join("\r\n")}\r\n\r\n${body}`, "utf8"), messageId };
-}
-
 /** Deterministic thread key shared by outbound sends and inbound replies for a given mailbox+lead. */
 function threadIdFor(mailboxId, leadEmail) {
   return `${mailboxId}:${String(leadEmail || "").trim().toLowerCase()}`;
-}
-
-function encodeSubject(subject) {
-  const text = String(subject || "");
-  // eslint-disable-next-line no-control-regex
-  if (/^[\x00-\x7F]*$/.test(text)) return text;
-  return `=?UTF-8?B?${Buffer.from(text, "utf8").toString("base64")}?=`;
 }
 
 module.exports = new CampaignSendService();
@@ -394,4 +361,3 @@ module.exports = new CampaignSendService();
 module.exports.buildRawMimeMessage = buildRawMimeMessage;
 module.exports.threadIdFor = threadIdFor;
 module.exports.mailboxDomain = mailboxDomain;
-module.exports.sesClient = sesClient;

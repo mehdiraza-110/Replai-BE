@@ -71,6 +71,46 @@ class MailboxService {
     };
   }
 
+  /** Inboxes on a domain served by our own Postal server. Same shape as a bulk-registered inbox: Paused, queued for warm-up. */
+  async createPostalMailboxes({ domainRow, localParts, displayName, createdBy, workspaceId }) {
+    const wanted = Array.from(new Set((localParts || []).map((p) => String(p || "").trim().toLowerCase()).filter(Boolean)));
+    const results = [];
+    const valid = wanted.filter((p) => LOCAL_PART_PATTERN.test(p));
+    for (const bad of wanted.filter((p) => !LOCAL_PART_PATTERN.test(p))) results.push({ email: `${bad}@${domainRow.domain}`, status: "Failed", error: "Invalid mailbox local part" });
+    const { rows: taken } = valid.length ? await db.query(`SELECT email FROM mailboxes WHERE email = ANY($1::text[]) AND is_deleted = FALSE`, [valid.map((p) => `${p}@${domainRow.domain}`)]) : { rows: [] };
+    const takenSet = new Set(taken.map((r) => r.email));
+    const fresh = valid.filter((p) => !takenSet.has(`${p}@${domainRow.domain}`));
+    for (const p of valid.filter((x) => takenSet.has(`${x}@${domainRow.domain}`))) results.push({ email: `${p}@${domainRow.domain}`, status: "Failed", error: "A mailbox with this email already exists" });
+    const usageId = fresh.length > 0 ? await quota.consume(workspaceId, "mailboxes", fresh.length, { domain: domainRow.domain }) : null;
+    let created = 0;
+    for (const localPart of fresh) {
+      const email = `${localPart}@${domainRow.domain}`;
+      const client = await db.getClient();
+      try {
+        await client.query("BEGIN");
+        const { rows } = await client.query(
+          `INSERT INTO mailboxes (domain_id, email, local_part, display_name, status, daily_limit, warmup_stage, provider, created_by, workspace_id, market_daily_limit, updated_at)
+           VALUES ($1,$2,$3,$4,'Paused',0,'Paused','postal',$5,$6,0,NOW()) ON CONFLICT (email) DO NOTHING RETURNING *`,
+          [domainRow.id, email, localPart, displayName || null, createdBy || null, domainRow.workspace_id]
+        );
+        if (!rows[0]) { await client.query("ROLLBACK"); results.push({ email, status: "Failed", error: "A mailbox with this email already exists" }); continue; }
+        await client.query(`INSERT INTO warmnet_mailboxes (mailbox_id, state) VALUES ($1,'queued') ON CONFLICT DO NOTHING`, [rows[0].id]);
+        await client.query("COMMIT");
+        created += 1;
+        results.push({ email, status: "Created", record: mapMailboxRow({ ...rows[0], domain_name: domainRow.domain, domain_status: domainRow.status, domain_bounce_rate: domainRow.bounce_rate, domain_complaint_rate: domainRow.complaint_rate }) });
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        console.error("createPostalMailboxes:", error);
+        results.push({ email, status: "Failed", error: "Could not create this mailbox" });
+      } finally {
+        client.release();
+      }
+    }
+    // Give back quota for any inbox that wasn't created.
+    if (usageId) await quota.refund(workspaceId, usageId, created);
+    return results;
+  }
+
   async createMailboxes({ domain, localParts, displayName, dailyLimit, createdBy, acceptedMonthlyIncreaseCents, workspaceId }) {
     const domainName = String(domain || "").trim().toLowerCase();
     if (!domainName) {
@@ -92,6 +132,11 @@ class MailboxService {
     // Maildoso-managed domains create real, billable mailboxes at Maildoso (cost-confirmed).
     if (domainRow.provider === "Maildoso") {
       return this.createMaildosoMailboxes({ domainRow, localParts, displayName, acceptedMonthlyIncreaseCents, workspaceId });
+    }
+
+    // Own-server (Postal) domains: mailboxes are only rows here, sent through Postal, and join the warm-up network paused.
+    if (domainRow.provider === "Postal") {
+      return this.createPostalMailboxes({ domainRow, localParts, displayName, createdBy, workspaceId });
     }
 
     const limit = Number.isFinite(Number(dailyLimit)) && Number(dailyLimit) > 0 ? Math.floor(Number(dailyLimit)) : 20;
@@ -259,7 +304,7 @@ class MailboxService {
   }
 
   /**
-   * The app-native inbox for a mailbox (see `messages` table / sesInboundEmail.service.js,
+   * The app-native inbox for a mailbox (see `messages` table / inboundEmail.service.js,
    * campaignSend.service.js) — every outbound send and inbound reply, newest first.
    */
   async listMailboxMessages(mailboxId, { page = 1, limit = 30, workspaceId } = {}) {

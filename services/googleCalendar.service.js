@@ -74,7 +74,9 @@ class GoogleCalendarService {
 
   async handleCallback(code, state) {
     // The workspace comes ONLY from the signed state: this endpoint has no session.
-    const { agentId, workspaceId } = verifyState(state);
+    const { agentId, workspaceId, userId } = verifyState(state);
+    // agentId 0 marks a workspace member connecting their own calendar (the AI SDR's call handler), not a legacy agent.
+    if (agentId === 0) return this.handleUserCallback(code, { workspaceId, userId });
     await assertAgentInWorkspace(agentId, workspaceId);
     const tokens = await this.exchangeCodeForTokens(code);
     const accessToken = cleanString(tokens.access_token);
@@ -151,6 +153,91 @@ class GoogleCalendarService {
     }
 
     return mapConnectionRow(result.rows[0]);
+  }
+
+  /** Consent URL for a workspace member connecting their own calendar. The signed state carries agentId 0. */
+  async getUserAuthUrl(workspaceId, userId) {
+    const wsId = normalizeWorkspaceId(workspaceId);
+    const uid = Number(userId);
+    if (!Number.isInteger(uid) || uid <= 0) {
+      const error = new Error("A signed-in user is required");
+      error.statusCode = 400;
+      throw error;
+    }
+    const params = new URLSearchParams({
+      client_id: requireEnv("GOOGLE_CALENDAR_CLIENT_ID"),
+      redirect_uri: requireEnv("GOOGLE_CALENDAR_REDIRECT_URI"),
+      response_type: "code",
+      scope: GOOGLE_SCOPES,
+      access_type: "offline",
+      prompt: "consent",
+      include_granted_scopes: "true",
+      state: signState(0, wsId, uid),
+    });
+    return `${GOOGLE_AUTH_URL}?${params.toString()}`;
+  }
+
+  async handleUserCallback(code, { workspaceId, userId }) {
+    const { rows: member } = await db.query(`SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2`, [workspaceId, userId]);
+    if (member.length === 0) {
+      const error = new Error("That account is not a member of this workspace.");
+      error.statusCode = 403;
+      throw error;
+    }
+    const tokens = await this.exchangeCodeForTokens(code);
+    const accessToken = cleanString(tokens.access_token);
+    const refreshToken = cleanString(tokens.refresh_token);
+    if (!accessToken) {
+      const error = new Error("Google did not return an access token");
+      error.statusCode = 502;
+      throw error;
+    }
+    if (!refreshToken) {
+      const error = new Error("Google did not return a refresh token. Remove this app from your Google account permissions and connect again.");
+      error.statusCode = 502;
+      throw error;
+    }
+    const email = await this.getUserEmail(accessToken).catch(() => null);
+    const a = encrypt(accessToken);
+    const r = encrypt(refreshToken);
+    const result = await db.query(
+      `INSERT INTO calendar_connections (workspace_id, user_id, ai_agent_id, provider, google_email, access_token_encrypted, access_token_iv, access_token_tag,
+                                         refresh_token_encrypted, refresh_token_iv, refresh_token_tag, token_expiry, calendar_id, status)
+       VALUES ($1, $2, NULL, 'google', $3, $4, $5, $6, $7, $8, $9, $10, 'primary', 'connected')
+       ON CONFLICT (workspace_id, user_id, provider) WHERE user_id IS NOT NULL
+       DO UPDATE SET google_email = EXCLUDED.google_email, access_token_encrypted = EXCLUDED.access_token_encrypted, access_token_iv = EXCLUDED.access_token_iv,
+                     access_token_tag = EXCLUDED.access_token_tag, refresh_token_encrypted = EXCLUDED.refresh_token_encrypted, refresh_token_iv = EXCLUDED.refresh_token_iv,
+                     refresh_token_tag = EXCLUDED.refresh_token_tag, token_expiry = EXCLUDED.token_expiry, status = 'connected', updated_at = now()
+       RETURNING id, provider, google_email, status, created_at`,
+      [workspaceId, userId, email, a.encrypted, a.iv, a.tag, r.encrypted, r.iv, r.tag, expiryFromSeconds(tokens.expires_in)]
+    );
+    return mapConnectionRow(result.rows[0]);
+  }
+
+  /** The full, token-bearing row for a member's connected calendar. Internal use only. */
+  async getConnectedForUser(workspaceId, userId) {
+    const result = await db.query(
+      `SELECT * FROM calendar_connections WHERE workspace_id = $1 AND user_id = $2 AND provider = 'google' AND status = 'connected' LIMIT 1`,
+      [workspaceId, userId]
+    );
+    return result.rows[0] || null;
+  }
+
+  /** Public (token-free) status of a member's calendar, including revoked connections so the UI can ask to reconnect. */
+  async getUserConnectionStatus(workspaceId, userId) {
+    const result = await db.query(
+      `SELECT id, provider, google_email, status, created_at FROM calendar_connections WHERE workspace_id = $1 AND user_id = $2 AND provider = 'google' LIMIT 1`,
+      [workspaceId, userId]
+    );
+    return mapConnectionRow(result.rows[0]);
+  }
+
+  /** Only the owner of a connection can remove it (the legacy disconnect only checks the workspace). */
+  async disconnectForUser(workspaceId, userId) {
+    const result = await db.query(`SELECT id FROM calendar_connections WHERE workspace_id = $1 AND user_id = $2 AND provider = 'google'`, [workspaceId, userId]);
+    if (!result.rows[0]) return { disconnected: false };
+    await this.disconnectConnection(result.rows[0].id, workspaceId);
+    return { disconnected: true };
   }
 
   /**
@@ -445,7 +532,7 @@ function verifyState(state) {
     throw buildStateError("This Google Calendar connection link has expired. Start the connection again.");
   }
 
-  return { agentId: normalizeAgentId(agentId), workspaceId: normalizeWorkspaceId(workspaceId), userId: Number(userId) || null };
+  return { agentId: Number(agentId) === 0 ? 0 : normalizeAgentId(agentId), workspaceId: normalizeWorkspaceId(workspaceId), userId: Number(userId) || null };
 }
 
 function buildStateError(message) {

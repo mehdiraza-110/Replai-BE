@@ -209,7 +209,7 @@ class WarmnetEngineService {
 
   /** Builds the MIME, sends it through the mailbox's own provider, records the row and updates counters. */
   async deliver({ row, seed, subject, body, kind, threadKey, inReplyTo }) {
-    const { buildRawMimeMessage, mailboxDomain, sesClient } = mime();
+    const { buildRawMimeMessage, mailboxDomain } = mime();
     const fromAddress = row.display_name ? `"${String(row.display_name).replace(/["\\\r\n]/g, "")}" <${row.email}>` : row.email;
     const extra = inReplyTo ? { "In-Reply-To": inReplyTo, References: inReplyTo } : {};
     const { raw, messageId } = buildRawMimeMessage({
@@ -222,7 +222,7 @@ class WarmnetEngineService {
     });
     const thread = threadKey || messageId.replace(/[<>]/g, "").slice(0, 60);
     try {
-      await sendRawEmail({ mailbox: { id: row.mailbox_id, email: row.email, provider: row.provider }, fromAddress, to: seed.email, raw, sesClient, tags: [] });
+      await sendRawEmail({ mailbox: { id: row.mailbox_id, email: row.email, provider: row.provider }, fromAddress, to: seed.email, raw });
       await db.query(
         `INSERT INTO warmnet_messages (mailbox_id, seed_id, direction, kind, thread_key, rfc_message_id, in_reply_to, subject, status)
          VALUES ($1, $2, 'to_seed', $3, $4, $5, $6, $7, 'sent')`,

@@ -115,6 +115,7 @@ class CampaignService {
     timezone,
     aiAgentId,
     humanReviewRequired,
+    launch,
     createdBy,
     workspaceId,
   }) {
@@ -200,7 +201,7 @@ class CampaignService {
            name, objective, subject, body, mailbox_mode, mailbox_ids, daily_limit_override,
            sending_days, window_start, window_end, timezone, ai_agent_id, human_review_required,
            status, started_at, created_by, workspace_id, updated_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'Active',NOW(),$14,$15,NOW())
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$16,NOW(),$14,$15,NOW())
          RETURNING id, workspace_id, name, status, started_at, sent_today, sent_total, reply_count, bounce_count, mailbox_mode, mailbox_ids`,
         [
           trimmedName,
@@ -218,6 +219,8 @@ class CampaignService {
           humanReviewRequired !== false,
           createdBy || null,
           workspaceId,
+          // `launch: false` creates the campaign paused, so it can be reviewed before anything is sent.
+          launch === false ? "Paused" : "Active",
         ]
       );
       const campaign = rows[0];

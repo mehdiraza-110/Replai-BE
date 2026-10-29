@@ -1,76 +1,8 @@
-const {
-  SESv2Client,
-  CreateEmailIdentityCommand,
-  GetEmailIdentityCommand,
-  PutEmailIdentityMailFromAttributesCommand,
-  PutEmailIdentityDkimSigningAttributesCommand,
-  PutEmailIdentityConfigurationSetAttributesCommand,
-  GetAccountCommand,
-  PutAccountDetailsCommand,
-  PutAccountVdmAttributesCommand,
-  CreateConfigurationSetCommand,
-  CreateConfigurationSetEventDestinationCommand,
-  GetConfigurationSetEventDestinationsCommand,
-} = require("@aws-sdk/client-sesv2");
-const {
-  Route53Client,
-  ListHostedZonesByNameCommand,
-  ChangeResourceRecordSetsCommand,
-  ListResourceRecordSetsCommand,
-} = require("@aws-sdk/client-route-53");
-const { CloudWatchClient, GetMetricDataCommand } = require("@aws-sdk/client-cloudwatch");
-const dns = require("node:dns").promises;
 const db = require("../config/db.config");
-const quota = require("./quota.service");
 
-const AWS_REGION = process.env.AWS_REGION || "us-east-1";
-const MAIL_FROM_SUBDOMAIN = process.env.SES_MAIL_FROM_SUBDOMAIN || "mail";
-const DMARC_POLICY = process.env.SES_DMARC_POLICY || "v=DMARC1; p=none;";
-const REPUTATION_EVENT_TYPES = ["SEND", "REJECT", "BOUNCE", "COMPLAINT", "DELIVERY", "OPEN", "CLICK", "RENDERING_FAILURE", "DELIVERY_DELAY"];
-const REPUTATION_WINDOW_DAYS = 14;
-// Per-event bounce/complaint capture (PlusVibe-Plan.md 12A.4) — set once the SNS topic
-// exists (see services/sesBounceComplaint.service.js for the handler it delivers to).
-const SES_BOUNCE_COMPLAINT_SNS_TOPIC_ARN = process.env.SES_BOUNCE_COMPLAINT_SNS_TOPIC_ARN || null;
-
-const sesClient = new SESv2Client({ region: AWS_REGION });
-const route53Client = new Route53Client({ region: AWS_REGION });
-const cloudWatchClient = new CloudWatchClient({ region: AWS_REGION });
-
-let vdmEnsured = false;
+// Domains are served by one of two paths: our own Postal mail server (the main one) or Maildoso. Amazon SES is no longer used.
 
 class DomainService {
-  // Route53 is our own AWS account, so it holds every tenant's zones. When a workspace is given, zones whose
-  // domain is already owned by ANOTHER workspace are hidden (they would otherwise leak that tenant's domains).
-  async listHostedZoneDomains(workspaceId = null) {
-    const zones = [];
-    let marker;
-
-    do {
-      const page = await route53Client.send(
-        new ListHostedZonesByNameCommand({ Marker: marker })
-      );
-      zones.push(...(page.HostedZones || []));
-      marker = page.IsTruncated ? page.NextMarker : undefined;
-    } while (marker);
-
-    let ownedElsewhere = new Set();
-    if (workspaceId) {
-      const { rows } = await db.query(
-        `SELECT domain FROM domains WHERE is_deleted = FALSE AND workspace_id <> $1`,
-        [workspaceId]
-      );
-      ownedElsewhere = new Set(rows.map((row) => row.domain));
-    }
-
-    return zones
-      .filter((zone) => !zone.Config?.PrivateZone)
-      .map((zone) => ({
-        domain: zone.Name.replace(/\.$/, ""),
-        hostedZoneId: zone.Id.replace("/hostedzone/", ""),
-      }))
-      .filter((zone) => !ownedElsewhere.has(zone.domain));
-  }
-
   async listDomains({ page = 1, limit = 10, search = "", workspaceId } = {}) {
     const pageNum = Math.max(1, Number.parseInt(page, 10) || 1);
     const limitNum = Math.min(Math.max(Number.parseInt(limit, 10) || 10, 1), 100);
@@ -115,432 +47,20 @@ class DomainService {
     };
   }
 
-  async onboardDomains(domainNames, createdBy, workspaceId) {
-    const hostedZones = await this.listHostedZoneDomains(workspaceId);
-    const hostedZoneByName = new Map(hostedZones.map((z) => [z.domain, z.hostedZoneId]));
-
-    const results = [];
-    for (const domainName of domainNames) {
-      try {
-        const hostedZoneId = hostedZoneByName.get(domainName);
-        if (!hostedZoneId) {
-          throw new Error(`No Route53 hosted zone found for ${domainName}`);
-        }
-        const result = await this.onboardDomain(domainName, hostedZoneId, createdBy, workspaceId);
-        results.push(result);
-      } catch (error) {
-        results.push({ domain: domainName, status: "Failed", error: error.message, ...(error.code ? { code: error.code } : {}) });
-      }
-    }
-    return results;
-  }
-
-  // Counts a new domain against the workspace's limit before any AWS side effect (re-onboarding a domain the
-  // workspace already has is not a new domain). Returns a usage event id to refund if onboarding then fails.
-  async consumeDomainQuota(domainName, workspaceId) {
-    const { rows } = await db.query(`SELECT 1 FROM domains WHERE domain = $1 AND workspace_id = $2 AND is_deleted = FALSE`, [domainName, workspaceId]);
-    if (rows[0]) return null;
-    return quota.consume(workspaceId, "domains", 1, { domain: domainName });
-  }
-
-  async onboardDomain(domainName, hostedZoneId, createdBy, workspaceId) {
-    await this.assertDomainAvailable(domainName, workspaceId);
-    const usageId = await this.consumeDomainQuota(domainName, workspaceId);
-    try {
-      return await this.onboardDomainUnchecked(domainName, hostedZoneId, createdBy, workspaceId);
-    } catch (error) {
-      await quota.refund(workspaceId, usageId);
-      throw error;
-    }
-  }
-
-  async onboardDomainUnchecked(domainName, hostedZoneId, createdBy, workspaceId) {
-    const { dkimTokens, mailFromDomain } = await this.createSesIdentity(domainName);
-
-    // Write the DNS records SES needs into Route53: DKIM CNAMEs, MAIL FROM MX + SPF, root SPF, DMARC.
-    // Existing TXT record sets are merged rather than replaced, since UPSERT replaces the whole
-    // set and would otherwise silently delete unrelated TXT entries (site verification, etc).
-    const existingTxt = await this.getExistingTxtRecords(hostedZoneId, [
-      domainName,
-      `_dmarc.${domainName}`,
-      mailFromDomain,
-    ]);
-    const changes = buildDnsChanges({ domainName, mailFromDomain, dkimTokens, existingTxt });
-    await route53Client.send(
-      new ChangeResourceRecordSetsCommand({
-        HostedZoneId: hostedZoneId,
-        ChangeBatch: { Comment: "SES domain onboarding", Changes: changes },
-      })
-    );
-
-    const record = await this.upsertDomainRecord({
-      domain: domainName,
-      hostedZoneId,
-      mailFromSubdomain: mailFromDomain,
-      dkimTokens,
-      createdBy,
-      workspaceId,
-      registrar: "Route53",
-      dnsProvider: "Route53",
-    });
-
-    return {
-      domain: domainName,
-      status: "Pending Verification",
-      record,
-      dnsRecords: buildDnsRecordList({ domainName, mailFromDomain, dkimTokens }),
-    };
-  }
-
-  // For a domain that isn't hosted in this AWS account's Route53 — we still create the SES
-  // identity, but hand back the DNS records for the caller to add at their own DNS provider
-  // instead of writing them ourselves.
-  async onboardExternalDomain(domainName, createdBy, workspaceId) {
-    await this.assertDomainAvailable(domainName, workspaceId);
-    const usageId = await this.consumeDomainQuota(domainName, workspaceId);
-    try {
-      return await this.onboardExternalDomainUnchecked(domainName, createdBy, workspaceId);
-    } catch (error) {
-      await quota.refund(workspaceId, usageId);
-      throw error;
-    }
-  }
-
-  async onboardExternalDomainUnchecked(domainName, createdBy, workspaceId) {
-    const { dkimTokens, mailFromDomain } = await this.createSesIdentity(domainName);
-
-    const record = await this.upsertDomainRecord({
-      domain: domainName,
-      hostedZoneId: null,
-      mailFromSubdomain: mailFromDomain,
-      dkimTokens,
-      createdBy,
-      workspaceId,
-      registrar: "External",
-      dnsProvider: "External",
-    });
-
-    return {
-      domain: domainName,
-      status: "Pending Verification",
-      record,
-      dnsRecords: buildDnsRecordList({ domainName, mailFromDomain, dkimTokens }),
-    };
-  }
-
-  // domains.domain is globally UNIQUE (and the SES identity is account-wide), so a domain already onboarded by
-  // another workspace can't be claimed here. Checked before any AWS/Route53 side effect.
-  async assertDomainAvailable(domainName, workspaceId) {
-    const { rows } = await db.query(`SELECT workspace_id FROM domains WHERE domain = $1`, [domainName]);
-    if (rows[0] && rows[0].workspace_id !== workspaceId) {
-      throw Object.assign(new Error(`${domainName} is already in use by another workspace`), { statusCode: 409, code: "DOMAIN_IN_USE" });
-    }
-  }
-
-  async createSesIdentity(domainName) {
-    const mailFromDomain = `${MAIL_FROM_SUBDOMAIN}.${domainName}`;
-
-    // Create (or reuse) the SES email identity with Easy DKIM (RSA 2048, managed by SES).
-    let identity;
-    try {
-      identity = await sesClient.send(
-        new CreateEmailIdentityCommand({
-          EmailIdentity: domainName,
-          DkimSigningAttributes: { NextSigningKeyLength: "RSA_2048_BIT" },
-        })
-      );
-    } catch (error) {
-      if (error.name === "AlreadyExistsException") {
-        identity = await sesClient.send(
-          new GetEmailIdentityCommand({ EmailIdentity: domainName })
-        );
-      } else {
-        throw error;
-      }
-    }
-
-    const dkimTokens = identity.DkimAttributes?.Tokens || [];
-
-    // Configure a custom MAIL FROM domain so bounces/SPF align to our own subdomain.
-    await sesClient.send(
-      new PutEmailIdentityMailFromAttributesCommand({
-        EmailIdentity: domainName,
-        MailFromDomain: mailFromDomain,
-        BehaviorOnMxFailure: "USE_DEFAULT_VALUE",
-      })
-    );
-
-    // Reputation tracking: a dedicated configuration set per domain, published to CloudWatch,
-    // set as this identity's default so every send from it is measured automatically.
-    const configurationSetName = await this.ensureDomainConfigurationSet(domainName);
-    await sesClient.send(
-      new PutEmailIdentityConfigurationSetAttributesCommand({
-        EmailIdentity: domainName,
-        ConfigurationSetName: configurationSetName,
-      })
-    );
-
-    return { dkimTokens, mailFromDomain, configurationSetName };
-  }
-
-  async ensureAccountVdmEnabled() {
-    if (vdmEnsured) return;
-    try {
-      await sesClient.send(
-        new PutAccountVdmAttributesCommand({
-          VdmAttributes: {
-            VdmEnabled: "ENABLED",
-            DashboardAttributes: { EngagementMetrics: "ENABLED" },
-            GuardianAttributes: { OptimizedSharedDelivery: "ENABLED" },
-          },
-        })
-      );
-    } catch (error) {
-      // Non-fatal — reputation tracking still works per configuration set without account-level VDM.
-      console.error("Unable to enable account VDM attributes:", error.message);
-    }
-    vdmEnsured = true;
-  }
-
-  configurationSetNameFor(domainName) {
-    const slug = domainName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-    return `domain-${slug}`.slice(0, 64);
-  }
-
-  async ensureDomainConfigurationSet(domainName) {
-    await this.ensureAccountVdmEnabled();
-    const configurationSetName = this.configurationSetNameFor(domainName);
-
-    try {
-      await sesClient.send(
-        new CreateConfigurationSetCommand({
-          ConfigurationSetName: configurationSetName,
-          ReputationOptions: { ReputationMetricsEnabled: true },
-          SendingOptions: { SendingEnabled: true },
-          VdmOptions: {
-            DashboardOptions: { EngagementMetrics: "ENABLED" },
-            GuardianOptions: { OptimizedSharedDelivery: "ENABLED" },
-          },
-        })
-      );
-    } catch (error) {
-      if (error.name !== "AlreadyExistsException") throw error;
-    }
-
-    const existingDestinations = await sesClient
-      .send(new GetConfigurationSetEventDestinationsCommand({ ConfigurationSetName: configurationSetName }))
-      .then((res) => res.EventDestinations || [])
-      .catch(() => []);
-
-    if (!existingDestinations.some((destination) => destination.Name === "cloudwatch")) {
-      await sesClient.send(
-        new CreateConfigurationSetEventDestinationCommand({
-          ConfigurationSetName: configurationSetName,
-          EventDestinationName: "cloudwatch",
-          EventDestination: {
-            Enabled: true,
-            MatchingEventTypes: REPUTATION_EVENT_TYPES,
-            CloudWatchDestination: {
-              DimensionConfigurations: [
-                {
-                  DimensionName: "ses:configuration-set",
-                  DimensionValueSource: "MESSAGE_TAG",
-                  DefaultDimensionValue: configurationSetName,
-                },
-              ],
-            },
-          },
-        })
-      );
-    }
-
-    if (SES_BOUNCE_COMPLAINT_SNS_TOPIC_ARN && !existingDestinations.some((destination) => destination.Name === "sns-bounce-complaint")) {
-      await sesClient.send(
-        new CreateConfigurationSetEventDestinationCommand({
-          ConfigurationSetName: configurationSetName,
-          EventDestinationName: "sns-bounce-complaint",
-          EventDestination: {
-            Enabled: true,
-            MatchingEventTypes: ["BOUNCE", "COMPLAINT"],
-            SnsDestination: { TopicArn: SES_BOUNCE_COMPLAINT_SNS_TOPIC_ARN },
-          },
-        })
-      );
-    }
-
-    return configurationSetName;
-  }
-
-  async getDomainReputationMetrics(configurationSetName, windowDays = REPUTATION_WINDOW_DAYS) {
-    const endTime = new Date();
-    const startTime = new Date(endTime.getTime() - windowDays * 24 * 60 * 60 * 1000);
-    const periodSeconds = windowDays * 24 * 60 * 60;
-    const dimensions = [{ Name: "ses:configuration-set", Value: configurationSetName }];
-
-    const metricNames = ["Send", "Delivery", "Bounce", "Complaint", "Reject"];
-    const response = await cloudWatchClient.send(
-      new GetMetricDataCommand({
-        StartTime: startTime,
-        EndTime: endTime,
-        MetricDataQueries: metricNames.map((name) => ({
-          Id: name.toLowerCase(),
-          MetricStat: {
-            Metric: { Namespace: "AWS/SES", MetricName: name, Dimensions: dimensions },
-            Period: periodSeconds,
-            Stat: "Sum",
-          },
-        })),
-      })
-    );
-
-    const byId = Object.fromEntries((response.MetricDataResults || []).map((result) => [result.Id, result.Values?.[0] || 0]));
-    const sent = byId.send || 0;
-    const delivered = byId.delivery || 0;
-    const bounced = byId.bounce || 0;
-    const complained = byId.complaint || 0;
-
-    return {
-      emailsSent: Math.round(sent),
-      emailsDelivered: Math.round(delivered),
-      emailsBounced: Math.round(bounced),
-      emailsComplained: Math.round(complained),
-      bounceRate: sent > 0 ? round3(bounced / sent) : null,
-      complaintRate: sent > 0 ? round3(complained / sent) : null,
-      deliveryRate: sent > 0 ? round3(delivered / sent) : null,
-    };
-  }
-
-  reputationLabelFor({ bounceRate, complaintRate, emailsSent }) {
-    if (!emailsSent) return "Unknown";
-    // Thresholds follow AWS's own published guidance for maintaining sending privileges:
-    // bounce rate should stay under 5%, complaint rate under 0.1%.
-    if (bounceRate > 0.1 || complaintRate > 0.005) return "At Risk";
-    if (bounceRate > 0.05 || complaintRate > 0.001) return "Watch";
-    return "Healthy";
-  }
-
-  // workspaceId is omitted only by background jobs; HTTP callers always pass it.
-  async refreshDomainReputation(domain, workspaceId = null) {
-    const { rows } = await db.query(
-      `SELECT id, configuration_set_name FROM domains WHERE domain = $1 AND is_deleted = FALSE AND ($2::int IS NULL OR workspace_id = $2)`,
-      [domain, workspaceId]
-    );
-    const domainRow = rows[0];
-    if (!domainRow) {
-      throw Object.assign(new Error(`Domain ${domain} is not onboarded yet`), { statusCode: 404 });
-    }
-
-    let configurationSetName = domainRow.configuration_set_name;
-    if (!configurationSetName) {
-      // Self-heal domains onboarded before reputation tracking existed: wire up the
-      // configuration set now and make it this identity's default going forward.
-      configurationSetName = await this.ensureDomainConfigurationSet(domain);
-      await sesClient.send(
-        new PutEmailIdentityConfigurationSetAttributesCommand({
-          EmailIdentity: domain,
-          ConfigurationSetName: configurationSetName,
-        })
-      );
-    }
-    const metrics = await this.getDomainReputationMetrics(configurationSetName);
-    const reputation = this.reputationLabelFor({ bounceRate: metrics.bounceRate ?? 0, complaintRate: metrics.complaintRate ?? 0, emailsSent: metrics.emailsSent });
-
-    const { rows: updatedRows } = await db.query(
-      `UPDATE domains SET
-         configuration_set_name = $2,
-         emails_sent_14d = $3,
-         emails_delivered_14d = $4,
-         emails_bounced_14d = $5,
-         emails_complained_14d = $6,
-         bounce_rate = $7,
-         complaint_rate = $8,
-         delivery_rate = $9,
-         reputation = $10,
-         reputation_checked_at = NOW(),
-         updated_at = NOW()
-       WHERE domain = $1 AND ($11::int IS NULL OR workspace_id = $11)
-       RETURNING *`,
-      [
-        domain,
-        configurationSetName,
-        metrics.emailsSent,
-        metrics.emailsDelivered,
-        metrics.emailsBounced,
-        metrics.emailsComplained,
-        metrics.bounceRate,
-        metrics.complaintRate,
-        metrics.deliveryRate,
-        reputation,
-        workspaceId,
-      ]
-    );
-
-    return mapDomainRow(updatedRows[0]);
-  }
-
+  /** Daily sends and bounce rate over the last N days, from our own sends (the own mail server reports no account-level metrics). */
   async getReputationTrend({ days = 7, workspaceId } = {}) {
     const daysNum = Math.min(Math.max(Number.parseInt(days, 10) || 7, 1), 30);
-
-    const endTime = new Date();
-    endTime.setUTCHours(0, 0, 0, 0);
-    endTime.setUTCDate(endTime.getUTCDate() + 1);
-    const startTime = new Date(endTime.getTime() - daysNum * 24 * 60 * 60 * 1000);
-
-    const buckets = new Map();
-    for (let i = 0; i < daysNum; i += 1) {
-      const date = new Date(startTime.getTime() + i * 24 * 60 * 60 * 1000);
-      buckets.set(date.toISOString().slice(0, 10), { sent: 0, bounced: 0, complained: 0 });
-    }
-
     const { rows } = await db.query(
-      `SELECT DISTINCT configuration_set_name FROM domains WHERE is_deleted = FALSE AND configuration_set_name IS NOT NULL AND workspace_id = $1`,
-      [workspaceId]
+      `SELECT to_char(g.day, 'YYYY-MM-DD') AS date,
+              COUNT(cl.id) FILTER (WHERE cl.status IN ('Sent', 'Replied', 'Bounced'))::int AS sent,
+              COUNT(cl.id) FILTER (WHERE cl.status = 'Bounced')::int AS bounced
+       FROM generate_series(CURRENT_DATE - ($2::int - 1), CURRENT_DATE, INTERVAL '1 day') AS g(day)
+       LEFT JOIN campaign_leads cl ON cl.workspace_id = $1 AND cl.sent_at >= g.day AND cl.sent_at < g.day + INTERVAL '1 day'
+       GROUP BY g.day ORDER BY g.day`,
+      [workspaceId, daysNum]
     );
-
-    const bucketKeyFor = { send: "sent", bounce: "bounced", complaint: "complained" };
-    const responses = await Promise.all(
-      rows.map((row) => {
-        const dimensions = [{ Name: "ses:configuration-set", Value: row.configuration_set_name }];
-        return cloudWatchClient
-          .send(
-            new GetMetricDataCommand({
-              StartTime: startTime,
-              EndTime: endTime,
-              MetricDataQueries: ["Send", "Bounce", "Complaint"].map((name) => ({
-                Id: name.toLowerCase(),
-                MetricStat: {
-                  Metric: { Namespace: "AWS/SES", MetricName: name, Dimensions: dimensions },
-                  Period: 86400,
-                  Stat: "Sum",
-                },
-              })),
-            })
-          )
-          .catch(() => null);
-      })
-    );
-
-    for (const response of responses) {
-      if (!response) continue;
-      for (const result of response.MetricDataResults || []) {
-        const key = bucketKeyFor[result.Id];
-        if (!key) continue;
-        (result.Timestamps || []).forEach((timestamp, index) => {
-          const dateKey = new Date(timestamp).toISOString().slice(0, 10);
-          const bucket = buckets.get(dateKey);
-          if (bucket) bucket[key] += result.Values?.[index] || 0;
-        });
-      }
-    }
-
-    return Array.from(buckets.entries())
-      .sort(([a], [b]) => (a < b ? -1 : 1))
-      .map(([date, bucket]) => ({
-        date,
-        sentVolume: Math.round(bucket.sent),
-        bounceRate: bucket.sent > 0 ? Math.round((bucket.bounced / bucket.sent) * 1000) / 10 : 0,
-        complaintRate: bucket.sent > 0 ? Math.round((bucket.complained / bucket.sent) * 10000) / 10 : 0,
-      }));
+    // No complaint feed exists yet, so complaintRate is reported as 0 rather than guessed.
+    return rows.map((r) => ({ date: r.date, sentVolume: r.sent, bounceRate: r.sent > 0 ? Math.round((r.bounced / r.sent) * 1000) / 10 : 0, complaintRate: 0 }));
   }
 
   async deleteDomain(id, workspaceId) {
@@ -576,191 +96,76 @@ class DomainService {
     }
   }
 
-  async upsertDomainRecord({ domain, hostedZoneId, mailFromSubdomain, dkimTokens, createdBy, workspaceId, registrar = "Route53", dnsProvider = "Route53" }) {
-    const { rows } = await db.query(
-      `INSERT INTO domains (
-         domain, registrar, dns_provider, hosted_zone_id, aws_region,
-         mail_from_subdomain, spf_status, dkim_status, dmarc_status, mx_status,
-         mail_from_status, provider, status, raw_dkim_tokens, created_by, workspace_id, updated_at
-       ) VALUES (
-         $1, $2, $3, $4, $5,
-         $6, 'Pending', 'Pending', 'Pending', 'Pending',
-         'Pending', 'Amazon SES', 'Pending Verification', $7, $8, $9, NOW()
-       )
-       ON CONFLICT (domain) DO UPDATE SET
-         registrar = EXCLUDED.registrar,
-         dns_provider = EXCLUDED.dns_provider,
-         hosted_zone_id = EXCLUDED.hosted_zone_id,
-         aws_region = EXCLUDED.aws_region,
-         mail_from_subdomain = EXCLUDED.mail_from_subdomain,
-         spf_status = 'Pending',
-         dkim_status = 'Pending',
-         dmarc_status = 'Pending',
-         mx_status = 'Pending',
-         mail_from_status = 'Pending',
-         status = 'Pending Verification',
-         raw_dkim_tokens = EXCLUDED.raw_dkim_tokens,
-         updated_at = NOW(),
-         is_deleted = FALSE
-       WHERE domains.workspace_id = EXCLUDED.workspace_id
-       RETURNING *`,
-      [domain, registrar, dnsProvider, hostedZoneId, AWS_REGION, mailFromSubdomain, JSON.stringify(dkimTokens), createdBy || null, workspaceId]
-    );
-    if (!rows[0]) {
-      throw Object.assign(new Error(`${domain} is already in use by another workspace`), { statusCode: 409, code: "DOMAIN_IN_USE" });
-    }
-    return mapDomainRow(rows[0]);
-  }
-
-  async getExistingTxtRecords(hostedZoneId, names) {
-    const wanted = new Set(names.map((n) => `${n.replace(/\.$/, "")}.`));
-    const found = new Map();
-    let startRecordName;
-    let startRecordType;
-
-    do {
-      const page = await route53Client.send(
-        new ListResourceRecordSetsCommand({
-          HostedZoneId: hostedZoneId,
-          StartRecordName: startRecordName,
-          StartRecordType: startRecordType,
-        })
-      );
-
-      for (const rrset of page.ResourceRecordSets || []) {
-        if (rrset.Type === "TXT" && wanted.has(rrset.Name)) {
-          found.set(rrset.Name, rrset.ResourceRecords?.map((r) => r.Value) || []);
-        }
-      }
-
-      startRecordName = page.IsTruncated ? page.NextRecordName : undefined;
-      startRecordType = page.IsTruncated ? page.NextRecordType : undefined;
-    } while (startRecordName);
-
-    return found;
-  }
-
   async refreshDomainStatus(domain, workspaceId = null) {
-    // Maildoso-managed domains have no SES identity: their DNS/verification lives at Maildoso,
-    // so only the reputation numbers (derived from our own sends/bounces) are refreshed here.
     const { rows: providerRows } = await db.query(`SELECT provider FROM domains WHERE domain = $1 AND is_deleted = FALSE AND ($2::int IS NULL OR workspace_id = $2)`, [domain, workspaceId]);
-    if (workspaceId && !providerRows[0]) {
-      throw Object.assign(new Error(`Domain ${domain} is not onboarded yet`), { statusCode: 404 });
-    }
-    if (providerRows[0]?.provider === "Maildoso") {
-      return mapDomainRow(await require("./maildoso.service").refreshDomainReputation(domain, workspaceId));
-    }
-
-    const [identity, spfStatus, dmarcStatus] = await Promise.all([
-      sesClient.send(new GetEmailIdentityCommand({ EmailIdentity: domain })),
-      checkSpfRecord(domain),
-      checkDmarcRecord(domain),
-    ]);
-
-    const dkimStatus = mapVerificationStatus(identity.DkimAttributes?.Status);
-    const mailFromStatus = mapVerificationStatus(identity.MailFromAttributes?.MailFromDomainStatus);
-    const verified = identity.VerifiedForSendingStatus === true;
-
-    const overallStatus = verified
-      ? "Verified"
-      : dkimStatus === "Failed" || mailFromStatus === "Failed"
-      ? "Failed"
-      : "Pending Verification";
-
-    const { rows } = await db.query(
-      `UPDATE domains SET
-         dkim_status = $2,
-         mail_from_status = $3,
-         spf_status = $4,
-         mx_status = $3,
-         dmarc_status = $5,
-         status = $6,
-         last_checked_at = NOW(),
-         updated_at = NOW()
-       WHERE domain = $1 AND ($7::int IS NULL OR workspace_id = $7)
-       RETURNING *`,
-      [domain, dkimStatus, mailFromStatus, spfStatus, dmarcStatus, overallStatus, workspaceId]
-    );
-
-    if (!rows[0]) {
-      throw Object.assign(new Error(`Domain ${domain} is not onboarded yet`), { statusCode: 404 });
-    }
-
-    // Reputation (bounce/complaint/delivery) is pulled from CloudWatch in the same recheck pass
-    // so one "Recheck status" action refreshes everything about the domain.
-    try {
-      return await this.refreshDomainReputation(domain, workspaceId);
-    } catch (error) {
-      console.error(`Unable to refresh reputation metrics for ${domain}:`, error.message);
-      return mapDomainRow(rows[0]);
-    }
+    if (!providerRows[0]) throw Object.assign(new Error(`Domain ${domain} is not onboarded yet`), { statusCode: 404 });
+    // Maildoso-managed domains: DNS and verification live at Maildoso, so only the reputation numbers (from our own sends and bounces) are refreshed.
+    if (providerRows[0].provider === "Maildoso") return mapDomainRow(await require("./maildoso.service").refreshDomainReputation(domain, workspaceId));
+    // Own mail server (Postal): the DNS is read live. A lookup that could not be answered at all never changes the status, so a DNS blip can't stop sending.
+    if (providerRows[0].provider === "Postal") return this.refreshPostalDomain(domain, workspaceId);
+    throw Object.assign(new Error(`${domain} was set up with a sending service that is no longer supported. Move it to the own mail server.`), { statusCode: 409 });
   }
 
-  async getAccountStatus(workspaceId) {
-    const account = await sesClient.send(new GetAccountCommand({}));
-    const { rows } = await db.query(
-      `SELECT * FROM ses_account_requests WHERE workspace_id = $1 ORDER BY requested_at DESC LIMIT 1`,
-      [workspaceId]
-    );
-
-    return {
-      awsRegion: AWS_REGION,
-      sendingEnabled: account.SendingEnabled ?? null,
-      productionAccessEnabled: account.ProductionAccessEnabled ?? false,
-      enforcementStatus: account.EnforcementStatus ?? null,
-      max24HourSend: account.SendQuota?.Max24HourSend ?? null,
-      maxSendRate: account.SendQuota?.MaxSendRate ?? null,
-      sentLast24Hours: account.SendQuota?.SentLast24Hours ?? null,
-      latestRequest: rows[0] ? mapAccountRequestRow(rows[0]) : null,
-    };
-  }
-
-  async requestProductionAccess({ mailType, websiteUrl, useCaseDescription, additionalContactEmailAddresses, createdBy, workspaceId }) {
-    if (!mailType || !websiteUrl) {
-      throw Object.assign(new Error("mailType and websiteUrl are required"), { statusCode: 400 });
+  async refreshPostalDomain(domain, workspaceId = null) {
+    const postalDns = require("./postalDns.service");
+    const { rows: found } = await db.query(`SELECT id, dkim_selector FROM domains WHERE domain = $1 AND is_deleted = FALSE AND ($2::int IS NULL OR workspace_id = $2)`, [domain, workspaceId]);
+    if (!found[0]) throw Object.assign(new Error(`Domain ${domain} is not onboarded yet`), { statusCode: 404 });
+    // The mail server has to verify the domain itself before it will send for it, and it knows the exact DKIM key. Ask it first (best effort).
+    const postalAdmin = require("./postalAdmin.service");
+    let fromPostal = null;
+    if (postalAdmin.configured()) {
+      fromPostal = await postalAdmin.checkDns(domain).catch(() => null);
+      const sel = fromPostal?.records?.dkim_name ? fromPostal.records.dkim_name.replace(/\._domainkey$/, "") : null;
+      if (sel && sel !== found[0].dkim_selector) { await db.query(`UPDATE domains SET dkim_selector = $2 WHERE id = $1`, [found[0].id, sel]); found[0].dkim_selector = sel; }
     }
-
-    let status = "Submitted";
-    let errorMessage = null;
-    try {
-      await sesClient.send(
-        new PutAccountDetailsCommand({
-          MailType: mailType,
-          WebsiteURL: websiteUrl,
-          UseCaseDescription: useCaseDescription,
-          AdditionalContactEmailAddresses: additionalContactEmailAddresses?.length ? additionalContactEmailAddresses : undefined,
-          ProductionAccessEnabled: true,
-        })
+    const result = await postalDns.check(domain, { dkimSelector: found[0].dkim_selector });
+    // Postal compares the DKIM key exactly; our own lookup only sees that a key exists. Prefer its verdict when we have it.
+    if (fromPostal?.status && result.statuses && !result.unreliable) {
+      const map = { OK: "Success", Missing: "Failed", Invalid: "Failed" };
+      if (found[0].dkim_selector && map[fromPostal.status.dkim]) result.statuses.dkim = map[fromPostal.status.dkim];
+    }
+    const toDb = (value) => (value === "Unknown" ? "Pending" : value);
+    if (result.unreliable) {
+      // Keep what we knew; just record that the check couldn't be completed.
+      await db.query(`UPDATE domains SET last_error = $2, last_checked_at = NOW(), updated_at = NOW() WHERE id = $1`, [found[0].id, `DNS lookup failed (${[...new Set(result.errors)].join(", ")}). Try again shortly.`]);
+    } else {
+      const s = result.statuses;
+      const status = postalDns.overall(s);
+      const problems = [s.mx === "Failed" && "MX doesn't point at the mail server", s.spf === "Failed" && "SPF doesn't include the mail server"].filter(Boolean);
+      await db.query(
+        `UPDATE domains SET mx_status = $2, spf_status = $3, dmarc_status = $4, dkim_status = $5, status = $6, last_error = $7, last_checked_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        [found[0].id, toDb(s.mx), toDb(s.spf), toDb(s.dmarc), toDb(s.dkim), status, problems.length ? problems.join("; ") : null]
       );
-    } catch (error) {
-      status = "Failed";
-      errorMessage = error.message;
     }
+    return mapDomainRow(await require("./maildoso.service").refreshDomainReputation(domain, workspaceId));
+  }
 
+  /**
+   * Background re-check of domains on the own mail server. A domain that isn't verified yet is looked at every pass (so warm-up
+   * starts by itself once its DNS has spread); a verified one only once a day (so a record that gets removed is noticed).
+   */
+  async refreshDuePostalDomains({ limit = 40, workspaceId = null } = {}) {
     const { rows } = await db.query(
-      `INSERT INTO ses_account_requests (
-         aws_region, mail_type, website_url, use_case_description,
-         additional_contact_emails, status, error_message, requested_by, workspace_id
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       RETURNING *`,
-      [
-        AWS_REGION,
-        mailType,
-        websiteUrl,
-        useCaseDescription || null,
-        JSON.stringify(additionalContactEmailAddresses || []),
-        status,
-        errorMessage,
-        createdBy || null,
-        workspaceId,
-      ]
+      `SELECT domain FROM domains
+       WHERE provider = 'Postal' AND is_deleted = FALSE AND ($2::int IS NULL OR workspace_id = $2) AND COALESCE(last_checked_at, TIMESTAMP 'epoch') < NOW() - INTERVAL '10 minutes'
+         AND (status <> 'Verified' OR COALESCE(last_checked_at, TIMESTAMP 'epoch') < NOW() - INTERVAL '24 hours')
+       ORDER BY (status = 'Verified'), last_checked_at NULLS FIRST LIMIT $1`,
+      [Math.min(Math.max(Number.parseInt(limit, 10) || 40, 1), 200), workspaceId]
     );
-
-    if (status === "Failed") {
-      throw Object.assign(new Error(errorMessage), { statusCode: 502, record: mapAccountRequestRow(rows[0]) });
+    const out = { checked: 0, nowVerified: 0, failed: 0, errors: 0 };
+    for (const row of rows) {
+      try {
+        const before = (await db.query(`SELECT status FROM domains WHERE domain = $1`, [row.domain])).rows[0]?.status;
+        const after = await this.refreshPostalDomain(row.domain, null);
+        out.checked += 1;
+        if (before !== "Verified" && after.status === "Verified") out.nowVerified += 1;
+        if (after.status === "Failed") out.failed += 1;
+      } catch (error) {
+        out.errors += 1;
+        console.error(`Re-check of ${row.domain} failed:`, error.message);
+      }
     }
-
-    return mapAccountRequestRow(rows[0]);
+    return out;
   }
 
   async refreshAllDomains(workspaceId = null) {
@@ -782,157 +187,6 @@ class DomainService {
   }
 }
 
-function mergedTxtValues(existingTxt, name, newValue) {
-  const key = `${name.replace(/\.$/, "")}.`;
-  const existingValues = existingTxt.get(key) || [];
-  const quoted = `"${newValue}"`;
-  // SPF records must stay singular per RFC 7208; anything starting with "v=spf1" is replaced,
-  // everything else (site verification TXTs, etc.) is preserved.
-  const isSpf = newValue.startsWith("v=spf1");
-  const kept = existingValues.filter((v) => !(isSpf && v.replace(/"/g, "").startsWith("v=spf1")) && v !== quoted);
-  return [...kept, quoted].map((Value) => ({ Value }));
-}
-
-function buildDnsChanges({ domainName, mailFromDomain, dkimTokens, existingTxt }) {
-  const changes = [];
-
-  for (const token of dkimTokens) {
-    changes.push({
-      Action: "UPSERT",
-      ResourceRecordSet: {
-        Name: `${token}._domainkey.${domainName}`,
-        Type: "CNAME",
-        TTL: 600,
-        ResourceRecords: [{ Value: `${token}.dkim.amazonses.com` }],
-      },
-    });
-  }
-
-  // MAIL FROM subdomain needs its own MX (for bounces) and SPF TXT record.
-  changes.push({
-    Action: "UPSERT",
-    ResourceRecordSet: {
-      Name: mailFromDomain,
-      Type: "MX",
-      TTL: 600,
-      ResourceRecords: [{ Value: `10 feedback-smtp.${AWS_REGION}.amazonses.com` }],
-    },
-  });
-  changes.push({
-    Action: "UPSERT",
-    ResourceRecordSet: {
-      Name: mailFromDomain,
-      Type: "TXT",
-      TTL: 600,
-      ResourceRecords: mergedTxtValues(existingTxt, mailFromDomain, "v=spf1 include:amazonses.com ~all"),
-    },
-  });
-
-  // Root domain SPF (covers any direct sends from the apex, and mail clients that check it).
-  changes.push({
-    Action: "UPSERT",
-    ResourceRecordSet: {
-      Name: domainName,
-      Type: "TXT",
-      TTL: 600,
-      ResourceRecords: mergedTxtValues(existingTxt, domainName, "v=spf1 include:amazonses.com ~all"),
-    },
-  });
-
-  // DMARC — monitor-only by default; tighten to quarantine/reject once inbox placement is verified.
-  changes.push({
-    Action: "UPSERT",
-    ResourceRecordSet: {
-      Name: `_dmarc.${domainName}`,
-      Type: "TXT",
-      TTL: 600,
-      ResourceRecords: mergedTxtValues(existingTxt, `_dmarc.${domainName}`, DMARC_POLICY),
-    },
-  });
-
-  return changes;
-}
-
-function buildDnsRecordList({ domainName, mailFromDomain, dkimTokens }) {
-  const records = dkimTokens.map((token) => ({
-    purpose: "DKIM",
-    type: "CNAME",
-    host: `${token}._domainkey.${domainName}`,
-    value: `${token}.dkim.amazonses.com`,
-  }));
-
-  records.push({
-    purpose: "MAIL FROM (bounce routing)",
-    type: "MX",
-    host: mailFromDomain,
-    value: `10 feedback-smtp.${AWS_REGION}.amazonses.com`,
-  });
-  records.push({
-    purpose: "MAIL FROM SPF",
-    type: "TXT",
-    host: mailFromDomain,
-    value: "v=spf1 include:amazonses.com ~all",
-  });
-  records.push({
-    purpose: "SPF",
-    type: "TXT",
-    host: domainName,
-    value: "v=spf1 include:amazonses.com ~all",
-  });
-  records.push({
-    purpose: "DMARC",
-    type: "TXT",
-    host: `_dmarc.${domainName}`,
-    value: DMARC_POLICY,
-  });
-
-  return records;
-}
-
-async function checkSpfRecord(domain) {
-  try {
-    const records = await dns.resolveTxt(domain);
-    const flat = records.map((parts) => parts.join(""));
-    return flat.some((value) => value.startsWith("v=spf1") && value.includes("amazonses.com")) ? "Success" : "Failed";
-  } catch (error) {
-    if (error.code === "ENODATA" || error.code === "ENOTFOUND") return "Pending";
-    return "Failed";
-  }
-}
-
-async function checkDmarcRecord(domain) {
-  try {
-    const records = await dns.resolveTxt(`_dmarc.${domain}`);
-    const flat = records.map((parts) => parts.join(""));
-    return flat.some((value) => value.startsWith("v=DMARC1")) ? "Success" : "Failed";
-  } catch (error) {
-    if (error.code === "ENODATA" || error.code === "ENOTFOUND") return "Pending";
-    return "Failed";
-  }
-}
-
-function mapVerificationStatus(status) {
-  if (status === "SUCCESS") return "Success";
-  if (status === "FAILED") return "Failed";
-  if (status === "PENDING") return "Pending";
-  return "Not started";
-}
-
-function mapAccountRequestRow(row) {
-  if (!row) return null;
-  return {
-    id: row.id,
-    awsRegion: row.aws_region,
-    mailType: row.mail_type,
-    websiteUrl: row.website_url,
-    useCaseDescription: row.use_case_description,
-    additionalContactEmails: row.additional_contact_emails,
-    status: row.status,
-    errorMessage: row.error_message,
-    requestedAt: row.requested_at,
-  };
-}
-
 function mapDomainRow(row) {
   if (!row) return null;
   return {
@@ -940,22 +194,16 @@ function mapDomainRow(row) {
     domain: row.domain,
     registrar: row.registrar,
     dnsProvider: row.dns_provider,
-    hostedZoneId: row.hosted_zone_id,
-    awsRegion: row.aws_region,
-    mailFromSubdomain: row.mail_from_subdomain,
     spfStatus: row.spf_status,
     dkimStatus: row.dkim_status,
     dmarcStatus: row.dmarc_status,
     mxStatus: row.mx_status,
-    mailFromStatus: row.mail_from_status,
     provider: row.provider,
     status: row.status,
     reputation: row.reputation,
     lastCheckedAt: row.last_checked_at,
     lastError: row.last_error,
-    dkimTokens: row.raw_dkim_tokens,
     mailboxCount: row.mailbox_count ?? null,
-    configurationSetName: row.configuration_set_name,
     emailsSent14d: row.emails_sent_14d,
     emailsDelivered14d: row.emails_delivered_14d,
     emailsBounced14d: row.emails_bounced_14d,
