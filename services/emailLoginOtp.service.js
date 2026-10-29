@@ -57,15 +57,15 @@ function maskEmail(email) {
 async function sendOtpEmail(user, code) {
   const { html, text } = emailService.renderEmail({
     title: "Your sign-in code",
-    preheader: `Your ReplyOS sign-in code is ${code}.`,
+    preheader: `Your SendVybe sign-in code is ${code}.`,
     paragraphs: [
-      `${user.first_name ? `Hi ${emailService.escapeHtml(user.first_name)}, use` : "Use"} this code to finish signing in to ReplyOS:`,
+      `${user.first_name ? `Hi ${emailService.escapeHtml(user.first_name)}, use` : "Use"} this code to finish signing in to SendVybe:`,
       `<span style="display:inline-block;font-size:30px;font-weight:700;letter-spacing:8px;color:#111827;">${code}</span>`,
       `It expires in ${OTP_TTL_SECONDS / 60} minutes and can only be used once.`,
     ],
     footnote: "If you didn't try to sign in, someone may know your password. You can ignore this email, but we recommend changing your password.",
   });
-  return emailService.send({ to: user.email, subject: `${code} is your ReplyOS sign-in code`, html, text, category: "login-otp" });
+  return emailService.send({ to: user.email, subject: `${code} is your SendVybe sign-in code`, html, text, category: "login-otp" });
 }
 
 const emailLoginOtpService = {

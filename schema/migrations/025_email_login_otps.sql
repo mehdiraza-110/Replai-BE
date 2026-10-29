@@ -1,4 +1,4 @@
--- 016 — email OTP for sign-in. One row per login challenge: the password was correct, a 6-digit code was emailed,
+-- 025 — email OTP for sign-in. One row per login challenge: the password was correct, a 6-digit code was emailed,
 -- and a session is only issued once that code is verified. Nothing here touches the users table (FK only).
 -- Neither the OTP nor the challenge token is stored in clear: otp_hash is an HMAC-SHA256 of the code (keyed with a server
 -- secret), challenge_hash is the sha256 of the opaque token the client sends back. Idempotent.
