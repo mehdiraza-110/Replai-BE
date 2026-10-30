@@ -76,9 +76,15 @@ class CampaignSendService {
       // Warmup sends draw from the permanent warmup-lane allowance (daily_limit/sent_today);
       // real campaigns draw from the separate market-lane allowance, which only unlocks once
       // a mailbox finishes ramping. See warmup.service.js tickMailbox.
+      // Real campaigns are also paced: by this point in the sending window a mailbox may only have sent its
+      // proportional share of the daily limit, so the limit is spread over the window instead of going out in the
+      // first minutes after it opens (which Gmail reads as a burst).
       const remainingCapacity = campaign.is_warmup
         ? mailbox.daily_limit - mailbox.sent_today
-        : mailbox.market_daily_limit - mailbox.market_sent_today;
+        : Math.min(
+            mailbox.market_daily_limit - mailbox.market_sent_today,
+            Math.ceil(mailbox.market_daily_limit * windowProgress(campaign)) - mailbox.market_sent_today
+          );
       let batchSize = Math.max(0, Math.min(MAX_SENDS_PER_MAILBOX_PER_TICK, remainingCapacity));
       if (batchSize === 0) continue;
 
@@ -339,6 +345,23 @@ function isWithinSendingWindow(campaign, now = new Date()) {
   const endMinutes = endH * 60 + endM;
 
   return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
+}
+
+/** How far "now" is through the campaign's sending window, 0 (just opened) to 1 (closing), in the campaign's timezone. */
+function windowProgress(campaign, now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: campaign.timezone || "UTC",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(now);
+  const current = Number(parts.find((p) => p.type === "hour").value) * 60 + Number(parts.find((p) => p.type === "minute").value);
+  const [startH, startM] = String(campaign.window_start || "00:00").split(":").map(Number);
+  const [endH, endM] = String(campaign.window_end || "23:59").split(":").map(Number);
+  const start = startH * 60 + startM;
+  const length = endH * 60 + endM - start;
+  if (length <= 0) return 1;
+  return Math.min(1, Math.max(0, (current - start) / length));
 }
 
 function escapeHeaderValue(value) {
