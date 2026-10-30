@@ -61,7 +61,9 @@ class NativeAgentReplyService {
     if (leadEmail && (await suppressionService.isSuppressed(leadEmail, workspaceId))) return { status: "Skipped", reason: "suppressed" };
 
     const helpers = messageService.agentHelpers;
-    const agent = toAgentContext(agentRow, campaign, override || {});
+    const replyRules = await require("./replier.service").rulesFor(workspaceId, agentRow.id).catch(() => null);
+    const playbook = replyRules?.playbook() || "";
+    const agent = toAgentContext(agentRow, campaign, { ...(override || {}), instructions: [override?.instructions, playbook].filter(Boolean).join(". ") });
     agent.workspace_id = workspaceId;
     const { rows: thread } = await db.query(
       `SELECT direction, body_text, created_at FROM messages WHERE mailbox_id = $1 AND thread_id = $2 AND workspace_id = $4 ORDER BY created_at DESC LIMIT $3`,
@@ -149,10 +151,14 @@ class NativeAgentReplyService {
     const result = { draftId: draft.id, draft, confidence: generation.confidence, generatedBy: generation.generatedBy };
     if (overrideAgentId) return { status: "Drafted", ...result };
 
+    // Replier mode for this type of reply: only "draft", "escalate" and "no_reply" are enforced here (all keep the draft for a person); "auto" still needs the agent's own confidence gate.
+    const typeMode = replyRules?.get(generation.intent)?.mode || "default";
+    const heldForPerson = ["draft", "escalate", "no_reply"].includes(typeMode);
     const autoSend =
+      !heldForPerson &&
       !campaign.human_review_required &&
-      agentRow.auto_reply_enabled &&
-      !agentRow.require_human_review &&
+      (agentRow.auto_reply_enabled || typeMode === "auto") &&
+      (!agentRow.require_human_review || typeMode === "auto") &&
       Number(generation.confidence) >= Number(agentRow.confidence_threshold);
     if (!autoSend) return { status: "Drafted", ...result };
 

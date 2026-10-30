@@ -65,12 +65,23 @@ const reset = () => { scripts = []; calls = []; dnsRecords = []; poolFull = fals
     assert.match(postalAdmin.checkScript("x.example"), /verify_with_dns unless domain\.verified\?/);
     assert.match(postalAdmin.checkScript("x.example"), /check_dns\(:manual\)/);
   });
+  await check("the console echoes the script back: the echo must not be mistaken for the result", async () => {
+    // exactly what Postal's console does when fed a script on stdin: it prints each input line, then the output
+    postalAdmin.setRunner(async (src) => `Loading production environment (Rails 7.1.6)\n${src.split("\n").map((l, i) => `irb(main):${String(i + 1).padStart(3, "0")}> ${l}`).join("\n")}\n__JSON_BEGIN__{"domains":[{"name":"a.example"}],"pools":[],"per_pool":10}__JSON_END__\n`);
+    const r = await postalAdmin.listDomains(); assert.equal(r.domains[0].name, "a.example"); assert.equal(r.per_pool, 10);
+    assert.ok(!/__JSON_BEGIN__/.test(postalAdmin.listScript()), "the script must not contain the contiguous marker");
+    assert.ok(!/__JSON_END__/.test(postalAdmin.provisionScript("x.example")) && !/__JSON_BEGIN__/.test(postalAdmin.checkScript("x.example")));
+    postalAdmin.setRunner(async () => 'irb> puts "__JSON_BEGIN__" + out.to_json + "__JSON_END__"\n__JSON_BEGIN__{"ok":true}__JSON_END__');
+    assert.equal((await postalAdmin.listDomains()).ok, true);
+    postalAdmin.setRunner(async () => 'irb> puts "__JSON_BEGIN__" + out.to_json + "__JSON_END__"');
+    await assert.rejects(() => postalAdmin.listDomains(), /didn't return a result/);
+  });
   await check("results are read from between the markers; errors become clear failures", async () => {
     postalAdmin.setRunner(async () => "no markers here");
     await assert.rejects(() => postalAdmin.listDomains(), /didn't return a result/);
     postalAdmin.setRunner(async () => json({ error: "ActiveRecord::RecordInvalid: Validation failed" }));
     await assert.rejects(() => postalAdmin.provision("x.example"), (e) => e.code === "POSTAL_REFUSED" && /Validation failed/.test(e.message));
-    postalAdmin.setRunner(async () => "__JSON_BEGIN__{broken__JSON_END__");
+    postalAdmin.setRunner(async () => "__JSON_BEGIN__{broken}__JSON_END__");
     await assert.rejects(() => postalAdmin.listDomains(), /unreadable/);
   });
 

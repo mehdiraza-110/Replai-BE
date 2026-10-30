@@ -132,7 +132,7 @@ function base64Lines(text) {
  * Plain bodies go out as text/plain exactly as before. When htmlBody is given the message is
  * multipart/alternative with `body` as the plain-text part and `htmlBody` as the HTML part.
  */
-function buildRawMimeMessage({ from, to, subject, body, htmlBody = null, extraHeaders = {}, messageIdDomain = "replyos" }) {
+function buildRawMimeMessage({ from, to, subject, body, htmlBody = null, extraHeaders = {}, messageIdDomain = "sendvybe" }) {
   const messageId = `<${crypto.randomUUID()}@${messageIdDomain}>`;
   const headerLines = [
     `From: ${from}`,

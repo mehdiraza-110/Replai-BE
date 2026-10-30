@@ -198,7 +198,7 @@ class GhlService {
         body: {
           type: "Email",
           contactId,
-          subject: cleanString(subject) || "Reply from ReplyOS AI agent",
+          subject: cleanString(subject) || "Reply from SendVybe AI agent",
           message: cleanString(body) || "",
           direction,
         },

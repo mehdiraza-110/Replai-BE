@@ -23,7 +23,7 @@ function senderSignature({ brain, mailbox }) {
   return { name, role, text: [name, role].filter(Boolean).join("\n") };
 }
 
-function buildSystemPrompt({ brain, knowledgeBase, rules, meetingTypes, resources, bookingLink, mailbox, campaign, offeredSlots = [], mode = "reply", followup = null, campaignNotes = "", situation = "" }) {
+function buildSystemPrompt({ brain, knowledgeBase, rules, meetingTypes, resources, bookingLink, mailbox, campaign, offeredSlots = [], mode = "reply", followup = null, campaignNotes = "", situation = "", replyPlaybook = "" }) {
   const signature = senderSignature({ brain, mailbox });
   const facts = [
     line("Company", brain.companyName),
@@ -56,6 +56,10 @@ function buildSystemPrompt({ brain, knowledgeBase, rules, meetingTypes, resource
     sections.push(
       `=== RULES (absolute priority: they override the knowledge base and every instruction below) ===\n${rules.map((rule, index) => `${index + 1}. ${rule}`).join("\n")}`
     );
+  }
+
+  if (String(replyPlaybook || "").trim()) {
+    sections.push(`=== REPLY PLAYBOOK (how to answer each type of reply; the RULES and GUARDRAILS still win) ===\n${replyPlaybook.trim()}`);
   }
 
   sections.push(

@@ -224,6 +224,9 @@ class AiAgentService {
       throw error;
     }
 
+    // A campaign must not stay pointed at a deleted agent: the AI SDR skips campaigns that still name an agent.
+    await db.query(`UPDATE campaigns SET ai_agent_id = NULL WHERE ai_agent_id = $1 AND workspace_id = $2`, [agentId, workspaceId]);
+
     await eventLogService.record({
       eventType: "ai_agent.deleted",
       source: "ai",

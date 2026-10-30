@@ -45,30 +45,30 @@ function resetEmail(token) {
   const url = emailService.appUrl(`reset-password?token=${token}`);
   const { html, text } = emailService.renderEmail({
     title: "Reset your password",
-    preheader: "Use this link to choose a new ReplyOS password.",
+    preheader: "Use this link to choose a new SendVybe password.",
     paragraphs: [
-      "We received a request to reset the password for your ReplyOS account.",
+      "We received a request to reset the password for your SendVybe account.",
       "This link is valid for 60 minutes and can be used once.",
     ],
     cta: { label: "Reset password", url },
     footnote: "If you did not request this, you can safely ignore this email. Your password will not change.",
   });
-  return { subject: "Reset your ReplyOS password", html, text };
+  return { subject: "Reset your SendVybe password", html, text };
 }
 
 async function sendPasswordChangedEmail(email, firstName) {
   try {
     const { html, text } = emailService.renderEmail({
       title: "Your password was changed",
-      preheader: "The password for your ReplyOS account was just changed.",
+      preheader: "The password for your SendVybe account was just changed.",
       paragraphs: [
-        `${firstName ? `Hi ${emailService.escapeHtml(firstName)}, the` : "The"} password for your ReplyOS account was just changed.`,
+        `${firstName ? `Hi ${emailService.escapeHtml(firstName)}, the` : "The"} password for your SendVybe account was just changed.`,
         "If this was you, no further action is needed.",
         "If this wasn't you, please contact support right away so we can secure your account.",
       ],
       cta: { label: "Sign in", url: emailService.appUrl("login") },
     });
-    await emailService.send({ to: email, subject: "Your ReplyOS password was changed", html, text, category: "password-changed" });
+    await emailService.send({ to: email, subject: "Your SendVybe password was changed", html, text, category: "password-changed" });
   } catch (error) {
     console.error("Password changed email failed:", error.message);
   }

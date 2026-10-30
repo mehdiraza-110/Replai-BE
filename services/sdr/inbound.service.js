@@ -6,6 +6,7 @@ const agent = require("./agent.service");
 const webhook = require("./webhook.service");
 const scheduling = require("./scheduling.service");
 const { ungroundedTopic } = require("./grounding");
+const replierService = require("../replier.service");
 
 const RANK = classifier.INTEREST_RANK;
 const POSITIVE_RANK = RANK.high;
@@ -116,7 +117,7 @@ class SdrInboundService {
    * Asks the model for the next email. Shared by replies and follow-ups. `latest` is null for a follow-up.
    * Returns the model's answer, or null when no usable answer exists (a person takes over).
    */
-  async generate({ workspaceId, all, mailbox, lead, campaign, conversation, latest, mode = "reply", followup = null, offeredSlots = [], situation = "" }) {
+  async generate({ workspaceId, all, mailbox, lead, campaign, conversation, latest, mode = "reply", followup = null, offeredSlots = [], situation = "", replyPlaybook = "" }) {
     try {
       return await agent.generate({
         workspaceId,
@@ -137,6 +138,7 @@ class SdrInboundService {
           followup,
           offeredSlots,
           situation,
+          replyPlaybook,
         },
       });
     } catch (error) {
@@ -257,7 +259,9 @@ class SdrInboundService {
       }
     }
 
-    const generated = await this.generate({ workspaceId, all, mailbox, lead, campaign, conversation, latest: inbound, offeredSlots, situation });
+    // Per reply-type instructions saved in the Replier. A failure here must never stop the SDR, so it falls back to no rules.
+    const replyRules = await replierService.rulesFor(workspaceId, null).catch(() => null);
+    const generated = await this.generate({ workspaceId, all, mailbox, lead, campaign, conversation, latest: inbound, offeredSlots, situation, replyPlaybook: replyRules?.playbook() || "" });
     const needsPerson = ["interested", "meeting_request", "question"].includes(classification.intent) || ["high", "very_high"].includes(classification.interest);
 
     if (!generated) {
@@ -274,6 +278,21 @@ class SdrInboundService {
     if (ungrounded && !generated.escalate) {
       generated.escalate = true;
       generated.escalateReason = ungrounded;
+    }
+
+    // Replier mode for this type of reply: "escalate" and "no_reply" stop the reply, "draft" forces review, "auto" lifts the workspace approval setting.
+    const typeRule = replyRules?.get(generated.intent) || null;
+    let approvalForType = approval;
+    if (typeRule?.mode === "escalate" && !generated.escalate) {
+      generated.escalate = true;
+      generated.escalateReason = `Reply type "${generated.intent}" is set to escalate to a person.`;
+      generated.shouldReply = false;
+    } else if (typeRule?.mode === "no_reply") {
+      generated.shouldReply = false;
+    } else if (typeRule?.mode === "draft") {
+      approvalForType = true;
+    } else if (typeRule?.mode === "auto") {
+      approvalForType = false;
     }
 
     const existing = await threadState.getState(workspaceId, inbound.mailbox_id, inbound.thread_id);
@@ -306,7 +325,7 @@ class SdrInboundService {
     }
 
     const subject = String(inbound.subject || "").toLowerCase().startsWith("re:") ? inbound.subject : `Re: ${inbound.subject || ""}`.trim();
-    const result = await this.deliver({ workspaceId, inbound, subject, body, generated, approval: generated.escalate || approval, campaignId: campaign?.id || null });
+    const result = await this.deliver({ workspaceId, inbound, subject, body, generated, approval: generated.escalate || approvalForType, campaignId: campaign?.id || null });
     if (result.status === "Sent") await this.afterAiSend({ ...threadRef, campaignId: campaign?.id || null });
     return result;
   }

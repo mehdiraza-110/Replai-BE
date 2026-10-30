@@ -51,10 +51,12 @@ function ssh(source) {
 async function run(source) {
   if (!configured()) throw fail("The mail server connection isn't set up on this server (POSTAL_SSH_HOST).", 503, "POSTAL_NOT_CONFIGURED");
   const out = await (runner ? runner(source) : ssh(source));
-  const m = /__JSON_BEGIN__([\s\S]*?)__JSON_END__/.exec(String(out));
-  if (!m) throw fail("The mail server didn't return a result.", 502, "POSTAL_NO_RESULT");
+  // Postal's console echoes every line it is given, so the script itself shows up in the output. The markers are built in two
+  // pieces in the script (never contiguous there), and only a real JSON object between them counts, taken from the last match.
+  const all = [...String(out).matchAll(/__JSON_BEGIN__(\{[\s\S]*?\})__JSON_END__/g)];
+  if (!all.length) throw fail("The mail server didn't return a result.", 502, "POSTAL_NO_RESULT");
   let data;
-  try { data = JSON.parse(m[1]); } catch { throw fail("The mail server returned something unreadable.", 502, "POSTAL_BAD_RESULT"); }
+  try { data = JSON.parse(all[all.length - 1][1]); } catch { throw fail("The mail server returned something unreadable.", 502, "POSTAL_BAD_RESULT"); }
   if (data.error) throw fail(`The mail server refused: ${String(data.error).slice(0, 300)}`, 422, "POSTAL_REFUSED");
   return data;
 }
@@ -66,7 +68,7 @@ ${body}
 rescue => e
   out = { error: "#{e.class}: #{e.message}" }
 end
-puts "__JSON_BEGIN__" + out.to_json + "__JSON_END__"
+puts "__JSON" + "_BEGIN__" + out.to_json + "__JSON" + "_END__"
 `;
 
 const recordsRuby = `out[:records] = { verification: domain.dns_verification_string, spf: domain.spf_record, dkim_name: domain.dkim_record_name, dkim: domain.dkim_record,

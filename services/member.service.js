@@ -115,7 +115,7 @@ function parseUserId(value) {
 // (the temporary password itself is never emailed). Never throws.
 async function sendAddedEmail({ email, workspaceName, role, created, userId }) {
   try {
-    const paragraphs = [`You've been added to <strong>${emailService.escapeHtml(workspaceName)}</strong> on ReplyOS as ${role === "admin" ? "an" : "a"} <strong>${emailService.escapeHtml(role)}</strong>.`];
+    const paragraphs = [`You've been added to <strong>${emailService.escapeHtml(workspaceName)}</strong> on SendVybe as ${role === "admin" ? "an" : "a"} <strong>${emailService.escapeHtml(role)}</strong>.`];
     let cta = { label: "Sign in", url: emailService.appUrl("login") };
     let footnote = "";
     if (created) {
@@ -126,7 +126,7 @@ async function sendAddedEmail({ email, workspaceName, role, created, userId }) {
     }
     const { html, text } = emailService.renderEmail({
       title: `You've been added to ${workspaceName}`,
-      preheader: `You now have access to ${workspaceName} on ReplyOS.`,
+      preheader: `You now have access to ${workspaceName} on SendVybe.`,
       paragraphs,
       cta,
       footnote,

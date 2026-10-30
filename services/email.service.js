@@ -30,7 +30,7 @@ function escapeHtml(value) {
 }
 
 /**
- * Wraps content in the standard ReplyOS email layout. `bodyHtml` must already be safe HTML (build it with
+ * Wraps content in the standard SendVybe email layout. `bodyHtml` must already be safe HTML (build it with
  * escapeHtml for any user-supplied text). Returns { html, text }.
  */
 function renderEmail({ title, preheader = "", paragraphs = [], cta = null, footnote = "" }) {
@@ -44,7 +44,7 @@ function renderEmail({ title, preheader = "", paragraphs = [], cta = null, footn
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:28px 12px;">
     <table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:14px;padding:30px;">
       <tr><td>
-        <p style="margin:0 0 18px;font-size:13px;font-weight:700;letter-spacing:.04em;color:#0b6bff;">ReplyOS</p>
+        <p style="margin:0 0 18px;font-size:13px;font-weight:700;letter-spacing:.04em;color:#0b6bff;">SendVybe</p>
         <h1 style="margin:0 0 16px;font-size:20px;line-height:1.3;color:#111827;">${escapeHtml(title)}</h1>
         ${paras}${button}
         ${footnote ? `<p style="margin:18px 0 0;font-size:12px;line-height:1.5;color:#6b7280;">${footnote}</p>` : ""}
@@ -89,7 +89,7 @@ async function send({ to, subject, text, html, replyTo = null, category = null }
       body: JSON.stringify({
         // One personalization per recipient so addresses are never exposed to each other.
         personalizations: unique.map((address) => ({ to: [{ email: address }] })),
-        from: { email: process.env.SENDGRID_FROM_EMAIL, name: process.env.SENDGRID_FROM_NAME || "ReplyOS" },
+        from: { email: process.env.SENDGRID_FROM_EMAIL, name: process.env.SENDGRID_FROM_NAME || "SendVybe" },
         ...(replyTo ? { reply_to: { email: replyTo } } : {}),
         subject: message.subject,
         content,

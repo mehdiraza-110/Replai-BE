@@ -28,6 +28,7 @@ router.get('/orders/:id', admin.getOrder);
 router.patch('/orders/:id', admin.updateOrder);
 router.post('/orders/:id/apply-limits', admin.applyLimits);
 
+router.get('/infra-health', admin.infraHealth);
 router.get('/users', admin.listUsers);
 router.patch('/users/:id', admin.updateUser);
 

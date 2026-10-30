@@ -881,7 +881,7 @@ async function notifyEmail(node, ctx) {
     }
 
     const vars = await notificationVariables(ctx);
-    const subject = fillVariables(data.subject, vars).replace(/[\r\n]+/g, " ").trim().slice(0, 200) || "ReplyOS notification";
+    const subject = fillVariables(data.subject, vars).replace(/[\r\n]+/g, " ").trim().slice(0, 200) || "SendVybe notification";
     const message = fillVariables(data.message, vars);
 
     if (dryRun) {

@@ -51,6 +51,7 @@ module.exports = {
   listUsers: handle("We couldn't load users. Please try again.", 200, null, (req) => adminService.listUsers(req.query)),
   updateUser: handle("We couldn't update this user. Please try again.", 200, "User updated", (req) => adminService.updateUser(req.user.id, req.params.id, req.body || {})),
 
+  infraHealth: handle("We couldn't check the mail server's identity. Please try again.", 200, null, () => require("../services/infraHealth.service").check()),
   analytics: handle("We couldn't load analytics. Please try again.", 200, null, (req) => adminService.analytics(req.query)),
 
   listOrders: handle("We couldn't load order requests. Please try again.", 200, null, (req) => adminOrderService.list(req.query)),

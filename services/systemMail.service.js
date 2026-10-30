@@ -192,9 +192,9 @@ async function trialMilestone(workspaceId, milestone, trialEndsAt) {
     title,
     preheader: ended ? `The trial of ${name} has ended.` : `The trial of ${name} ends ${when}.`,
     paragraphs: ended
-      ? [`The trial of <strong>${esc(name)}</strong> has ended. Your data is safe. Contact us to continue using ReplyOS.`]
+      ? [`The trial of <strong>${esc(name)}</strong> has ended. Your data is safe. Contact us to continue using SendVybe.`]
       : [`The trial of <strong>${esc(name)}</strong> ends on <strong>${esc(when)}</strong> (${milestone} day${milestone === 1 ? "" : "s"} from now).`, "Contact us before then if you want to keep going without interruption."],
-    cta: { label: "Open ReplyOS", url: appUrl("mailer") },
+    cta: { label: "Open SendVybe", url: appUrl("mailer") },
   });
   return sendOnce(workspaceId, key, null, { to, subject: title, html, text, category: "trial" });
 }
