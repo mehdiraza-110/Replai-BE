@@ -3,6 +3,7 @@ const db = require("../config/db.config");
 const suppressionService = require("./suppression.service");
 const { sendRawEmail } = require("./mailTransport.service");
 const quotaService = require("./quota.service");
+const leadVerifyService = require("./leadVerify.service");
 const { renderMessage, hasUnresolvedPlaceholders, buildRawMimeMessage } = require("../utils/emailTemplate.util");
 
 // How many leads a single mailbox may send in one tick. Kept deliberately small so a
@@ -10,6 +11,20 @@ const { renderMessage, hasUnresolvedPlaceholders, buildRawMimeMessage } = requir
 // the cron in index.js should run this every few minutes.
 const MAX_SENDS_PER_MAILBOX_PER_TICK = 1;
 const MAX_SEND_ATTEMPTS = 5;
+
+const envInt = (name, fallback) => {
+  const value = Number.parseInt(process.env[name], 10);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+};
+
+/**
+ * Mail from our own servers (Postal) only gets a brand-new IP's worth of trust one day at a time: an IP may send this many
+ * emails per day (warm-up and campaign mail together) at the given age, starting small and rising until the maximum.
+ * Tunable with POSTAL_IP_CAP_START / POSTAL_IP_CAP_STEP / POSTAL_IP_CAP_MAX.
+ */
+function ipDailyCap(ageDays) {
+  return Math.min(envInt("POSTAL_IP_CAP_MAX", 60), envInt("POSTAL_IP_CAP_START", 10) + envInt("POSTAL_IP_CAP_STEP", 2) * Math.max(0, ageDays || 0));
+}
 
 class CampaignSendService {
   /**
@@ -67,6 +82,8 @@ class CampaignSendService {
     }
 
     let sentCount = 0;
+    // Emails already sent from each sending IP during this tick, on top of what the database counted when the tick began.
+    const ipSentThisTick = new Map();
     for (const mailbox of mailboxes) {
       // A campaign deleted/paused while this tick was running must stop sending right away.
       if (!campaign.is_warmup) {
@@ -88,6 +105,16 @@ class CampaignSendService {
       let batchSize = Math.max(0, Math.min(MAX_SENDS_PER_MAILBOX_PER_TICK, remainingCapacity));
       if (batchSize === 0) continue;
 
+      // A Postal mailbox is also held to its sending IP's daily cap (a mailbox with no known IP is treated as its own IP).
+      let ipKey = null;
+      if (!campaign.is_warmup && mailbox.provider === "postal") {
+        ipKey = mailbox.ip_id ? `ip:${mailbox.ip_id}` : `mailbox:${mailbox.id}`;
+        const sentToday = mailbox.ip_id ? Number(mailbox.ip_sent_today) : mailbox.sent_today + mailbox.market_sent_today;
+        const ipRoom = ipDailyCap(mailbox.ip_id ? mailbox.ip_age_days : 0) - sentToday - (ipSentThisTick.get(ipKey) || 0);
+        batchSize = Math.min(batchSize, ipRoom);
+        if (batchSize <= 0) continue;
+      }
+
       // Follow-ups to people this mailbox already emailed take priority over new leads: a
       // sequence that stalls mid-way wastes the first touch. Warmup pool has no follow-ups.
       if (!campaign.is_warmup) {
@@ -95,7 +122,7 @@ class CampaignSendService {
         for (const lead of dueFollowUps) {
           const outcome = await this.sendToLead(campaign, mailbox, lead, { followUp: lead.followup });
           if (outcome.reason === "email_limit_reached") return { campaignId: campaign.id, sent: sentCount, reason: "email_limit_reached" };
-          if (outcome.sent) sentCount += 1;
+          if (outcome.sent) { sentCount += 1; if (ipKey) ipSentThisTick.set(ipKey, (ipSentThisTick.get(ipKey) || 0) + 1); }
           batchSize -= 1;
         }
         if (batchSize <= 0) continue;
@@ -105,7 +132,7 @@ class CampaignSendService {
       for (const lead of leads) {
         const outcome = await this.sendToLead(campaign, mailbox, lead);
         if (outcome.reason === "email_limit_reached") return { campaignId: campaign.id, sent: sentCount, reason: "email_limit_reached" };
-        if (outcome.sent) sentCount += 1;
+        if (outcome.sent) { sentCount += 1; if (ipKey) ipSentThisTick.set(ipKey, (ipSentThisTick.get(ipKey) || 0) + 1); }
       }
     }
 
@@ -126,10 +153,27 @@ class CampaignSendService {
       ? "m.sent_today < m.daily_limit"
       : "m.market_daily_limit > 0 AND m.market_sent_today < m.market_daily_limit";
 
+    // Readiness gate for our own mail servers: a Postal mailbox may only send real campaign mail once its domain's SPF, DKIM,
+    // MX and DMARC are all verified and it has been warming up for POSTAL_MIN_WARMUP_DAYS (default 14). Warm-up mail itself
+    // is never gated, or nothing could ever warm up.
+    let readinessFilter = "";
+    if (!campaign.is_warmup) {
+      params.push(envInt("POSTAL_MIN_WARMUP_DAYS", 14));
+      readinessFilter = `AND (m.provider <> 'postal' OR (
+           d.spf_status = 'Success' AND d.dkim_status = 'Success' AND d.mx_status = 'Success' AND d.dmarc_status = 'Success'
+           AND m.warmup_started_at IS NOT NULL AND m.warmup_started_at <= NOW() - make_interval(days => $${params.length})))`;
+    }
+
     const { rows } = await db.query(
-      `SELECT m.*, d.status AS domain_status
+      `SELECT m.*, d.status AS domain_status, w.ip_id,
+              GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (NOW() - ip.created_at)) / 86400))::int AS ip_age_days,
+              (SELECT COALESCE(SUM(m2.sent_today + m2.market_sent_today), 0)
+                 FROM mailboxes m2 JOIN warmnet_domains w2 ON w2.domain_id = m2.domain_id
+                WHERE w2.ip_id = w.ip_id AND m2.is_deleted = FALSE)::int AS ip_sent_today
        FROM mailboxes m
        JOIN domains d ON d.id = m.domain_id AND d.is_deleted = FALSE AND d.workspace_id = m.workspace_id
+       LEFT JOIN warmnet_domains w ON w.domain_id = d.id
+       LEFT JOIN warmnet_ips ip ON ip.id = w.ip_id
        WHERE m.is_deleted = FALSE
          AND m.workspace_id = $1
          AND m.status = 'Active'
@@ -137,6 +181,7 @@ class CampaignSendService {
          AND d.status = 'Verified'
          AND ${capacityFilter}
          ${mailboxFilter}
+         ${readinessFilter}
        ORDER BY m.sent_today ASC, m.id ASC`,
       params
     );
@@ -187,6 +232,16 @@ class CampaignSendService {
     if (await suppressionService.isSuppressed(lead.email, campaign.workspace_id)) {
       await db.query(`UPDATE campaign_leads SET status = 'Suppressed' WHERE id = $1`, [lead.id]);
       return { sent: false, reason: "suppressed" };
+    }
+
+    // An address that can't possibly receive mail (no such domain, no mail server) only costs us a bounce, which is the most
+    // expensive kind of mistake for a young sending IP. Skip it, leaving the reason on the lead. A DNS outage never blocks.
+    const verdict = await leadVerifyService.checkAddress(lead.email);
+    if (verdict.deliverable === false) {
+      const reason = `${verdict.reason}; not sent`;
+      if (followUp) await db.query(`UPDATE campaign_leads SET last_error = $2, followup_retry_after = NOW() + INTERVAL '24 hours' WHERE id = $1`, [lead.id, reason]);
+      else await db.query(`UPDATE campaign_leads SET status = 'Failed', last_error = $2 WHERE id = $1`, [lead.id, reason]);
+      return { sent: false, reason: "undeliverable_address" };
     }
 
     const rendered = renderMessage({ subject: campaign.subject, body: followUp ? followUp.body : campaign.body }, lead, mailbox);
@@ -383,4 +438,5 @@ module.exports = new CampaignSendService();
 // exactly like a campaign send, rather than duplicating the MIME/thread-id logic.
 module.exports.buildRawMimeMessage = buildRawMimeMessage;
 module.exports.threadIdFor = threadIdFor;
+module.exports.ipDailyCap = ipDailyCap;
 module.exports.mailboxDomain = mailboxDomain;

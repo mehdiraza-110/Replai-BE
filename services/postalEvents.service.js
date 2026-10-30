@@ -47,6 +47,9 @@ class PostalEventsService {
   async record({ email, rfcMessageId, postalMessageId, isHard, detail, kind, senders = [] }) {
     const address = String(email || "").toLowerCase().trim();
     if (!address) return { status: "Ignored", reason: "No recipient in event" };
+    // Mail addressed to one of our own return-path addresses (xxxx@psrp.<domain>) is the mail server's bounce plumbing, not a
+    // person: there is nobody to suppress, and it must not be logged as a bounce we couldn't place.
+    if (/@psrp\./.test(address)) return { status: "Ignored", reason: "Return-path address, not a recipient" };
 
     const campaignId = await this.findCampaignId(address, rfcMessageId);
     const workspaceId = await resolveWorkspaceId({ campaignId, senderAddresses: senders });
@@ -117,9 +120,10 @@ async function resolveWorkspaceId({ campaignId, senderAddresses = [] }) {
         break;
       }
 
+      // The envelope sender of our mail is on the return-path subdomain (psrp.example.com); the registered domain is example.com.
       const { rows: domainRows } = await db.query(
         `SELECT workspace_id FROM domains WHERE domain = $1 AND is_deleted = FALSE LIMIT 2`,
-        [address.split("@").pop()]
+        [address.split("@").pop().replace(/^psrp\./, "")]
       );
       if (domainRows.length === 1 && domainRows[0].workspace_id) {
         found.add(domainRows[0].workspace_id);
