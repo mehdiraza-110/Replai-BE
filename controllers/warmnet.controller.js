@@ -39,6 +39,8 @@ module.exports = {
   listDomains: handle("We couldn't load domains. Please try again.", 200, null, () => warmnet.listDomains()),
   registerDomains: handle("We couldn't register these domains. Please try again.", 200, "Domains registered", (req) => warmnet.registerDomains(req.user.id, req.body || {})),
 
+  addMailboxes: handle("We couldn't add the inboxes. Please try again.", 201, "Inboxes added", (req) => warmnet.addMailboxes(req.user.id, { ...(req.body || {}), domainId: id(req) })),
+
   listMessages: handle("We couldn't load the activity. Please try again.", 200, null, (req) => warmnet.listMessages(req.query)),
 
   listSeeds: handle("We couldn't load seed inboxes. Please try again.", 200, null, async () => ({ items: await warmnet.listSeeds(), presets: warmnet.seedPresets() })),

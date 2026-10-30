@@ -14,6 +14,7 @@ router.post("/mailboxes/action", c.mailboxAction);
 
 router.get("/domains", c.listDomains);
 router.post("/domains/register", c.registerDomains);
+router.post("/domains/:id/mailboxes", c.addMailboxes);
 
 router.get("/messages", c.listMessages);
 

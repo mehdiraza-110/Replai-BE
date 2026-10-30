@@ -437,6 +437,62 @@ class WarmnetService {
     return { workspaceId, perDomain, registered: results.filter((r) => r.ok).length, results };
   }
 
+  /**
+   * Adds inboxes to a domain that is already registered (Postal domain in the warm-up network). Same shape as registration:
+   * Paused, outside the old warm-up lane, enrolled as "queued" (or "warming" with autoStart), American names that are unique
+   * across the workspace. A domain holds at most 10 inboxes.
+   */
+  async addMailboxes(actorId, input = {}) {
+    const domainId = parseInt(input.domainId, 10);
+    const count = parseInt(input.count, 10);
+    if (!Number.isInteger(domainId) || domainId < 1) throw new WorkspaceError("That domain could not be found.", 404);
+    if (!Number.isInteger(count) || count < 1 || count > 10) throw new WorkspaceError("Choose between 1 and 10 inboxes to add.", 400);
+
+    const client = await db.getClient();
+    try {
+      await client.query("BEGIN");
+      const { rows: found } = await client.query(
+        `SELECT d.id, d.domain, d.provider, d.workspace_id FROM domains d JOIN warmnet_domains wd ON wd.domain_id = d.id
+          WHERE d.id = $1 AND d.is_deleted = FALSE FOR UPDATE OF d`,
+        [domainId]
+      );
+      const dom = found[0];
+      if (!dom) throw new WorkspaceError("That domain isn't in the warm-up network.", 404);
+      if (dom.provider !== "Postal") throw new WorkspaceError("Inboxes can only be added to domains on our own mail server.", 409);
+
+      const { rows: have } = await client.query(`SELECT email FROM mailboxes WHERE domain_id = $1 AND is_deleted = FALSE`, [domainId]);
+      if (have.length + count > 10) throw new WorkspaceError(`A domain holds at most 10 inboxes; ${dom.domain} already has ${have.length}.`, 409);
+
+      const used = new Set();
+      const { rows: names } = await client.query(`SELECT display_name FROM mailboxes WHERE workspace_id = $1 AND display_name IS NOT NULL`, [dom.workspace_id]);
+      names.forEach((r) => used.add(r.display_name));
+      const taken = new Set(have.map((r) => r.email.toLowerCase()));
+
+      const created = [];
+      for (const person of generatePeople(count, used)) {
+        const email = `${person.localPart}@${dom.domain}`;
+        if (taken.has(email.toLowerCase())) continue;
+        const mb = await client.query(
+          `INSERT INTO mailboxes (domain_id, email, local_part, display_name, status, daily_limit, warmup_stage, provider, created_by, workspace_id, market_daily_limit)
+           VALUES ($1, $2, $3, $4, 'Paused', 0, 'Paused', 'postal', $5, $6, 0) RETURNING id`,
+          [domainId, email, person.localPart, person.displayName, actorId || null, dom.workspace_id]
+        );
+        await client.query(
+          `INSERT INTO warmnet_mailboxes (mailbox_id, state, started_at) VALUES ($1, $2, $3)`,
+          [mb.rows[0].id, input.autoStart ? "warming" : "queued", input.autoStart ? new Date() : null]
+        );
+        created.push({ id: mb.rows[0].id, email, displayName: person.displayName });
+      }
+      await client.query("COMMIT");
+      return { domainId, domain: dom.domain, created: created.length, mailboxes: created, total: have.length + created.length };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   // ---------------- activity ----------------
   async listMessages(q = {}) {
     const { limit, page, offset } = pageArgs(q);
