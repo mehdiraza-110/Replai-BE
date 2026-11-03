@@ -18,13 +18,15 @@ const DEFAULTS = {
   replyRate: 0.45,
   counterReplyRate: 0.5,
   starRate: 0.35,
-  readyAfterDays: 21,
+  readyAfterDays: 14,
   readyMinInboxRate: 0.85,
   readyMinPlaced: 30,
   holdBelowInboxRate: 0.5,
   holdMinPlaced: 10,
   maxConsecutiveFailures: 5,
   maxSendsPerTick: 150,
+  minGapMinutes: 45,
+  sendChancePerTick: 0.1,
 };
 
 let ticking = false;
@@ -72,7 +74,7 @@ class WarmnetEngineService {
 
       const inWindow = local.hours >= settings.windowStartHour && local.hours < settings.windowEndHour;
       if (inWindow || force) {
-        await this.sendDue(settings, local, summary);
+        await this.sendDue(settings, local, summary, { spread: !force });
         summary.seedReplies = await this.sendSeedReplies();
         summary.counterReplies = await this.sendCounterReplies(settings, summary);
       }
@@ -133,7 +135,7 @@ class WarmnetEngineService {
     return count;
   }
 
-  async sendDue(settings, local, summary) {
+  async sendDue(settings, local, summary, { spread = false } = {}) {
     const { rows } = await db.query(
       `SELECT wm.*, m.id AS m_id, m.email, m.display_name, m.provider, m.workspace_id, m.status AS mailbox_status, m.domain_id,
               ip.clean AS ip_clean
@@ -159,6 +161,12 @@ class WarmnetEngineService {
       const target = dailyTarget(row, settings, local);
       const due = Math.ceil(target * Math.min(1, progress));
       if (row.today_sent >= due || row.today_sent >= target) continue;
+      // Spread sends out: a mailbox that is due waits for a random tick and leaves a gap since its last mail, so the
+      // seeds see a trickle, not 50 emails in one minute. The last hour of the window sends whatever is still owed.
+      if (spread && local.hours < settings.windowEndHour - 1) {
+        if (row.last_sent_at && Date.now() - new Date(row.last_sent_at).getTime() < settings.minGapMinutes * 60_000) continue;
+        if (Math.random() >= settings.sendChancePerTick) continue;
+      }
 
       const seed = this.chooseSeed(seedLoad, row.mailbox_id);
       if (!seed) {

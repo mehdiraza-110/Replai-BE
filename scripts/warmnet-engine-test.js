@@ -99,7 +99,7 @@ const day = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10
     await engine.runTick({ force: true }); const r = (await db.query(`SELECT ramp_day, held_days FROM warmnet_mailboxes WHERE mailbox_id = $1`, [id])).rows[0];
     assert.deepEqual(r, { ramp_day: 6, held_days: 1 });
   });
-  await check("21 days, 30+ placed tests and 85%+ inbox -> ready; the same with poor placement -> not ready", async () => {
+  await check("14+ days, 30+ placed tests and 85%+ inbox -> ready; the same with poor placement -> not ready", async () => {
     const ok = await mkYesterday("ready", 20, 25, { started: day(22) }); await place(ok, s2, 34, 32);
     const no = await mkYesterday("notyet", 20, 25, { started: day(22) }); await place(no, s2, 34, 20);
     const young = await mkYesterday("young", 20, 25, { started: day(5) }); await place(young, s2, 34, 34);
