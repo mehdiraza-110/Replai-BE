@@ -24,6 +24,9 @@ function detectFieldForHeader(normalized) {
     if (aliases.includes(normalized)) return field;
   }
   if (normalized.includes("email")) return "email";
+  // "Company LinkedIn URL" / "Company Website" are link columns, not the company name: check them before the "company" catch-all.
+  if (normalized.includes("linkedin")) return "linkedinUrl";
+  if (normalized.includes("website") || normalized.endsWith("url") || normalized.includes("domain")) return "website";
   if (normalized.includes("company") || normalized.includes("organization")) return "company";
   if (normalized.includes("fullname") || normalized === "name") return "fullName";
   if (normalized.includes("firstname")) return "firstName";

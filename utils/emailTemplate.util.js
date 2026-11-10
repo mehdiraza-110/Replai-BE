@@ -86,11 +86,27 @@ function cleanCompany(value) {
  * Every merge variable the campaign editor offers (snake_case) plus the camelCase names older campaigns use.
  * sender_name is the display name of the mailbox the email goes out from. Lead values are cleaned first.
  */
+const URL_RE = /^(?:https?:\/\/|www\.)|linkedin\.com\//i;
+
+/** Leads imported before the header fix can hold a LinkedIn/website URL as their company: use the real name from the imported row instead, or nothing. */
+function companyFor(lead) {
+  const direct = cleanCompany(lead.company);
+  if (direct && !URL_RE.test(direct)) return direct;
+  const raw = lead.raw_data && typeof lead.raw_data === "object" ? lead.raw_data : {};
+  for (const [header, value] of Object.entries(raw)) {
+    const key = header.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (!["company", "companyname", "companynamecleaned", "organization", "employer"].includes(key)) continue;
+    const candidate = cleanCompany(value);
+    if (candidate && !URL_RE.test(candidate)) return candidate;
+  }
+  return "";
+}
+
 function mergeValues(lead, mailbox) {
   const fullName = cleanFullName(lead.full_name) || cleanFullName([lead.first_name, lead.last_name].filter(Boolean).join(" "));
   const firstName = cleanFirstName(lead.first_name) || cleanFirstName(lead.full_name) || "there";
   const lastName = cleanFullName(lead.last_name);
-  const cleanedCompany = cleanCompany(lead.company);
+  const cleanedCompany = companyFor(lead);
   const company = cleanedCompany.replace(/[^\p{L}\p{N}]/gu, "").length >= 2 ? cleanedCompany : "";
   const role = cleanText(lead.role);
   const email = String(lead.email || "").trim();

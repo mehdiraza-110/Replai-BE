@@ -7,8 +7,20 @@ const db = require("../config/db.config");
 // mentions "stop" in passing (e.g. "please stop by our booth").
 const OPT_OUT_PATTERN = /\b(opt[\s-]?out|unsubscribe|remove me( from (this|your) (list|mailing list))?|take me off (this|your) list|stop emailing me)\b/i;
 
+/** Drops the quoted original ("> ...", "On <date> ... wrote:", "-----Original Message-----", "From: ..." headers): our own opt-out footer lives there and is not the lead's words. */
+function stripQuotedReply(text) {
+  const lines = String(text || "").replace(/\r/g, "").split("\n");
+  const kept = [];
+  for (const line of lines) {
+    if (/^\s*On .{5,200}wrote:?\s*$/i.test(line) || /^\s*-{2,}\s*(Original Message|Forwarded message)/i.test(line) || /^\s*From:\s.+/i.test(line) && kept.length) break;
+    if (/^\s*>/.test(line)) continue;
+    kept.push(line);
+  }
+  return kept.join("\n");
+}
+
 function isOptOutText(text) {
-  const cleaned = String(text || "").trim();
+  const cleaned = stripQuotedReply(text).trim();
   if (!cleaned) return false;
   if (OPT_OUT_PATTERN.test(cleaned)) return true;
   // A bare "STOP" (the standard SMS-style opt-out keyword) only counts when it's
