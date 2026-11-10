@@ -75,8 +75,9 @@ const recordsRuby = `out[:records] = { verification: domain.dns_verification_str
   return_path: domain.return_path_domain, return_target: Postal::Config.dns.return_path_domain, mx: Postal::Config.dns.mx_records, verified: domain.verified? }`;
 
 /**
- * Creates (or finds) the domain in Postal, gives it a catch-all route to this app's inbound endpoint and puts it on the
- * least-loaded sending IP pool. Idempotent. dryRun rolls everything back and only reports what would happen.
+ * Creates (or finds) the domain in Postal and puts it on the least-loaded sending IP pool. Postal only allows the catch-all route
+ * to this app's inbound endpoint once the domain is verified (its TXT record is in DNS), so a first call on a new domain returns
+ * route: null and a later call, after the DNS step, adds it. Idempotent. dryRun rolls everything back and only reports what would happen.
  */
 function provisionScript(name, { dryRun = false } = {}) {
   const c = cfg();
@@ -86,7 +87,9 @@ function provisionScript(name, { dryRun = false } = {}) {
   out[:existed] = !domain.nil?
   domain ||= Domain.create!(owner: server, name: ${lit(name)}, verification_method: "DNS")
   endpoint = HTTPEndpoint.find_by!(server_id: server.id, name: ${lit(c.endpointName)})
-  route = Route.find_by(server_id: server.id, domain_id: domain.id, name: "*") || Route.create!(server: server, name: "*", domain: domain, endpoint: endpoint, mode: "Endpoint", spam_mode: "Mark")
+  domain.verify_with_dns unless domain.verified? || ${dryRun ? "true" : "false"}
+  route = Route.find_by(server_id: server.id, domain_id: domain.id, name: "*")
+  route ||= Route.create!(server: server, name: "*", domain: domain, endpoint: endpoint, mode: "Endpoint", spam_mode: "Mark") if domain.verified?
   rule = IPPoolRule.where(owner_type: "Server", owner_id: server.id, from_text: ${lit(name)}).first
   if rule
     pool = rule.ip_pool
@@ -98,7 +101,7 @@ function provisionScript(name, { dryRun = false } = {}) {
     IPPoolRule.create!(owner: server, ip_pool_id: pool.id, from_text: ${lit(name)})
   end
   ip = IPAddress.where(ip_pool_id: pool.id).first
-  out[:route] = { mode: route.mode, endpoint: route.endpoint.name }
+  out[:route] = route ? { mode: route.mode, endpoint: route.endpoint.name } : nil
   out[:pool] = { id: pool.id, name: pool.name, ip: ip && ip.ipv4, hostname: ip && ip.hostname }
   ${recordsRuby}
   ${dryRun ? "raise ActiveRecord::Rollback" : ""}

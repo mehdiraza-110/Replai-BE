@@ -53,7 +53,7 @@ async function onboard(actorId, input = {}) {
       step("porkbun", true, "Domain found in Porkbun.");
 
       const post = await postalAdmin.provision(name, { dryRun });
-      step("postal", true, `${post.existed ? "Already in" : dryRun ? "Would be added to" : "Added to"} the mail server; replies route to this app; sending IP pool ${post.pool?.name || "none"}.`);
+      step("postal", true, `${post.existed ? "Already in" : dryRun ? "Would be added to" : "Added to"} the mail server; ${post.route ? "replies route to this app" : "reply route is added once the domain verifies"}; sending IP pool ${post.pool?.name || "none"}.`);
 
       const dns = await porkbun.applyRecords(name, recordsFrom(name, post.records), { dryRun });
       step("dns", dns.conflicts.length === 0, `${dryRun ? "Would add" : "Added"} ${dns.added.length} record(s), ${dns.alreadyThere.length} already there${dns.conflicts.length ? `, ${dns.conflicts.length} conflict(s) to fix by hand (${dns.conflicts.map((c) => c.key).join(", ")})` : ""}.`);
@@ -62,6 +62,8 @@ async function onboard(actorId, input = {}) {
 
       // Postal checks the records itself; right after adding them DNS usually hasn't spread yet, so this is best effort.
       const verify = await postalAdmin.checkDns(name).catch((e) => ({ error: e.message }));
+      // The reply route can only be created once Postal sees the verification record.
+      if (!post.route && verify.status?.verified === true) await postalAdmin.provision(name).then((p2) => { post.route = p2.route; }).catch(() => {});
       step("verify", !verify.error && verify.status?.verified === true, verify.error ? "Postal couldn't be asked just now." : verify.status.verified ? "Postal has verified the domain." : "DNS hasn't spread yet. Use Re-check in a few minutes.");
 
       const reg = await warmnet.registerDomains(actorId, {
