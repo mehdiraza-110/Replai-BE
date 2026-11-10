@@ -95,7 +95,7 @@ function companyFor(lead) {
   const raw = lead.raw_data && typeof lead.raw_data === "object" ? lead.raw_data : {};
   for (const [header, value] of Object.entries(raw)) {
     const key = header.toLowerCase().replace(/[^a-z0-9]/g, "");
-    if (!["company", "companyname", "companynamecleaned", "organization", "employer"].includes(key)) continue;
+    if (!["company", "companyname", "comapnyname", "companynamecleaned", "organization", "employer"].includes(key)) continue;
     const candidate = cleanCompany(value);
     if (candidate && !URL_RE.test(candidate)) return candidate;
   }

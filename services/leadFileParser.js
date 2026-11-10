@@ -7,7 +7,7 @@ const FIELD_ALIASES = {
   fullName: ["fullname", "name", "contactname", "contactfullname", "leadname"],
   firstName: ["firstname", "fname", "first"],
   lastName: ["lastname", "lname", "last"],
-  company: ["company", "companyname", "companynamecleaned", "organization", "org", "employer", "business"],
+  company: ["company", "companyname", "comapnyname", "compnayname", "comanyname", "companynamecleaned", "organization", "org", "employer", "business"],
   role: ["role", "title", "jobtitle", "position", "designation"],
   phone: ["phone", "phonenumber", "mobile", "telephone", "cell", "cellphone"],
   website: ["website", "websiteurl", "companywebsite", "url", "domain"],
@@ -27,7 +27,7 @@ function detectFieldForHeader(normalized) {
   // "Company LinkedIn URL" / "Company Website" are link columns, not the company name: check them before the "company" catch-all.
   if (normalized.includes("linkedin")) return "linkedinUrl";
   if (normalized.includes("website") || normalized.endsWith("url") || normalized.includes("domain")) return "website";
-  if (normalized.includes("company") || normalized.includes("organization")) return "company";
+  if (normalized.includes("company") || normalized.includes("comapny") || normalized.includes("organization")) return "company";
   if (normalized.includes("fullname") || normalized === "name") return "fullName";
   if (normalized.includes("firstname")) return "firstName";
   if (normalized.includes("lastname")) return "lastName";
