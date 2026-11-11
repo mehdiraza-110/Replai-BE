@@ -405,6 +405,32 @@ async function previewAssign(body = {}) {
 // ---------------------------------------------------------------- list / detail
 const escLike = (s) => String(s).replace(/[\\%_]/g, (m) => `\\${m}`);
 
+function warmnetOf(r) {
+  const placed = Number(r.placed) || 0;
+  const inbox = Number(r.inbox) || 0;
+  const enrolled = r.enrolled == null ? 0 : Number(r.enrolled);
+  const ready = (Number(r.ready) || 0) + (Number(r.released) || 0);
+  let state = "not_started";
+  if (enrolled > 0) state = ready === enrolled ? "ready" : Number(r.paused) === enrolled ? "paused" : "warming";
+  return {
+    state,
+    enrolled,
+    warming: Number(r.warming) || 0,
+    queued: Number(r.queued) || 0,
+    paused: Number(r.paused) || 0,
+    ready: Number(r.ready) || 0,
+    released: Number(r.released) || 0,
+    ramp_day: enrolled ? Number(r.ramp_day) : null,
+    started_at: r.wn_started_at || null,
+    total_sent: Number(r.wn_total_sent) || 0,
+    placed_5d: placed,
+    inbox_rate_5d: placed ? inbox / placed : null,
+    sendable_mailboxes: Number(r.sendable) || 0,
+    ip: r.ip_addr || null,
+    ip_clean: r.ip_clean === null || r.ip_clean === undefined ? null : r.ip_clean,
+  };
+}
+
 async function decorate(rows) {
   if (!rows.length) return [];
   const domainIds = rows.map((r) => r.id);
@@ -453,6 +479,7 @@ async function decorate(rows) {
       mailbox_count: m.total,
       active_mailbox_count: m.active,
       warmup: { stages: m.stages, avg_daily_limit: m.total ? Math.round(m.sum / m.total) : null },
+      warmnet: warmnetOf(r),
       workspace: r.workspace_id ? { id: r.workspace_id, name: r.ws_name, slug: r.ws_slug, type: r.ws_type, status: r.ws_status } : null,
       owner: o ? { id: o.id, email: o.email, name: ownerName(o) } : null,
       assigned_at: a ? a.created_at : null,
@@ -463,9 +490,47 @@ async function decorate(rows) {
   });
 }
 
-const DOMAIN_SELECT = `SELECT d.id, d.domain, d.provider, d.status, d.created_at, d.workspace_id,
-    w.name AS ws_name, w.slug AS ws_slug, w.type AS ws_type, w.status AS ws_status
-  FROM domains d LEFT JOIN workspaces w ON w.id = d.workspace_id`;
+// Warm-up readiness per domain, from the warm-up network (warmnet_*): how many mailboxes are in each state, the furthest
+// ramp day, the inbox rate over the last 5 days (the same window and rule the engine uses to mark a mailbox "ready"),
+// and how many mailboxes could send campaign mail right now (Postal ones also need passing DNS and the warm-up age gate).
+const CAMPAIGN_MIN_WARMUP_DAYS = (() => { const n = Number.parseInt(process.env.POSTAL_MIN_WARMUP_DAYS, 10); return Number.isFinite(n) && n >= 0 ? n : 14; })();
+const WN_WITH = `WITH wn_mb AS (
+    SELECT m.domain_id, COUNT(*)::int AS enrolled,
+      COUNT(*) FILTER (WHERE wm.state = 'warming')::int AS warming, COUNT(*) FILTER (WHERE wm.state = 'queued')::int AS queued,
+      COUNT(*) FILTER (WHERE wm.state = 'paused')::int AS paused, COUNT(*) FILTER (WHERE wm.state = 'ready')::int AS ready,
+      COUNT(*) FILTER (WHERE wm.state = 'released')::int AS released, COALESCE(MAX(wm.ramp_day), 0)::int AS ramp_day,
+      MIN(wm.started_at) AS wn_started_at, COALESCE(SUM(wm.total_sent), 0)::int AS wn_total_sent
+    FROM warmnet_mailboxes wm JOIN mailboxes m ON m.id = wm.mailbox_id AND m.is_deleted = FALSE GROUP BY m.domain_id
+  ), wn_msg AS (
+    SELECT m.domain_id, COUNT(*) FILTER (WHERE x.placement IN ('inbox', 'spam'))::int AS placed, COUNT(*) FILTER (WHERE x.placement = 'inbox')::int AS inbox
+    FROM warmnet_messages x JOIN mailboxes m ON m.id = x.mailbox_id AND m.is_deleted = FALSE
+    WHERE x.direction = 'to_seed' AND x.status = 'sent' AND x.sent_at >= NOW() - INTERVAL '5 days' GROUP BY m.domain_id
+  ), wn_send AS (
+    SELECT m.domain_id, COUNT(*)::int AS sendable
+    FROM mailboxes m JOIN domains dd ON dd.id = m.domain_id AND dd.is_deleted = FALSE
+    WHERE m.is_deleted = FALSE AND m.status = 'Active' AND m.provider IN ('maildoso', 'postal') AND dd.status = 'Verified'
+      AND (m.provider <> 'postal' OR (dd.spf_status = 'Success' AND dd.dkim_status = 'Success' AND dd.mx_status = 'Success' AND dd.dmarc_status = 'Success'
+           AND m.warmup_started_at IS NOT NULL AND m.warmup_started_at <= NOW() - make_interval(days => ${CAMPAIGN_MIN_WARMUP_DAYS})))
+    GROUP BY m.domain_id
+  )`;
+const DOMAIN_FROM = `FROM domains d LEFT JOIN workspaces w ON w.id = d.workspace_id
+  LEFT JOIN wn_mb wn ON wn.domain_id = d.id LEFT JOIN wn_msg mg ON mg.domain_id = d.id LEFT JOIN wn_send sd ON sd.domain_id = d.id
+  LEFT JOIN warmnet_domains wd ON wd.domain_id = d.id LEFT JOIN warmnet_ips wip ON wip.id = wd.ip_id`;
+const DOMAIN_SELECT = `${WN_WITH} SELECT d.id, d.domain, d.provider, d.status, d.created_at, d.workspace_id,
+    w.name AS ws_name, w.slug AS ws_slug, w.type AS ws_type, w.status AS ws_status,
+    wn.enrolled, wn.warming, wn.queued, wn.paused, wn.ready, wn.released, wn.ramp_day, wn.wn_started_at, wn.wn_total_sent,
+    mg.placed, mg.inbox, COALESCE(sd.sendable, 0) AS sendable, wip.ip AS ip_addr, wip.clean AS ip_clean
+  ${DOMAIN_FROM}`;
+// not_started = not in the warm-up network; ready = every enrolled mailbox earned "ready" (or is already released);
+// paused = every enrolled mailbox is paused; otherwise warming.
+const READINESS_SQL = `(CASE WHEN wn.enrolled IS NULL THEN 'not_started' WHEN wn.ready + wn.released = wn.enrolled THEN 'ready'
+  WHEN wn.paused = wn.enrolled THEN 'paused' ELSE 'warming' END)`;
+const INBOX_RATE_SQL = `(CASE WHEN mg.placed > 0 THEN mg.inbox::float8 / mg.placed ELSE NULL END)`;
+const SORTS = {
+  inbox: `${INBOX_RATE_SQL} DESC NULLS LAST, mg.placed DESC NULLS LAST, d.domain, d.id`,
+  days: `wn.ramp_day DESC NULLS LAST, d.domain, d.id`,
+  ready: `(${READINESS_SQL} = 'ready') DESC, ${INBOX_RATE_SQL} DESC NULLS LAST, d.domain, d.id`,
+};
 
 async function list(query = {}) {
   const page = Math.max(1, parseInt(query.page, 10) || 1);
@@ -490,9 +555,21 @@ async function list(query = {}) {
       SELECT 1 FROM workspace_members wm JOIN users u ON u.id = wm.user_id
       WHERE wm.workspace_id = d.workspace_id AND wm.role = 'owner' AND LOWER(u.email) LIKE ${s}))`);
   }
+  if (query.readiness) {
+    const r = String(query.readiness);
+    if (!["ready", "warming", "paused", "not_started"].includes(r)) throw new WorkspaceError("Unknown warm-up filter.", 400);
+    where.push(`${READINESS_SQL} = ${add(r)}`);
+  }
+  if (query.minInbox !== undefined && query.minInbox !== "") {
+    const pct = Number(query.minInbox);
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100) throw new WorkspaceError("Minimum inbox rate must be between 0 and 100.", 400);
+    where.push(`${INBOX_RATE_SQL} >= ${add(pct / 100)}`);
+  }
+  if (query.canSend === "1" || query.canSend === "true") where.push(`COALESCE(sd.sendable, 0) > 0`);
   const clause = `WHERE ${where.join(" AND ")}`;
-  const total = (await db.query(`SELECT COUNT(*)::int AS n FROM domains d LEFT JOIN workspaces w ON w.id = d.workspace_id ${clause}`, params)).rows[0].n;
-  const { rows } = await db.query(`${DOMAIN_SELECT} ${clause} ORDER BY d.domain, d.id LIMIT ${add(limit)} OFFSET ${add((page - 1) * limit)}`, params);
+  const order = SORTS[query.sort] || "d.domain, d.id";
+  const total = (await db.query(`${WN_WITH} SELECT COUNT(*)::int AS n ${DOMAIN_FROM} ${clause}`, params)).rows[0].n;
+  const { rows } = await db.query(`${DOMAIN_SELECT} ${clause} ORDER BY ${order} LIMIT ${add(limit)} OFFSET ${add((page - 1) * limit)}`, params);
   return { items: await decorate(rows), total, page, limit };
 }
 
@@ -504,8 +581,14 @@ async function get(idRaw) {
   const [item] = await decorate(rows);
   const [mbs, hist] = await Promise.all([
     db.query(
-      `SELECT m.id, m.email, m.status, m.provider, m.daily_limit, m.warmup_stage, s.name AS strategy_name
+      `SELECT m.id, m.email, m.status, m.provider, m.daily_limit, m.warmup_stage, s.name AS strategy_name,
+         wm.state AS wn_state, wm.ramp_day AS wn_ramp_day,
+         (SELECT COUNT(*)::int FROM warmnet_messages x WHERE x.mailbox_id = m.id AND x.direction = 'to_seed' AND x.status = 'sent'
+            AND x.placement IN ('inbox', 'spam') AND x.sent_at >= NOW() - INTERVAL '5 days') AS wn_placed,
+         (SELECT COUNT(*)::int FROM warmnet_messages x WHERE x.mailbox_id = m.id AND x.direction = 'to_seed' AND x.status = 'sent'
+            AND x.placement = 'inbox' AND x.sent_at >= NOW() - INTERVAL '5 days') AS wn_inbox
        FROM mailboxes m LEFT JOIN warmup_strategies s ON s.id = m.warmup_strategy_id
+       LEFT JOIN warmnet_mailboxes wm ON wm.mailbox_id = m.id
        WHERE m.domain_id = $1 AND m.is_deleted = FALSE ORDER BY m.id`,
       [id],
     ),
@@ -528,6 +611,10 @@ async function get(idRaw) {
       daily_limit: m.daily_limit,
       warmup_stage: m.warmup_stage,
       warmup_strategy_name: m.strategy_name || null,
+      warmnet_state: m.wn_state || null,
+      warmnet_ramp_day: m.wn_state ? m.wn_ramp_day : null,
+      warmnet_placed_5d: m.wn_placed,
+      warmnet_inbox_rate_5d: m.wn_placed ? m.wn_inbox / m.wn_placed : null,
     })),
     history: hist.rows.map((h) => ({
       at: h.created_at,
