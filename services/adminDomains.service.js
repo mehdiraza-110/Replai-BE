@@ -394,12 +394,26 @@ async function previewAssign(body = {}) {
       })),
     })),
     campaigns: plan.campaigns.map(publicCampaign),
-    warmup: { preserved: true, strategies: plan.strategies.map((s) => ({ name: s.name, action: s.action })) },
+    warmup: { preserved: true, strategies: plan.strategies.map((s) => ({ name: s.name, action: s.action })), willEnroll: await countEnrollable(plan, target) },
     mailboxesMoving: plan.mailboxes.length,
     requiresConfirmation,
     warnings,
     blocked,
   };
+}
+
+/** How many of the moving own-server mailboxes have never been in the warm-up network (they will be enrolled with priority). */
+async function countEnrollable(plan, target) {
+  if (target.slug === PLATFORM_SLUG) return { domains: 0, mailboxes: 0 };
+  const ownDomains = plan.domains.filter((d) => String(d.provider || "").toLowerCase() === "postal").map((d) => d.id);
+  if (!ownDomains.length) return { domains: 0, mailboxes: 0 };
+  const { rows } = await db.query(
+    `SELECT COUNT(*)::int AS mailboxes, COUNT(DISTINCT m.domain_id)::int AS domains
+     FROM mailboxes m LEFT JOIN warmnet_mailboxes wm ON wm.mailbox_id = m.id
+     WHERE m.domain_id = ANY($1::int[]) AND m.is_deleted = FALSE AND (wm.mailbox_id IS NULL OR wm.state = 'queued')`,
+    [ownDomains]
+  );
+  return rows[0];
 }
 
 // ---------------------------------------------------------------- list / detail

@@ -64,7 +64,7 @@ class WarmnetEngineService {
   async runTick({ force = false } = {}) {
     if (ticking) return { skipped: "busy" };
     ticking = true;
-    const summary = { sent: 0, failed: 0, seedReplies: 0, counterReplies: 0, rolled: 0, ready: 0, skippedNoSeed: 0, skippedBlocklisted: 0 };
+    const summary = { sent: 0, failed: 0, seedReplies: 0, counterReplies: 0, rolled: 0, ready: 0, released: 0, skippedNoSeed: 0, skippedBlocklisted: 0 };
     try {
       const settings = await getSettings();
       if (!settings.enabled && !force) return { skipped: "disabled" };
@@ -130,6 +130,17 @@ class WarmnetEngineService {
            state = $5, ready_at = $6, updated_at = NOW() WHERE mailbox_id = $1`,
         [row.mailbox_id, advance ? 1 : 0, row.state === "warming" && fullDay && !advance ? 1 : 0, local.date, nextState, readyAt]
       );
+      // A mailbox that was assigned to a client with priority goes straight to the client once it is ready, and keeps
+      // warming at the maintenance volume next to their campaigns. If that is not possible yet (for example the
+      // workspace has none and one could not be created) it stays "ready" and shows up as waiting to be released.
+      if (nextState === "ready" && row.priority_at) {
+        try {
+          await require("./warmnet.service").release([row.mailbox_id], { createDefaultStrategy: true });
+          summary.released += 1;
+        } catch (error) {
+          console.warn(`Warm-up: mailbox ${row.mailbox_id} is ready but could not be released automatically: ${error.message}`);
+        }
+      }
       count += 1;
     }
     return count;
@@ -145,7 +156,7 @@ class WarmnetEngineService {
        LEFT JOIN warmnet_domains wd ON wd.domain_id = d.id
        LEFT JOIN warmnet_ips ip ON ip.id = wd.ip_id
        WHERE wm.state IN ('warming', 'released')
-       ORDER BY wm.today_sent ASC, wm.mailbox_id ASC`
+       ORDER BY (wm.priority_at IS NOT NULL AND wm.state = 'warming') DESC, wm.priority_at ASC NULLS LAST, wm.today_sent ASC, wm.mailbox_id ASC`
     );
     const windowLen = settings.windowEndHour - settings.windowStartHour;
     const progress = Math.min(1, Math.max(0, (local.hours - settings.windowStartHour) / windowLen) + 0.08);

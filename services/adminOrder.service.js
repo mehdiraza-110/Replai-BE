@@ -317,6 +317,16 @@ const adminOrderService = {
       },
     });
     await domainsSvc.afterAssign(plan, result, { adminId });
+    // Domains handed to a client that never went through the warm-up network start it now, with priority, while the
+    // client can already use anything that is warmed. Returning a domain to the pool never enrols anything.
+    if (plan.target.slug !== domainsSvc.PLATFORM_SLUG) {
+      try {
+        result.warmup.enrollment = await require("./warmnet.service").enrollAssigned(plan.domains.map((d) => d.id));
+      } catch (e) {
+        console.error("Warm-up enrolment after assignment failed:", e.message);
+        result.warmup.enrollment = null;
+      }
+    }
     return result;
   },
 

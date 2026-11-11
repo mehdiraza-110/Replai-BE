@@ -270,7 +270,7 @@ class WarmnetService {
    * Hands warmed mailboxes to the workspace: they become Active with the chosen warm-up strategy, so the normal sending
    * lane and campaigns can use them. Warm-up continues in the background at the low maintenance volume.
    */
-  async release(ids, { strategyId, force } = {}) {
+  async release(ids, { strategyId, force, createDefaultStrategy } = {}) {
     const { rows } = await db.query(
       `SELECT wm.mailbox_id, wm.state, m.workspace_id FROM warmnet_mailboxes wm JOIN mailboxes m ON m.id = wm.mailbox_id AND m.is_deleted = FALSE WHERE wm.mailbox_id = ANY($1::int[])`,
       [ids]
@@ -287,6 +287,12 @@ class WarmnetService {
         const { rows: ok } = await db.query(`SELECT id FROM warmup_strategies WHERE id = $1 AND workspace_id = $2 AND is_deleted = FALSE`, [sid, r.workspace_id]);
         if (!ok[0]) throw new WorkspaceError("That warm-up strategy does not belong to the mailbox's workspace.", 400);
       }
+      // Automatic releases (priority mailboxes) must not stall on a brand-new client workspace that has no strategy yet:
+      // give it the standard one. A manual release still asks for an explicit choice.
+      if (!sid && createDefaultStrategy) {
+        const made = await require("./warmup.service").createStrategy({ name: "Default warm-up", description: "Created automatically when the first warmed mailbox was released to this workspace.", workspaceId: r.workspace_id });
+        sid = made.id;
+      }
       if (!sid) throw new WorkspaceError("The workspace has no warm-up strategy yet. Create one first.", 409);
       await db.query(
         `UPDATE mailboxes SET status = 'Active', warmup_stage = 'New', warmup_strategy_id = $2, warmup_started_at = NOW(), reputation_status = 'Healthy', updated_at = NOW() WHERE id = $1`,
@@ -296,6 +302,56 @@ class WarmnetService {
       affected += 1;
     }
     return affected;
+  }
+
+  /**
+   * Called after domains are assigned to a client workspace. Own-server (Postal) mailboxes that have never been through
+   * the warm-up network are enrolled and start warming now; queued ones are started; all of them get priority, so the
+   * engine gives them seed slots before everything else and releases them to the client as soon as they are ready.
+   * Paused (held by an admin or by a failure streak), ready and released mailboxes are left exactly as they are.
+   */
+  async enrollAssigned(domainIds) {
+    const ids = [...new Set((domainIds || []).filter(Number.isInteger))];
+    if (!ids.length) return { domains: 0, enrolled: 0, started: 0, prioritised: 0, alreadyWarmed: 0, skippedProvider: 0 };
+    const { rows: doms } = await db.query(
+      `SELECT id, LOWER(provider) AS provider FROM domains WHERE id = ANY($1::int[]) AND COALESCE(is_deleted, FALSE) = FALSE`,
+      [ids]
+    );
+    const own = doms.filter((d) => d.provider === "postal").map((d) => d.id);
+    const out = { domains: own.length, enrolled: 0, started: 0, prioritised: 0, alreadyWarmed: 0, skippedProvider: doms.length - own.length };
+    if (!own.length) return out;
+
+    const client = await db.getClient();
+    try {
+      await client.query("BEGIN");
+      for (const id of own) await client.query(`INSERT INTO warmnet_domains (domain_id, ip_id) VALUES ($1, NULL) ON CONFLICT (domain_id) DO NOTHING`, [id]);
+      const { rows } = await client.query(
+        `SELECT m.id, wm.state FROM mailboxes m LEFT JOIN warmnet_mailboxes wm ON wm.mailbox_id = m.id
+          WHERE m.domain_id = ANY($1::int[]) AND m.is_deleted = FALSE ORDER BY m.id FOR UPDATE OF m`,
+        [own]
+      );
+      for (const r of rows) {
+        if (!r.state) {
+          await client.query(`INSERT INTO warmnet_mailboxes (mailbox_id, state, started_at, priority_at) VALUES ($1, 'warming', NOW(), NOW()) ON CONFLICT (mailbox_id) DO NOTHING`, [r.id]);
+          out.enrolled += 1; out.prioritised += 1;
+        } else if (r.state === "queued") {
+          await client.query(`UPDATE warmnet_mailboxes SET state = 'warming', started_at = COALESCE(started_at, NOW()), priority_at = NOW(), updated_at = NOW() WHERE mailbox_id = $1`, [r.id]);
+          out.started += 1; out.prioritised += 1;
+        } else if (r.state === "warming") {
+          await client.query(`UPDATE warmnet_mailboxes SET priority_at = COALESCE(priority_at, NOW()), updated_at = NOW() WHERE mailbox_id = $1`, [r.id]);
+          out.prioritised += 1;
+        } else if (r.state === "ready" || r.state === "released") {
+          out.alreadyWarmed += 1;
+        }
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+    return out;
   }
 
   // ---------------- domains ----------------
