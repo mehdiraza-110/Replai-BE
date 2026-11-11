@@ -424,7 +424,7 @@ function warmnetOf(r) {
   const inbox = Number(r.inbox) || 0;
   const enrolled = r.enrolled == null ? 0 : Number(r.enrolled);
   const ready = (Number(r.ready) || 0) + (Number(r.released) || 0);
-  let state = "not_started";
+  let state = String(r.provider || "").toLowerCase() === "postal" ? "not_started" : "provider_managed";
   if (enrolled > 0) state = ready === enrolled ? "ready" : Number(r.paused) === enrolled ? "paused" : "warming";
   return {
     state,
@@ -535,9 +535,10 @@ const DOMAIN_SELECT = `${WN_WITH} SELECT d.id, d.domain, d.provider, d.status, d
     wn.enrolled, wn.warming, wn.queued, wn.paused, wn.ready, wn.released, wn.ramp_day, wn.wn_started_at, wn.wn_total_sent,
     mg.placed, mg.inbox, COALESCE(sd.sendable, 0) AS sendable, wip.ip AS ip_addr, wip.clean AS ip_clean
   ${DOMAIN_FROM}`;
-// not_started = not in the warm-up network; ready = every enrolled mailbox earned "ready" (or is already released);
+// not_started = own-server domain not in the warm-up network; provider_managed = a provider (Maildoso) warms it itself, so
+// it never enters our network; ready = every enrolled mailbox earned "ready" (or is already released);
 // paused = every enrolled mailbox is paused; otherwise warming.
-const READINESS_SQL = `(CASE WHEN wn.enrolled IS NULL THEN 'not_started' WHEN wn.ready + wn.released = wn.enrolled THEN 'ready'
+const READINESS_SQL = `(CASE WHEN wn.enrolled IS NULL THEN (CASE WHEN LOWER(d.provider) = 'postal' THEN 'not_started' ELSE 'provider_managed' END) WHEN wn.ready + wn.released = wn.enrolled THEN 'ready'
   WHEN wn.paused = wn.enrolled THEN 'paused' ELSE 'warming' END)`;
 const INBOX_RATE_SQL = `(CASE WHEN mg.placed > 0 THEN mg.inbox::float8 / mg.placed ELSE NULL END)`;
 const SORTS = {
@@ -571,7 +572,7 @@ async function list(query = {}) {
   }
   if (query.readiness) {
     const r = String(query.readiness);
-    if (!["ready", "warming", "paused", "not_started"].includes(r)) throw new WorkspaceError("Unknown warm-up filter.", 400);
+    if (!["ready", "warming", "paused", "not_started", "provider_managed"].includes(r)) throw new WorkspaceError("Unknown warm-up filter.", 400);
     where.push(`${READINESS_SQL} = ${add(r)}`);
   }
   if (query.minInbox !== undefined && query.minInbox !== "") {

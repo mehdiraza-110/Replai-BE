@@ -32,14 +32,15 @@ const day = (n) => new Date(Date.now() - n * 86400000);
     await mk("almost", "postal", true, ["warming"], 18, 25, 6, 6);          // warming, 72%, not sendable yet (6d < 14d)
     await mk("weak", "postal", true, ["warming"], 10, 25, 4, 4);            // warming, 40%
     await mk("held", "postal", true, ["paused"], 5, 10, 3, 3);              // paused
-    await mk("fresh", "maildoso", true, [null], 0, 0, 0, null);             // not enrolled; maildoso is sendable
+    await mk("fresh", "maildoso", true, [null], 0, 0, 0, null);             // Maildoso warms itself: provider_managed, sendable
+    await mk("cold", "postal", true, [null], 0, 0, 0, null);                // own server, never warmed: not_started
     await mk("nodns", "postal", false, ["ready"], 20, 20, 9, 16);           // ready but DNS failing: not sendable
     await mk("partial", "postal", true, ["ready", "warming"], 20, 25, 8, 10); // one of two ready
 
     const all = await svc.list({ workspaceId: ws, limit: 100 });
     const by = Object.fromEntries(all.items.map((i) => [i.domain.replace(`-${stamp}.invalid`, ""), i.warmnet]));
     console.log("numbers");
-    await check("states per domain", () => { assert.equal(by.great.state, "ready"); assert.equal(by.almost.state, "warming"); assert.equal(by.held.state, "paused"); assert.equal(by.fresh.state, "not_started"); assert.equal(by.partial.state, "warming"); assert.equal(by.partial.ready, 1); assert.equal(by.partial.enrolled, 2); });
+    await check("states per domain", () => { assert.equal(by.great.state, "ready"); assert.equal(by.almost.state, "warming"); assert.equal(by.held.state, "paused"); assert.equal(by.fresh.state, "provider_managed"); assert.equal(by.cold.state, "not_started"); assert.equal(by.partial.state, "warming"); assert.equal(by.partial.ready, 1); assert.equal(by.partial.enrolled, 2); });
     await check("inbox rate and sample size", () => { assert.equal(Math.round(by.great.inbox_rate_5d * 100), 96); assert.equal(by.great.placed_5d, 25); assert.equal(by.fresh.inbox_rate_5d, null); assert.equal(by.almost.ramp_day, 6); });
     await check("sendable counts the campaign gates", () => { assert.equal(by.great.sendable_mailboxes, 2); assert.equal(by.almost.sendable_mailboxes, 0); assert.equal(by.nodns.sendable_mailboxes, 0); assert.equal(by.fresh.sendable_mailboxes, 1); });
     await check("counts match across list and detail", async () => { const g = all.items.find((i) => i.domain.startsWith("great-")); const det = await svc.get(g.id); assert.equal(det.warmnet.state, "ready"); assert.equal(det.mailboxes.length, 2); assert.equal(det.mailboxes[0].warmnet_state, "ready"); assert.equal(Math.round(det.mailboxes[0].warmnet_inbox_rate_5d * 100), 96); });
@@ -47,7 +48,7 @@ const day = (n) => new Date(Date.now() - n * 86400000);
     console.log("filters and sorting");
     await check("ready filter", async () => assert.deepEqual((await only({ readiness: "ready" })).sort(), ["great", "nodns"]));
     await check("warming filter", async () => assert.deepEqual((await only({ readiness: "warming" })).sort(), ["almost", "partial", "weak"]));
-    await check("not started and paused filters", async () => { assert.deepEqual(await only({ readiness: "not_started" }), ["fresh"]); assert.deepEqual(await only({ readiness: "paused" }), ["held"]); });
+    await check("not started and paused filters", async () => { assert.deepEqual(await only({ readiness: "not_started" }), ["cold"]); assert.deepEqual(await only({ readiness: "provider_managed" }), ["fresh"]); assert.deepEqual(await only({ readiness: "paused" }), ["held"]); });
     await check("minimum inbox rate", async () => { assert.deepEqual((await only({ minInbox: "70" })).sort(), ["almost", "great", "nodns", "partial"]); assert.deepEqual((await only({ minInbox: "95" })).sort(), ["great", "nodns"]); });
     await check("filters combine", async () => assert.deepEqual(await only({ readiness: "warming", minInbox: "70", sort: "inbox" }), ["partial", "almost"]));
     await check("can send now", async () => assert.deepEqual((await only({ canSend: "1" })).sort(), ["fresh", "great"]));
