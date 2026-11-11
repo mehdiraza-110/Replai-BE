@@ -3,6 +3,8 @@ const db = require("../config/db.config");
 const suppressionService = require("./suppression.service");
 const { sendRawEmail } = require("./mailTransport.service");
 const quotaService = require("./quota.service");
+const optOutGuard = require("./optOutGuard.service");
+const { applyOptOutSetting } = require("../utils/optOutFooter.util");
 const leadVerifyService = require("./leadVerify.service");
 const { renderMessage, hasUnresolvedPlaceholders, buildRawMimeMessage } = require("../utils/emailTemplate.util");
 
@@ -244,7 +246,10 @@ class CampaignSendService {
       return { sent: false, reason: "undeliverable_address" };
     }
 
-    const rendered = renderMessage({ subject: campaign.subject, body: followUp ? followUp.body : campaign.body }, lead, mailbox);
+    // The opt-out line is a workspace setting applied here, not stored in the body. Warm-up mail keeps its own fixed body.
+    const storedBody = followUp ? followUp.body : campaign.body;
+    const outgoingBody = campaign.is_warmup ? storedBody : applyOptOutSetting(storedBody, await optOutGuard.isFooterEnabled(campaign.workspace_id));
+    const rendered = renderMessage({ subject: campaign.subject, body: outgoingBody }, lead, mailbox);
     // An unknown {{variable}} would reach the recipient as literal text. Refuse to send and leave the lead exactly
     // as it was (no attempt used) so fixing the template resumes sending with nothing lost.
     if (hasUnresolvedPlaceholders(rendered.subject) || hasUnresolvedPlaceholders(rendered.text)) {

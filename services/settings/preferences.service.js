@@ -118,7 +118,11 @@ const WORKSPACE_DEFAULTS = {
   color: "#2d6fa1",
   conferencing: { type: "google_meet", staticUrl: "" },
   sharing: { communication: false },
-  coldEmail: { schedule: { from: "09:00", to: "17:00", timezone: "America/New_York", days: ["Mon", "Tue", "Wed", "Thu", "Fri"] } },
+  coldEmail: {
+    schedule: { from: "09:00", to: "17:00", timezone: "America/New_York", days: ["Mon", "Tue", "Wed", "Thu", "Fri"] },
+    // Opt-out line appended to every campaign email. On unless the workspace switches it off; the guard (optOutGuard.service.js) switches it back on if sending goes bad.
+    optOutFooter: { enabled: true, disabledAt: null, autoEnabledAt: null, autoReason: null },
+  },
   callAnalyzer: { language: "en-US", frameworks: Object.fromEntries(ANALYZER_TYPES.map((t) => [t, ""])) },
 };
 
@@ -137,7 +141,7 @@ async function getWorkspaceSettings(workspaceId) {
     coldEmail: merge(WORKSPACE_DEFAULTS.coldEmail, r.cold_email),
     callAnalyzer: merge(WORKSPACE_DEFAULTS.callAnalyzer, r.call_analyzer),
     // False until someone saves a schedule, so new campaigns keep using the browser's time zone until then.
-    coldEmailConfigured: isObj(r.cold_email) && Object.keys(r.cold_email).length > 0,
+    coldEmailConfigured: isObj(r.cold_email) && isObj(r.cold_email.schedule) && Object.keys(r.cold_email.schedule).length > 0,
     weekdays: WEEKDAYS,
   };
 }
@@ -172,17 +176,31 @@ async function updateWorkspaceSettings(workspaceId, userId, body = {}) {
     if (next.sharing.communication !== current.sharing.communication) changes.push(["sharing", next.sharing.communication ? "Turned communication sharing on" : "Turned communication sharing off"]);
   }
   if (body.coldEmail !== undefined) {
-    const s = body.coldEmail?.schedule;
-    if (!isObj(body.coldEmail) || !isObj(s)) throw bad("Send a default schedule.");
-    if (s.from !== undefined) next.coldEmail.schedule.from = hhmm(s.from, "Start time");
-    if (s.to !== undefined) next.coldEmail.schedule.to = hhmm(s.to, "End time");
-    if (s.timezone !== undefined) next.coldEmail.schedule.timezone = zone(s.timezone);
-    if (s.days !== undefined) {
-      if (!Array.isArray(s.days) || s.days.some((d) => !WEEKDAYS.includes(d))) throw bad("Days must be Mon to Sun.");
-      next.coldEmail.schedule.days = WEEKDAYS.filter((d) => s.days.includes(d));
+    if (!isObj(body.coldEmail)) throw bad("Cold email settings must be an object.");
+    const s = body.coldEmail.schedule;
+    if (s === undefined && body.coldEmail.optOutFooter === undefined) throw bad("Send a default schedule.");
+    if (s !== undefined) {
+      if (!isObj(s)) throw bad("Send a default schedule.");
+      if (s.from !== undefined) next.coldEmail.schedule.from = hhmm(s.from, "Start time");
+      if (s.to !== undefined) next.coldEmail.schedule.to = hhmm(s.to, "End time");
+      if (s.timezone !== undefined) next.coldEmail.schedule.timezone = zone(s.timezone);
+      if (s.days !== undefined) {
+        if (!Array.isArray(s.days) || s.days.some((d) => !WEEKDAYS.includes(d))) throw bad("Days must be Mon to Sun.");
+        next.coldEmail.schedule.days = WEEKDAYS.filter((d) => s.days.includes(d));
+      }
+      if (next.coldEmail.schedule.from >= next.coldEmail.schedule.to) throw bad("The sending window must end after it starts.");
+      if (!next.coldEmail.schedule.days.length) throw bad("Pick at least one sending day.");
     }
-    if (next.coldEmail.schedule.from >= next.coldEmail.schedule.to) throw bad("The sending window must end after it starts.");
-    if (!next.coldEmail.schedule.days.length) throw bad("Pick at least one sending day.");
+    const f = body.coldEmail.optOutFooter;
+    if (f !== undefined) {
+      if (!isObj(f) || f.enabled === undefined) throw bad("Choose whether to add the opt-out line.");
+      const enabled = bool(f.enabled, "Opt-out line");
+      if (enabled !== current.coldEmail.optOutFooter.enabled) {
+        // Switching it off records when, so the automatic check only counts sending from that moment on.
+        next.coldEmail.optOutFooter = { enabled, disabledAt: enabled ? current.coldEmail.optOutFooter.disabledAt : new Date().toISOString(), autoEnabledAt: null, autoReason: null };
+        changes.push(["cold_email", enabled ? "Turned the opt-out line on for campaign emails" : "Turned the opt-out line off for campaign emails"]);
+      }
+    }
   }
   if (body.callAnalyzer !== undefined) {
     const a = body.callAnalyzer;
@@ -196,10 +214,13 @@ async function updateWorkspaceSettings(workspaceId, userId, body = {}) {
       }
     }
   }
+  // Defaults are not saved as choices: without a saved schedule, new campaigns keep using the browser's time zone.
+  const storedColdEmail = { ...next.coldEmail };
+  if (!current.coldEmailConfigured && body.coldEmail?.schedule === undefined) delete storedColdEmail.schedule;
   await db.query(
     `INSERT INTO workspace_settings (workspace_id, color, conferencing, sharing, cold_email, call_analyzer) VALUES ($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6::jsonb)
      ON CONFLICT (workspace_id) DO UPDATE SET color = EXCLUDED.color, conferencing = EXCLUDED.conferencing, sharing = EXCLUDED.sharing, cold_email = EXCLUDED.cold_email, call_analyzer = EXCLUDED.call_analyzer, updated_at = NOW()`,
-    [workspaceId, next.color, JSON.stringify(next.conferencing), JSON.stringify(next.sharing), JSON.stringify(next.coldEmail), JSON.stringify(next.callAnalyzer)]
+    [workspaceId, next.color, JSON.stringify(next.conferencing), JSON.stringify(next.sharing), JSON.stringify(storedColdEmail), JSON.stringify(next.callAnalyzer)]
   );
   for (const [area, summary] of changes) await audit(workspaceId, userId, area, summary);
   return getWorkspaceSettings(workspaceId);

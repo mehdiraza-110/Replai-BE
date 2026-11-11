@@ -137,6 +137,14 @@ cron.schedule('*/10 * * * *', () => {
         .catch((error) => console.error('AI SDR follow-up tick failed:', error.message));
 });
 
+// Workspaces that switched the opt-out line off get it back automatically when their recent sending goes bad
+// (bounce / complaint rate). See services/optOutGuard.service.js.
+cron.schedule('17 * * * *', () => {
+    require('./services/optOutGuard.service').runTick()
+        .then((r) => { if (r.turnedOn.length) console.log(`Opt-out guard turned the line back on for workspace(s): ${r.turnedOn.join(', ')}`); })
+        .catch((error) => console.error('Opt-out guard tick failed:', error.message));
+});
+
 // Trial milestone emails (7/3/1 days before the end, and when it has ended). Hourly, deduplicated in the database.
 try {
     require('./services/trialNotifier.service').start();

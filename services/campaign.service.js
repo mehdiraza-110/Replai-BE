@@ -3,18 +3,7 @@ const { parseLeadsFile } = require("./leadFileParser");
 const suppressionService = require("./suppression.service");
 const leadLibraryService = require("./leadLibrary.service");
 
-// Appended to every campaign email (and each follow-up step) so every outbound message
-// carries a working opt-out mechanism, per PlusVibe-Plan.md 12A. Reply-based rather than
-// a link: replies containing this phrase are detected in message.service.js (isOptOutText)
-// and immediately added to the suppression list.
-const OPT_OUT_FOOTER = "\n\nIf you'd prefer not to hear from us again, just reply to this email with \"OPT OUT\" and we'll remove you from our list right away.";
-const OPT_OUT_LANGUAGE_PATTERN = /opt[\s-]?out|unsubscribe|remove (you|me) from (this|our|your) (list|mailing list)/i;
-
-function withOptOutFooter(body) {
-  const trimmed = String(body || "");
-  if (OPT_OUT_LANGUAGE_PATTERN.test(trimmed)) return trimmed;
-  return `${trimmed}${OPT_OUT_FOOTER}`;
-}
+const { withOptOutFooter, stripOptOutFooter } = require("../utils/optOutFooter.util");
 
 class CampaignService {
   async listCampaigns({ page = 1, limit = 10, search = "", workspaceId } = {}) {
@@ -130,7 +119,6 @@ class CampaignService {
     if (!body || !String(body).trim()) {
       throw Object.assign(new Error("Email body is required"), { statusCode: 400 });
     }
-    const bodyWithOptOut = withOptOutFooter(body);
 
     const normalizedLeads = [];
     const seenEmails = new Set();
@@ -207,7 +195,7 @@ class CampaignService {
           trimmedName,
           objective || null,
           trimmedSubject,
-          bodyWithOptOut,
+          body,
           mode,
           parsedMailboxIds,
           Number.isFinite(Number(dailyLimitOverride)) && Number(dailyLimitOverride) > 0 ? Math.floor(Number(dailyLimitOverride)) : null,
@@ -278,7 +266,7 @@ class CampaignService {
         await client.query(
           `INSERT INTO campaign_followups (campaign_id, workspace_id, step_order, delay_days, body)
            VALUES ($1, $2, $3, $4, $5)`,
-          [campaign.id, campaign.workspace_id, index + 1, Number(followUp.delayDays) > 0 ? Math.floor(Number(followUp.delayDays)) : 3, withOptOutFooter(followUp.body)]
+          [campaign.id, campaign.workspace_id, index + 1, Number(followUp.delayDays) > 0 ? Math.floor(Number(followUp.delayDays)) : 3, followUp.body]
         );
       }
 
@@ -391,7 +379,7 @@ class CampaignService {
     }
     if (has("body")) {
       if (!String(changes.body || "").trim()) throw bad("Email body is required");
-      set("body", withOptOutFooter(changes.body));
+      set("body", changes.body);
     }
     if (has("status")) {
       if (!["Active", "Paused"].includes(changes.status)) throw bad("Status must be Active or Paused");
@@ -449,11 +437,11 @@ class CampaignService {
             `INSERT INTO campaign_followups (campaign_id, workspace_id, step_order, delay_days, body)
              SELECT $1, $2, $3, $4, $5
              WHERE NOT EXISTS (SELECT 1 FROM campaign_followups WHERE campaign_id = $1 AND step_order = $3)`,
-            [campaign.id, workspaceId, index + 1, delay, withOptOutFooter(step.body)]
+            [campaign.id, workspaceId, index + 1, delay, step.body]
           );
           await client.query(
             `UPDATE campaign_followups SET delay_days = $3, body = $4 WHERE campaign_id = $1 AND step_order = $2`,
-            [campaign.id, index + 1, delay, withOptOutFooter(step.body)]
+            [campaign.id, index + 1, delay, step.body]
           );
         }
         await client.query(`DELETE FROM campaign_followups WHERE campaign_id = $1 AND step_order > $2`, [campaign.id, followUps.length]);
@@ -625,12 +613,6 @@ class CampaignService {
       totalPages: Math.max(1, Math.ceil(total / limitNum)),
     };
   }
-}
-
-/** Campaigns store their body with the opt-out line appended; the edit screen shows what the user wrote. */
-function stripOptOutFooter(body) {
-  const text = String(body || "");
-  return text.endsWith(OPT_OUT_FOOTER) ? text.slice(0, -OPT_OUT_FOOTER.length) : text;
 }
 
 function mapCampaignSummaryRow(row) {
