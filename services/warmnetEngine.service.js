@@ -8,8 +8,8 @@ const mime = () => require("./campaignSend.service");
 
 const DEFAULTS = {
   startPerDay: 3,
-  incrementPerDay: 1,
-  maxPerDay: 25,
+  incrementPerDay: 1.5,
+  maxPerDay: 12,
   maintenancePerDay: 5,
   weekendFactor: 0.5,
   timezone: "America/New_York",
@@ -18,9 +18,9 @@ const DEFAULTS = {
   replyRate: 0.45,
   counterReplyRate: 0.5,
   starRate: 0.35,
-  readyAfterDays: 14,
-  readyMinInboxRate: 0.85,
-  readyMinPlaced: 30,
+  readyAfterDays: 7,
+  readyMinInboxRate: 0.75,
+  readyMinPlaced: 20,
   holdBelowInboxRate: 0.5,
   holdMinPlaced: 10,
   maxConsecutiveFailures: 5,
@@ -94,9 +94,9 @@ class WarmnetEngineService {
          (SELECT COUNT(*) FROM warmnet_messages x WHERE x.mailbox_id = wm.mailbox_id AND x.direction = 'to_seed' AND x.status = 'sent'
             AND x.placement = 'inbox' AND x.sent_at >= NOW() - INTERVAL '7 days') AS inbox7,
          (SELECT COUNT(*) FROM warmnet_messages x WHERE x.mailbox_id = wm.mailbox_id AND x.direction = 'to_seed' AND x.status = 'sent'
-            AND x.placement IN ('inbox','spam') AND x.sent_at >= NOW() - INTERVAL '14 days') AS placed14,
+            AND x.placement IN ('inbox','spam') AND x.sent_at >= NOW() - INTERVAL '5 days') AS placed_r,
          (SELECT COUNT(*) FROM warmnet_messages x WHERE x.mailbox_id = wm.mailbox_id AND x.direction = 'to_seed' AND x.status = 'sent'
-            AND x.placement = 'inbox' AND x.sent_at >= NOW() - INTERVAL '14 days') AS inbox14
+            AND x.placement = 'inbox' AND x.sent_at >= NOW() - INTERVAL '5 days') AS inbox_r
        FROM warmnet_mailboxes wm JOIN mailboxes m ON m.id = wm.mailbox_id AND m.is_deleted = FALSE
        WHERE wm.state IN ('warming', 'released') AND (wm.today_date IS NULL OR wm.today_date::text <> $1)`,
       [local.date]
@@ -117,9 +117,9 @@ class WarmnetEngineService {
       let readyAt = row.ready_at;
       if (row.state === "warming" && row.started_at) {
         const daysIn = (Date.now() - new Date(row.started_at).getTime()) / 86_400_000;
-        const placed14 = Number(row.placed14);
-        const inboxRate14 = placed14 ? Number(row.inbox14) / placed14 : 0;
-        if (daysIn >= settings.readyAfterDays && placed14 >= settings.readyMinPlaced && inboxRate14 >= settings.readyMinInboxRate) {
+        const placedR = Number(row.placed_r);
+        const inboxRateR = placedR ? Number(row.inbox_r) / placedR : 0;
+        if (daysIn >= settings.readyAfterDays && placedR >= settings.readyMinPlaced && inboxRateR >= settings.readyMinInboxRate) {
           nextState = "ready";
           readyAt = new Date();
           summary.ready += 1;
