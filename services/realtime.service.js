@@ -80,6 +80,8 @@ function init(server) {
 
   io.on("connection", (socket) => {
     socket.join(roomFor(socket.data.workspaceId));
+    // A private room per person, for things addressed to one user (support ticket replies, new tickets for staff).
+    socket.join(`user:${socket.data.userId}`);
     socket.on("disconnect", () => {});
   });
 
@@ -101,4 +103,15 @@ function broadcast(workspaceId, event, payload) {
   }
 }
 
-module.exports = { init, broadcast, authenticateHandshake };
+/** Pushes an event to one person (every tab they have open). Same fire-and-forget rules as broadcast(). */
+function emitToUser(userId, event, payload) {
+  if (!io || userId === null || userId === undefined) return;
+
+  try {
+    io.to(`user:${userId}`).emit(event, payload);
+  } catch (error) {
+    console.error("Realtime user emit failed:", error.message);
+  }
+}
+
+module.exports = { init, broadcast, emitToUser, authenticateHandshake };

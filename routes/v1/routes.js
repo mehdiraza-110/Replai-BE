@@ -38,6 +38,9 @@ const memberRoutes = require('./members.routes');
 const workflowRoutes = require('./workflows.routes');
 const orderRoutes = require('./orders.routes');
 
+// Public health check; the deploy script reads `version` to confirm the new build is live.
+router.get('/health', (req, res) => res.json({ success: true, status: 'ok', version: require('../../config/version').APP_VERSION }));
+
 // User + workspace routes guard themselves (signup/login are public; everything else is per-route).
 router.use('/users', userRoutes);
 router.use('/workspaces', workspaceRoutes);
@@ -95,6 +98,11 @@ router.use('/members', TenantGuard, memberRoutes);
 router.use('/ai-keys', TenantGuard, aiKeyRoutes);
 router.use('/workflows', TenantGuard, workflowRoutes);
 router.use('/orders', TenantGuard, coldMailer, orderRoutes);
+
+// Support tickets: any signed-in person (no workspace needed); the team side is limited to super admins in the routes.
+const { TicketUser, StaffOnly } = require('../../middlewares/ticketUser.middleware');
+router.use('/feedback', TicketUser, require('./feedback.routes'));
+router.use('/asana', TicketUser, StaffOnly, require('./asana.routes'));
 
 // Platform administration: super admin only, no workspace needed
 router.use('/admin', require('../../middlewares/superAdmin.middleware'), adminRoutes);
