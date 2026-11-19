@@ -174,6 +174,8 @@ async function receiveWebhook(req, res) {
     // No session on the webhook: the tenant comes from the integration matched by the payload's PlusVibe
     // workspace id. Unmatched payloads throw here, before anything is written or any draft job is queued.
     const { appWorkspaceId, ...data } = await plusVibeService.recordWebhook(req.body, req.query?.token);
+    // Positive reply: tell the workspace admins (email/SMS/in-app). Fire-and-forget, once per lead.
+    require("../services/leadAlert.service").notifyPlusVibePositive(appWorkspaceId, req.body).catch(() => {});
     // An active "PlusVibe reply" workflow handles the reply; otherwise (or if it fails before doing anything)
     // the built-in draft generation runs exactly as before.
     require("../services/workflowExecutor.service")

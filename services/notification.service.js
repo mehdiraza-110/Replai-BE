@@ -3,6 +3,11 @@ const db = require("../config/db.config");
 // Only a curated subset of event_logs event types are surfaced as user-facing
 // notifications — most events (page views, listings, syncs) are too noisy.
 const NOTIFICATION_RULES = {
+  "lead.positive": {
+    title: "New positive lead",
+    tone: "success",
+    describe: (row) => `${row.metadata?.leadName || row.lead_email || "A lead"} replied positively${row.campaign_name ? ` to ${row.campaign_name}` : ""}.`,
+  },
   "ai.draft.generated": {
     title: "Human review required",
     tone: "warning",

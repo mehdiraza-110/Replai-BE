@@ -7,6 +7,7 @@ const webhook = require("./webhook.service");
 const scheduling = require("./scheduling.service");
 const { ungroundedTopic } = require("./grounding");
 const replierService = require("../replier.service");
+const leadAlert = require("../leadAlert.service");
 
 const RANK = classifier.INTEREST_RANK;
 const POSITIVE_RANK = RANK.high;
@@ -27,9 +28,21 @@ function prospectNameOf(lead, fromAddress) {
   return lead?.full_name || [lead?.first_name, lead?.last_name].filter(Boolean).join(" ") || fromAddress;
 }
 
-/** Fires the positive-reply webhook once per thread, the first time interest reaches "high". Never throws. */
-async function maybeNotifyPositive({ workspaceId, previousInterest, interest, payload }) {
+/**
+ * Runs once per thread, the first time interest reaches "high": tells the workspace admins (and the all-workspaces
+ * people) by email, SMS and in-app, then fires the positive-reply webhook. Never throws.
+ */
+async function maybeNotifyPositive({ workspaceId, previousInterest, interest, payload, reply = "" }) {
   if (RANK[interest] < POSITIVE_RANK || RANK[previousInterest || "none"] >= POSITIVE_RANK) return;
+  await leadAlert.notifyPositiveLead({
+    workspaceId,
+    leadKey: `native:${payload.mailboxId}:${payload.threadId}`,
+    leadName: payload.prospect?.name,
+    leadEmail: payload.prospect?.email,
+    subject: payload.subject,
+    reply,
+    source: "native",
+  });
   try {
     const settings = await settingsService.loadForPrompt(workspaceId);
     if (!settings.settings.webhookUrl || !settings.webhookSecret) return;
@@ -94,6 +107,7 @@ class SdrInboundService {
       previousInterest: existing?.interest,
       interest: patch.interest || existing?.interest || "none",
       payload: { threadId, mailboxId, prospect: { name: prospectNameOf(lead, fromAddress), email: fromAddress }, subject },
+      reply: body,
     });
     return { classification: result, previous: existing };
   }
@@ -314,6 +328,7 @@ class SdrInboundService {
       previousInterest: existing?.interest,
       interest: generated.interest,
       payload: { threadId: inbound.thread_id, mailboxId: inbound.mailbox_id, prospect: { name, email: inbound.from_address }, subject: inbound.subject },
+      reply: inbound.body_text || inbound.body || "",
     });
 
     if (!generated.shouldReply || !generated.reply) return { status: "NoReply", reason: generated.escalate ? "escalated" : "model_declined", generated };
