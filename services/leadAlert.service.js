@@ -1,10 +1,9 @@
 // Alerts for a positive lead: email + SMS + in-app, once per lead.
 //
 // Who is told:
-//   1. The owners and admins of the workspace the lead belongs to.
-//   2. TEMPORARY: the "all workspaces" people (Felipe and Mahdi) for every workspace. They are listed in
-//      GLOBAL_LEAD_ALERT_EMAILS (comma separated, e.g. "mahdi.r@kovalai.ai,felipe@example.com"). An address that has
-//      no account still gets the email; one with an account also gets SMS (users.phone) and the in-app push.
+//   1. The people routed to the brand (campaign name pattern) in lead_alert_routes.
+//   2. The copy-all people (lead_alert_routes with no pattern, plus GLOBAL_LEAD_ALERT_EMAILS) for every brand.
+//   An address with no account still gets the email; one with an account also gets SMS (users.phone) and the push.
 //
 // Everything is best effort: this never throws and never blocks the reply pipeline that calls it.
 const db = require("../config/db.config");
@@ -22,8 +21,13 @@ function globalEmails() {
     .filter((e) => EMAIL_RE.test(e));
 }
 
-/** Returns [{ email, userId|null, phone|null, global }] with one entry per address. */
-async function recipientsFor(workspaceId) {
+/**
+ * Returns [{ email, userId|null, phone|null, global }] with one entry per address.
+ * Recipients come only from lead_alert_routes: the people set for this brand (campaign name) plus the rows with
+ * no pattern, who get a copy of every brand (Chris). Workspace owners/admins are NOT alerted anymore.
+ * GLOBAL_LEAD_ALERT_EMAILS still adds copy-all addresses.
+ */
+async function recipientsFor(campaignName) {
   const byEmail = new Map();
   const add = (row, isGlobal) => {
     const email = String(row.email).toLowerCase();
@@ -32,12 +36,14 @@ async function recipientsFor(workspaceId) {
     byEmail.set(email, { email, userId: row.id ?? null, phone: row.phone || null, global: isGlobal });
   };
 
-  const admins = await db.query(
-    `SELECT u.id, u.email, u.phone FROM workspace_members m JOIN users u ON u.id = m.user_id
-     WHERE m.workspace_id = $1 AND m.role IN ('owner', 'admin') AND COALESCE(u.is_deleted, FALSE) = FALSE`,
-    [workspaceId],
+  const routes = await db.query(
+    `SELECT r.email, r.campaign_pattern, u.id, u.phone
+       FROM lead_alert_routes r
+       LEFT JOIN users u ON LOWER(u.email) = LOWER(r.email) AND COALESCE(u.is_deleted, FALSE) = FALSE
+      WHERE r.campaign_pattern IS NULL OR ($1::text IS NOT NULL AND $1 ILIKE r.campaign_pattern)`,
+    [campaignName || null],
   );
-  for (const r of admins.rows) if (EMAIL_RE.test(String(r.email || ""))) add(r, false);
+  for (const r of routes.rows) if (EMAIL_RE.test(String(r.email || ""))) add(r, r.campaign_pattern == null);
 
   const extra = globalEmails();
   if (extra.length) {
@@ -97,7 +103,7 @@ async function notifyPositiveLead(p) {
       metadata: { leadName: p.leadName || null, preview },
     });
 
-    const recipients = await recipientsFor(workspaceId);
+    const recipients = await recipientsFor(p.campaignName);
     const subject = `Positive lead in ${workspaceName}: ${p.leadName || p.leadEmail}`.slice(0, 200);
     const paragraphs = [
       `<strong>${emailService.escapeHtml(who)}</strong> replied positively${p.campaignName ? ` to <strong>${emailService.escapeHtml(p.campaignName)}</strong>` : ""} in <strong>${emailService.escapeHtml(workspaceName)}</strong>.`,
