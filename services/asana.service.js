@@ -201,4 +201,34 @@ async function createFeedbackTask({ userId, workspaceGid, projectGid, assigneeGi
   return { gid: task.gid, url: task.permalink_url || null };
 }
 
-module.exports = { status, connect, test, disconnect, workspaces, projects, users, assertWorkspaceReachable, createFeedbackTask };
+// Server-level target from the environment (ASANA_TOKEN, ASANA_PROJECT_GID, optional ASANA_SECTION_GID / ASANA_ASSIGNEE_GID).
+// When set it is used for every ticket, so no admin has to connect an account in the UI first.
+function envTarget() {
+  const token = String(process.env.ASANA_TOKEN || "").trim();
+  const projectGid = String(process.env.ASANA_PROJECT_GID || "").trim();
+  if (!token || !projectGid) return null;
+  return { token, projectGid, sectionGid: String(process.env.ASANA_SECTION_GID || "").trim() || null, assigneeGid: String(process.env.ASANA_ASSIGNEE_GID || "").trim() || null };
+}
+
+// Tasks are created incomplete (Asana's "To do"), placed in the configured section of the project.
+async function createEnvTask({ name, notes }) {
+  const t = envTarget();
+  try {
+    const task = await client(t.token).createTask({
+      name,
+      notes,
+      completed: false,
+      projects: [t.projectGid],
+      ...(t.assigneeGid ? { assignee: t.assigneeGid } : {}),
+    });
+    if (t.sectionGid) {
+      // The task exists either way; a failed move leaves it in the project's default spot instead of losing the ticket.
+      await request(t.token, "POST", `/sections/${encodeURIComponent(t.sectionGid)}/addTask`, { body: { task: task.gid } }).catch(() => {});
+    }
+    return { gid: task.gid, url: task.permalink_url || null };
+  } catch (error) {
+    throw toHttp(error);
+  }
+}
+
+module.exports = { status, connect, test, disconnect, workspaces, projects, users, assertWorkspaceReachable, createFeedbackTask, envTarget, createEnvTask };

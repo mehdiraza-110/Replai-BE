@@ -356,8 +356,9 @@ async function createAsanaTask(actor, id) {
     await db.query(`UPDATE feedback SET asana_task_error = $2 WHERE id = $1`, [id, String(message).slice(0, 500)]).catch(() => {});
   };
 
+  const envMode = Boolean(asana.envTarget());
   const cfg = (await settings.getConfig()).asana;
-  if (!cfg.workspaceGid || !cfg.projectGid || !cfg.connectionUserId) {
+  if (!envMode && (!cfg.workspaceGid || !cfg.projectGid || !cfg.connectionUserId)) {
     const message = "Asana tasks for tickets are not set up yet. Choose a workspace and project in the ticket settings.";
     await fail(message);
     throw httpError(message, 409);
@@ -376,14 +377,10 @@ async function createAsanaTask(actor, id) {
   ].filter((p) => p && String(p).trim());
 
   try {
-    const task = await asana.createFeedbackTask({
-      userId: cfg.connectionUserId,
-      workspaceGid: cfg.workspaceGid,
-      projectGid: cfg.projectGid,
-      assigneeGid: cfg.assigneeGid,
-      name: row.issue_name.slice(0, 200),
-      notes: parts.join("\n\n").slice(0, 10000),
-    });
+    const fields = { name: row.issue_name.slice(0, 200), notes: parts.join("\n\n").slice(0, 10000) };
+    const task = envMode
+      ? await asana.createEnvTask(fields)
+      : await asana.createFeedbackTask({ userId: cfg.connectionUserId, workspaceGid: cfg.workspaceGid, projectGid: cfg.projectGid, assigneeGid: cfg.assigneeGid, ...fields });
     await db.query(`UPDATE feedback SET asana_task_gid = $2, asana_task_url = $3, asana_task_error = NULL WHERE id = $1`, [id, task.gid, task.url]);
     return { asanaTaskUrl: task.url };
   } catch (e) {
