@@ -7,12 +7,12 @@ const db = require("../config/db.config");
 
 const EMAILS = {
   Felipe: "felipe.v@kovalai.ai", Chantal: "Chantal.C@sistaffing.com", Joe: "joesph.h@kovalinvest.com",
-  Artem: "artem.p@kovalinvest.com", Yuri: "yuri@sistaffing.com", Chris: "chris.b@kovalcorp.com",
+  Artem: "artem.p@kovalinvest.com", Chris: "chris.b@kovalcorp.com",
   Mardi: "", // email still needed
 };
 const ROUTES = {
   "Koval AI%": ["Felipe"],
-  "Staffing Brokerage%": ["Chantal", "Mardi", "Yuri"],
+  "Staffing Brokerage%": ["Chantal", "Mardi"],
   "Koval Invest%": ["Joe", "Chantal", "Artem"],
 };
 const COPY_ALL = ["Chris"];
