@@ -21,6 +21,11 @@ function globalEmails() {
     .filter((e) => EMAIL_RE.test(e));
 }
 
+/** Addresses that must never get a positive-lead alert, whatever the routes say (LEAD_ALERT_EXCLUDE_EMAILS). */
+function excludedEmails() {
+  return new Set(String(process.env.LEAD_ALERT_EXCLUDE_EMAILS || "").split(/[,;\s]+/).map((e) => e.trim().toLowerCase()).filter(Boolean));
+}
+
 /**
  * Returns [{ email, userId|null, phone|null, global }] with one entry per address.
  * Recipients come only from lead_alert_routes: the people set for this brand (campaign name) plus the rows with
@@ -55,7 +60,8 @@ async function recipientsFor(campaignName) {
     for (const r of found.rows) add(r, true);
     for (const email of extra) if (!known.has(email)) add({ email }, true);
   }
-  return [...byEmail.values()];
+  const excluded = excludedEmails();
+  return [...byEmail.values()].filter((r) => !excluded.has(r.email));
 }
 
 /** Claims the right to alert for this lead. False when this lead was already announced (or the claim failed). */
